@@ -19,7 +19,7 @@ const {
   getAuthToken
 } = require('./auth');
 
-const { ensureUpstreamCookie, injectPolyfill } = require('./token-crawler');
+const { ensureUpstreamCookie, injectPolyfill, getEncodingType, decompressBuffer } = require('./token-crawler');
 const desktopManager = require('./desktop-manager');
 const dshManager = require('./dsh-manager');
 const backupService = require('./backup-service');
@@ -392,33 +392,44 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
   }
 
   const ct = String(proxyRes.headers['content-type'] || '').toLowerCase();
+  const origCe = proxyRes.headers['content-encoding'];
+  const encType = getEncodingType(origCe);
 
   if (ct.includes('text/html')) {
-    delete proxyRes.headers['content-length'];
-    res.removeHeader('content-length');
-
     // 严禁浏览器缓存 HTML 主入口，确保每次加载均获取最新组合包版本 (彻底消除 rev 过期 404)
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
-    let injected = false;
-    const origWrite = res.write.bind(res);
-    res.write = function (chunk, ...rest) {
-      if (!injected && chunk) {
-        injected = true;
-        let htmlStr = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
-        htmlStr = injectPolyfill(htmlStr);
-        chunk = Buffer.from(htmlStr);
-      }
-      return origWrite(chunk, ...rest);
-    };
-    return;
-  }
+    if (!encType) {
+      // 无压缩时保持现有「首块注入」流式逻辑（零回归）
+      delete proxyRes.headers['content-length'];
+      res.removeHeader('content-length');
 
-  if (ct.includes('javascript')) {
+      let injected = false;
+      const origWrite = res.write.bind(res);
+      res.write = function (chunk, ...rest) {
+        if (!injected && chunk) {
+          injected = true;
+          let htmlStr = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+          htmlStr = injectPolyfill(htmlStr);
+          chunk = Buffer.from(htmlStr);
+        }
+        return origWrite(chunk, ...rest);
+      };
+      return;
+    }
+
+    if (encType === 'unknown') {
+      console.warn(`[gateway] 检测到未知的内容编码 (${origCe})，跳过 HTML 注入以防损坏响应`);
+      return;
+    }
+
+    // 上游有 gzip/deflate/br 压缩：缓冲全部 chunk，在 res.end 时解压并注入，删除 content-encoding
     delete proxyRes.headers['content-length'];
     res.removeHeader('content-length');
+    delete proxyRes.headers['content-encoding'];
+    res.removeHeader('content-encoding');
 
     const chunks = [];
     const origWrite = res.write.bind(res);
@@ -438,7 +449,84 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
       res.write = origWrite;
       res.end = origEnd;
 
-      let body = Buffer.concat(chunks).toString('utf8');
+      const rawBuffer = Buffer.concat(chunks);
+      let decompressed = null;
+      try {
+        decompressed = decompressBuffer(rawBuffer, encType);
+      } catch (err) {
+        // 安全兜底：content-encoding 已在 writeHead 之前删除，而此处 res.headersSent 已为 true，
+        // 无法再用 setHeader 恢复响应头（会抛 ERR_HTTP_HEADERS_SENT，进而触发 uncaughtException）。
+        // 故只原样透传未改写的字节并告警；整个 res.end 钩子必须永不抛异常。
+        console.warn(`[gateway] 解压上游 HTML 失败 (${encType}):`, err && err.message, '，回退原样透传');
+        try {
+          return origEnd(rawBuffer, ...rest);
+        } catch (e2) {
+          console.warn('[gateway] HTML 兜底写出失败:', e2 && e2.message);
+          try { res.destroy(); } catch {}
+          return;
+        }
+      }
+
+      let htmlStr = decompressed.toString('utf8');
+      htmlStr = injectPolyfill(htmlStr);
+      origEnd(Buffer.from(htmlStr), ...rest);
+    };
+    return;
+  }
+
+  if (ct.includes('javascript')) {
+    if (encType === 'unknown') {
+      console.warn(`[gateway] 检测到未知的内容编码 (${origCe})，跳过 JS 替换以防损坏响应`);
+      return;
+    }
+
+    delete proxyRes.headers['content-length'];
+    res.removeHeader('content-length');
+
+    if (encType) {
+      delete proxyRes.headers['content-encoding'];
+      res.removeHeader('content-encoding');
+    }
+
+    const chunks = [];
+    const origWrite = res.write.bind(res);
+    const origEnd = res.end.bind(res);
+
+    res.write = function (chunk, ...rest) {
+      if (chunk !== undefined && chunk !== null) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return true;
+    };
+
+    res.end = function (chunk, ...rest) {
+      if (chunk !== undefined && chunk !== null) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      res.write = origWrite;
+      res.end = origEnd;
+
+      const rawBuffer = Buffer.concat(chunks);
+      let body = null;
+
+      if (encType) {
+        try {
+          body = decompressBuffer(rawBuffer, encType).toString('utf8');
+        } catch (err) {
+          // 同上：headersSent 已为 true，不能 setHeader 恢复 content-encoding；只做不抛异常的兜底透传。
+          console.warn(`[gateway] 解压上游 JS 失败 (${encType}):`, err && err.message, '，回退原样透传');
+          try {
+            return origEnd(rawBuffer, ...rest);
+          } catch (e2) {
+            console.warn('[gateway] JS 兜底写出失败:', e2 && e2.message);
+            try { res.destroy(); } catch {}
+            return;
+          }
+        }
+      } else {
+        body = rawBuffer.toString('utf8');
+      }
+
       if (body.includes(LOOPBACK_NEEDLE_1)) body = body.split(LOOPBACK_NEEDLE_1).join('true');
       if (body.includes(LOOPBACK_NEEDLE_2)) body = body.split(LOOPBACK_NEEDLE_2).join('"host"');
       if (body.includes(LOOPBACK_NEEDLE_3)) body = body.split(LOOPBACK_NEEDLE_3).join('"host"');

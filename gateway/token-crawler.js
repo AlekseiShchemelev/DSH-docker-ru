@@ -1,4 +1,5 @@
 const fs = require('fs');
+const zlib = require('zlib');
 
 const LOG_FILE = process.env.DSH_WEB_LOG || '/tmp/dsh-web.log';
 const TOKEN_FILE_AUTO = process.env.DSH_TOKEN_FILE_AUTO || '/tmp/dsh-launch-token';
@@ -99,6 +100,56 @@ function getCachedUpstreamCookie() {
   return state.upstreamCookie;
 }
 
+// 3. WebSocket wss:// 安全升级 shim（HTTPS 反向代理下防止 Mixed Content 拦截）
+const WS_UPGRADE_SHIM = `(function() {
+  try {
+    var loc = typeof window !== "undefined" && window.location ? window.location : (typeof location !== "undefined" ? location : null);
+    if (!loc || loc.protocol !== "https:") return;
+    if (typeof WebSocket === "undefined") return;
+    if (WebSocket.__dsh_wss_shimmed) return;
+
+    var OrigWebSocket = WebSocket;
+    var PatchedWebSocket = function(url, protocols) {
+      var targetUrl = url;
+      try {
+        if (typeof url === "string") {
+          var parsed = new URL(url, loc.href);
+          if (parsed.protocol === "ws:") {
+            parsed.protocol = "wss:";
+            targetUrl = parsed.toString();
+          }
+        } else if (typeof URL !== "undefined" && url instanceof URL) {
+          if (url.protocol === "ws:") {
+            var copy = new URL(url.toString());
+            copy.protocol = "wss:";
+            targetUrl = copy;
+          }
+        }
+      } catch (err) {}
+
+      if (protocols !== undefined) {
+        return new OrigWebSocket(targetUrl, protocols);
+      }
+      return new OrigWebSocket(targetUrl);
+    };
+
+    PatchedWebSocket.prototype = OrigWebSocket.prototype;
+    for (var key in OrigWebSocket) {
+      if (Object.prototype.hasOwnProperty.call(OrigWebSocket, key)) {
+        PatchedWebSocket[key] = OrigWebSocket[key];
+      }
+    }
+    PatchedWebSocket.CONNECTING = OrigWebSocket.CONNECTING !== undefined ? OrigWebSocket.CONNECTING : 0;
+    PatchedWebSocket.OPEN = OrigWebSocket.OPEN !== undefined ? OrigWebSocket.OPEN : 1;
+    PatchedWebSocket.CLOSING = OrigWebSocket.CLOSING !== undefined ? OrigWebSocket.CLOSING : 2;
+    PatchedWebSocket.CLOSED = OrigWebSocket.CLOSED !== undefined ? OrigWebSocket.CLOSED : 3;
+
+    PatchedWebSocket.__dsh_wss_shimmed = true;
+    if (typeof window !== "undefined") window.WebSocket = PatchedWebSocket;
+    if (typeof globalThis !== "undefined") globalThis.WebSocket = PatchedWebSocket;
+  } catch (e) {}
+})();`;
+
 // Polyfill for non-secure contexts (LAN IP / plain HTTP) and native __DSH_TRANSPORT__
 const RANDOM_UUID_POLYFILL = `<script>
 // 1. DSH 官方预留扩展锚点：显式声明拥有宿主回环控制权 (零侵入启用 host 模式，彻底免去源码修补)
@@ -121,6 +172,9 @@ globalThis.__DSH_TRANSPORT__ = { ownsHost: true };
     }
   } catch (e) {}
 })();
+
+// 3. WebSocket wss:// 安全升级 shim
+${WS_UPGRADE_SHIM}
 </script>`;
 
 function injectPolyfill(html) {
@@ -134,10 +188,40 @@ function injectPolyfill(html) {
   return RANDOM_UUID_POLYFILL + html;
 }
 
+function getEncodingType(encoding) {
+  const enc = String(encoding || '').trim().toLowerCase();
+  if (!enc || enc === 'identity') return null;
+  const first = enc.split(',')[0].trim();
+  if (first === 'gzip' || first === 'x-gzip') return 'gzip';
+  if (first === 'deflate') return 'deflate';
+  if (first === 'br') return 'br';
+  return 'unknown';
+}
+
+function decompressBuffer(buf, encType) {
+  if (encType === 'gzip') {
+    return zlib.gunzipSync(buf);
+  }
+  if (encType === 'deflate') {
+    try {
+      return zlib.inflateSync(buf);
+    } catch {
+      return zlib.inflateRawSync(buf);
+    }
+  }
+  if (encType === 'br') {
+    return zlib.brotliDecompressSync(buf);
+  }
+  throw new Error(`Unsupported encoding type: ${encType}`);
+}
+
 module.exports = {
   getLaunchToken,
   ensureUpstreamCookie,
   getCachedUpstreamCookie,
   RANDOM_UUID_POLYFILL,
-  injectPolyfill
+  WS_UPGRADE_SHIM,
+  injectPolyfill,
+  getEncodingType,
+  decompressBuffer
 };
