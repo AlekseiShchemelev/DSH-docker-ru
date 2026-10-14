@@ -2062,7 +2062,7 @@
             <div class="form-label" style="margin-bottom:6px; font-weight:700; color:var(--text-main);">Параметры рабочего стола (разрешение / сон / CDP)</div>
             <div style="font-size:12px; color:var(--text-muted); line-height:1.8;">
               Теперь единое управление на странице «<strong>Браузер и рабочий стол</strong>» с мгновенным сохранением; здесь вход больше не предоставляется, чтобы у одной настройки не было двух точек записи.<br>
-              Текущие значения: разрешение <strong id="roDesktopRes">--</strong>　｜　сон по простоям <strong id="roDesktopIdle">--</strong>　｜　CDP <strong id="roDesktopCdp">--</strong>
+              Текущие значения: разрешение <strong id="roDesktopRes">--</strong> | сон по простоям <strong id="roDesktopIdle">--</strong> | CDP <strong id="roDesktopCdp">--</strong>
             </div>
           </div>
 
@@ -3145,13 +3145,13 @@
           hubProjNotice.style.background = '#eff6ff';
           hubProjNotice.style.borderColor = '#bfdbfe';
           hubProjNotice.style.color = '#1e40af';
-          hubProjNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">💡 ${escapeHtml(titleText)}：</div>` + listHtml;
+          hubProjNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">💡 ${escapeHtml(titleText)}:</div>` + listHtml;
         } else {
           hubProjNotice.className = 'notice-card notice-card-block notice-info';
           hubProjNotice.style.background = '#f0fdf4';
           hubProjNotice.style.borderColor = '#bbf7d0';
           hubProjNotice.style.color = '#166534';
-          hubProjNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">🎉 ${escapeHtml(titleText)} (уже последняя)：</div>` + listHtml;
+          hubProjNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">🎉 ${escapeHtml(titleText)} (уже последняя):</div>` + listHtml;
         }
       }
 
@@ -3187,19 +3187,19 @@
 
         if (dsh.notice && dsh.notice.message) {
           hubDshNotice.className = 'notice-card notice-card-block notice-' + (dsh.notice.level || 'info');
-          hubDshNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">${escapeHtml(dsh.notice.title || 'Уведомление о состоянии ядра')}：<span style="font-weight:normal; font-size:12px;">${escapeHtml(dsh.notice.message)}</span></div>` + dshListHtml;
+          hubDshNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">${escapeHtml(dsh.notice.title || 'Уведомление о состоянии ядра')}:<span style="font-weight:normal; font-size:12px;">${escapeHtml(dsh.notice.message)}</span></div>` + dshListHtml;
         } else if (dsh.hasUpdate) {
           hubDshNotice.className = 'notice-card notice-card-block notice-info';
           hubDshNotice.style.background = '#eff6ff';
           hubDshNotice.style.borderColor = '#bfdbfe';
           hubDshNotice.style.color = '#1e40af';
-          hubDshNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">💡 Ключевые моменты нового официального релиза (v${escapeHtml(dsh.latest)})：</div>` + dshListHtml;
+          hubDshNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">💡 Ключевые моменты нового официального релиза (v${escapeHtml(dsh.latest)}):</div>` + dshListHtml;
         } else {
           hubDshNotice.className = 'notice-card notice-card-block notice-info';
           hubDshNotice.style.background = '#f0fdf4';
           hubDshNotice.style.borderColor = '#bbf7d0';
           hubDshNotice.style.color = '#166534';
-          hubDshNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">✔ Ключевые возможности официального ядра (v${escapeHtml(dsh.current || '0.2.1-alpha.2')})：</div>` + dshListHtml;
+          hubDshNotice.innerHTML = `<div class="notice-title" style="font-weight:700; font-size:13px; margin-bottom:8px; display:block;">✔ Ключевые возможности официального ядра (v${escapeHtml(dsh.current || '0.2.1-alpha.2')}):</div>` + dshListHtml;
         }
       }
 
@@ -3376,7 +3376,7 @@
 
       const titleElem = document.getElementById('popoverContentTitle');
       if (titleElem) {
-        titleElem.textContent = proj.updateTitle ? `📋 ${proj.updateTitle}:` : (hasUpdate ? `📋 Изменения в новой версии (v${lat})：` : `📋 Изменения в текущей версии (v${cur})：`);
+         titleElem.textContent = proj.updateTitle ? `📋 ${proj.updateTitle}:` : (hasUpdate ? `📋 Изменения в новой версии (v${lat}):` : `📋 Изменения в текущей версии (v${cur}):`);
       }
 
       const listElem = document.getElementById('popoverChangelogList');

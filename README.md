@@ -1,9 +1,9 @@
 # DeepSeek Harness Docker
 
-> 📌 **Информация о версиях**: совместимость с официальным ядром DeepSeek Harness `0.2.1-alpha.2` / `0.2.1-alpha.1` / `0.2.0-rc.2` / `0.2.0-rc.1` / `0.1.7-rc.2` / `0.1.7-rc.1` / `0.1.7-alpha.2` / `0.1.7-alpha.1` / `0.1.6-alpha.2` / `0.1.6-alpha.1` / `0.1.5-rc.2` / `0.1.5-rc.1` / `0.1.2-rc.1` ｜ версия проекта `0.2.3`  
+> 📌 **Информация о версиях**: совместимость с официальным ядром DeepSeek Harness `0.2.1-alpha.2` / `0.2.1-alpha.1` / `0.2.0-rc.2` / `0.2.0-rc.1` / `0.1.7-rc.2` / `0.1.7-rc.1` / `0.1.7-alpha.2` / `0.1.7-alpha.1` / `0.1.6-alpha.2` / `0.1.6-alpha.1` / `0.1.5-rc.2` / `0.1.5-rc.1` / `0.1.2-rc.1` | версия проекта `0.2.3`  
 > 🔗 **Быстрые ссылки**:
-> - ⚡ **Официальный репозиторий DSH**: [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) ｜ [Журнал обновлений официальных Releases](https://github.com/deepseek-ai/deepseek-harness/releases) ｜ [Страница официального пакета npm](https://www.npmjs.com/package/@deepseek-ai/dsh)
-> - 📦 **Docker-репозиторий данного проекта**: [misaka-link/deepseek-harness-docker](https://github.com/misaka-link/deepseek-harness-docker) ｜ [Releases данного проекта](https://github.com/misaka-link/deepseek-harness-docker/releases)
+> - ⚡ **Официальный репозиторий DSH**: [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | [Журнал обновлений официальных Releases](https://github.com/deepseek-ai/deepseek-harness/releases) | [Страница официального пакета npm](https://www.npmjs.com/package/@deepseek-ai/dsh)
+> - 📦 **Docker-репозиторий данного проекта**: [misaka-link/deepseek-harness-docker](https://github.com/misaka-link/deepseek-harness-docker) | [Releases данного проекта](https://github.com/misaka-link/deepseek-harness-docker/releases)
 > 🏷️ **Правила именования тегов образов**: по умолчанию при скачивании образы единообразно используют **`:latest`** (чистая версия) и **`:latest-market`** (версия с магазином плагинов) — готовы к работе из коробки; при каждой сборке образа **дополнительно проставляются ещё два тега версий**:  
 > 1. **Дополнительный тег 1 — встроенный тег версии официального ядра DeepSeek Harness** (например `:0.2.1-alpha.2`, `:0.2.1-alpha.2-market`), точно привязывающий к официальному движку DSH;  
 > 2. **Дополнительный тег 2 — тег версии самого проекта** (например `:0.2.3`, `:0.2.3-market`), точно привязывающий к версии этого контейнерного набора.

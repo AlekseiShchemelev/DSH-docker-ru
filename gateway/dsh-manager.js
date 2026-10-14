@@ -920,7 +920,7 @@ class DshManager {
         }
 
         // ==========================================================
-        // 【Самовосстановление при сбое запуска и автоизоляция сбойных плагинов】
+        // [Самовосстановление при сбое запуска и автоизоляция сбойных плагинов]
         // Ограничения: 1. Функция самовосстановления включена (autoHealEnabled)
         //              2. За один цикл запуска количество изоляций не превысило лимит (лимит: 3)
         //              3. Нет ручной остановки или установки с обновлением
@@ -930,7 +930,7 @@ class DshManager {
             const detected = this.detectCrashingPlugin(this.recentLogs);
             if (detected) {
               this.autoHealCountInCurrentBoot++;
-              console.warn(`[dsh-manager] 🛡️ 【Сработало самовосстановление сбоя запуска (${this.autoHealCountInCurrentBoot}/${this.maxAutoHealPerBoot})】Обнаружено расширение «${detected.name}», вызывающее сбой запуска DSH (${detected.matched})!`);
+              console.warn(`[dsh-manager] 🛡️ [Сработало самовосстановление сбоя запуска (${this.autoHealCountInCurrentBoot}/${this.maxAutoHealPerBoot})] Обнаружено расширение «${detected.name}», вызывающее сбой запуска DSH (${detected.matched})!`);
               console.log(`[dsh-manager] Автоматически изолируем и отключаем расширение «${detected.name}», чтобы вернуть работоспособность системы...`);
 
               try {
