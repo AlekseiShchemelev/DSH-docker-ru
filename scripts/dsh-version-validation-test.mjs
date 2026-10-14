@@ -1,6 +1,6 @@
 /**
- * S1 回归测试：DSH 版本号校验与路径包含性。
- * 纯函数测试，无副作用。用法: node scripts/dsh-version-validation-test.mjs
+ * S1 регрессионный тест: проверка номера версии DSH и вложенности пути.
+ * Тест чистых функций, без побочных эффектов. Запуск: node scripts/dsh-version-validation-test.mjs
  */
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -16,12 +16,12 @@ const ok = (cond, msg) => {
   else { console.log('   ❌ ' + msg); fail++; }
 };
 
-console.log('\n=== A. 合法版本号应通过 ===');
+console.log('\n=== A. Допустимые номера версий должны проходить ===');
 for (const v of ['0.1.6-alpha.2', '1.2.3', '0.1.2-rc.1', '10.20.30', '1.0.0+build.5', '0.1.6-alpha.2+build.1', '  0.1.6  ']) {
-  ok(isValidVersion(v), `合法: ${JSON.stringify(v)}`);
+  ok(isValidVersion(v), `допустимо: ${JSON.stringify(v)}`);
 }
 
-console.log('\n=== B. 攻击性/非法输入应被拒 ===');
+console.log('\n=== B. Атакующие/недопустимые входные значения должны отклоняться ===');
 const bad = [
   '../../../root/.dsh/profiles/web',
   '../../..',
@@ -46,17 +46,17 @@ const bad = [
   123,
   {}
 ];
-for (const v of bad) ok(!isValidVersion(v), `拒绝: ${JSON.stringify(v)?.slice(0, 40)}`);
+for (const v of bad) ok(!isValidVersion(v), `отклонено: ${JSON.stringify(v)?.slice(0, 40)}`);
 
-console.log('\n=== C. resolveWithinDir 包含性 ===');
+console.log('\n=== C. Вложенность resolveWithinDir ===');
 const base = '/root/.dsh-snapshots/versions';
-ok(resolveWithinDir(base, '0.1.6-alpha.2') === '/root/.dsh-snapshots/versions/0.1.6-alpha.2', '正常版本落在目录内');
-ok(resolveWithinDir(base, 'a/../b') === '/root/.dsh-snapshots/versions/b', '内部 .. 归一化后仍在目录内');
+ok(resolveWithinDir(base, '0.1.6-alpha.2') === '/root/.dsh-snapshots/versions/0.1.6-alpha.2', 'нормальная версия лежит в каталоге');
+ok(resolveWithinDir(base, 'a/../b') === '/root/.dsh-snapshots/versions/b', 'внутренние .. после нормализации остаются в каталоге');
 for (const v of ['../../../root/.dsh/profiles/web', '/etc/passwd', '../../..']) {
   let threw = false;
   try { resolveWithinDir(base, v); } catch { threw = true; }
-  ok(threw, `越界被拒: ${JSON.stringify(v)}`);
+  ok(threw, `выход за пределы отклонён: ${JSON.stringify(v)}`);
 }
 
-console.log(`\n===== 汇总: 通过 ${pass} / 失败 ${fail} =====`);
+console.log(`\n===== Итог: пройдено ${pass} / провалено ${fail} =====`);
 process.exit(fail ? 1 : 0);

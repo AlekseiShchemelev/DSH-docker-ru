@@ -15,10 +15,10 @@ try { fs.mkdirSync(SNAPSHOTS_DIR, { recursive: true }); } catch {}
 try { fs.mkdirSync(DSH_WORKSPACE, { recursive: true }); } catch {}
 
 function killPortProcess(port) {
-  // 安全阀：绝不清理网关自己的端口（若 DSH_PORT 被误配成 PROXY_PORT，fuser -k 会杀掉网关自身）
+  // Предохранитель: никогда не чистим порт самого шлюза (если DSH_PORT ошибочно настроен как PROXY_PORT, `fuser -k` убьёт сам шлюз)
   const proxyPort = Number(process.env.PROXY_PORT) || 3080;
   if (Number(port) === proxyPort) {
-    console.warn(`[dsh-manager] 跳过端口清理：目标端口 ${port} 与网关端口相同，避免误杀自身`);
+    console.warn(`[dsh-manager] Пропуск очистки порта: целевой порт ${port} совпадает с портом шлюза, во избежание случайного убийства собственного процесса`);
     return;
   }
   try {
@@ -28,7 +28,7 @@ function killPortProcess(port) {
     const res = spawnSync('ps', ['-eo', 'pid,args'], { encoding: 'utf8' });
     if (res.status === 0 && res.stdout) {
       for (const line of res.stdout.split('\n')) {
-        // 收敛匹配：仅处理"本 DSH 端口上的 dsh web 服务进程"，避免误伤其它同名命令
+        // Точная фильтрация: обрабатываем только «процесс dsh web на данном DSH-порту», чтобы не задеть другие одноимённые команды
         if (!/dsh\s+web(\s|$)/.test(line)) continue;
         if (!line.includes(String(port))) continue;
         const m = line.trim().match(/^(\d+)/);
@@ -69,7 +69,7 @@ async function ensurePortReleased(port, timeoutMs = 3500) {
       }
     } catch {}
 
-    // 若未查到，使用 Node net 模块作双重确认 (防 ss 缺失误判)
+    // Двойная проверка через модуль net на случай, если утилиты `ss` нет или она дала ложный результат
     if (!inUse) {
       inUse = await isPortInUse(port);
     }
@@ -81,10 +81,12 @@ async function ensurePortReleased(port, timeoutMs = 3500) {
   return false;
 }
 
-// ── 版本元数据单一数据源 ────────────────────────────────────────────
-// 「已适配版本」曾在本文件、version-service.js 与 version.json 三处各写一份，
-// 升级时漏改本文件，导致管理后台把 0.1.7-alpha.1/alpha.2 误判为「未经特殊适配」。
-// 现统一优先读取仓库根 version.json 的 compatibility.adaptedVersions，杜绝再次漂移。
+// ── Единый источник метаданных версий ────────────────────────────────────────────
+// «Поддерживаемые версии» ранее велись в трёх местах: в этом файле, в version-service.js
+// и в version.json. При обновлении этот файл нередко забывали править, из-за чего
+// панель управления ошибочно считала 0.1.7-alpha.1/alpha.2 «специально не адаптированными».
+// Теперь единообразно в 우선ном порядке читается compatibility.adaptedVersions из
+// version.json в корне репозитория, что исключает повторное расхождение.
 const VERSION_META_PATHS = [
   path.join(__dirname, '../version.json'),
   path.join(__dirname, 'version.json'),
@@ -103,7 +105,7 @@ function readVersionMeta() {
 
 const VERSION_META = readVersionMeta();
 
-// 兜底清单：仅在 version.json 缺失时使用，必须与 compatibility.recommendedDsh 保持同步
+// Резервный список: используется только при отсутствии version.json; должен поддерживаться в синхронизме с compatibility.recommendedDsh
 const DEFAULT_ADAPTED_VERSIONS = [
   '0.2.1-alpha.2',
   '0.2.1-alpha.1',
@@ -120,7 +122,7 @@ const DEFAULT_ADAPTED_VERSIONS = [
   '0.1.2-rc.1'
 ];
 
-// 版本探测失败时的兜底版本号（优先取 version.json 供应链固定版本）
+// Резервный номер версии при неудаче определения (в приоритете берётся зафиксированная в version.json версия из цепочки поставок)
 const FALLBACK_DSH_VERSION = (VERSION_META && VERSION_META.supply && VERSION_META.supply.dshVersion) || '0.2.1-alpha.2';
 
 function parseSemver(v = '') {
@@ -141,30 +143,38 @@ function compareSemver(v1, v2) {
   return p1.pre.localeCompare(p2.pre);
 }
 
-// ── 版本存储库（持久化路径）与目录置换原语 ──────────────────────────────
-// Issue #7 修复：版本归档原先落在 /app（容器可写层），容器重建或镜像更新即蒸发，
-// 导致「切回旧版必须重新下载」。现迁移到持久化路径 $DSH_SNAPSHOTS_DIR/versions
-// （复用快照卷，见下方 VERSIONS_DIR），并把「先 rm -rf 活动核心再 cp」改为
-// 「staging 复制 + 目录置换（优先 rename；overlayfs lower 层退化为复制 + 删除）」。
+// ── Хранилище версий (постоянный путь) и примитивы подмены каталогов ──────────────────────────────
+// Исправление Issue #7: архивы версий ранее складывались в /app (записываемый слой контейнера),
+// поэтому пересоздание контейнера или обновление образа стирали их, и «возврат к старой версии»
+// требовал повторной загрузки. Теперь они перенесены в постоянный путь $DSH_SNAPSHOTS_DIR/versions
+// (том со снимками, см. VERSIONS_DIR ниже), а схема «сначала rm -rf активного ядра, затем cp»
+// заменена на «staging-копирование + подмену каталога (приоритетно rename; на нижнем слое
+// overlayfs — откат на копирование + удаление)».
 const DSH_HOME_DIR = process.env.DSH_HOME || '/root';
-// 版本库默认落在「快照与备份」卷内的子目录（复用现有 ./data/snapshots 挂载，不再新增挂载点）。
-// 它是惰性缓存：只在「切换版本」时被读取，其余时间可随时删除（代价仅是该次回切重新下载）。
-// 需要隔离的用户可用 DSH_VERSIONS_DIR 指到独立卷，例如 /root/.dsh-versions。
+// Хранилище версий по умолчанию размещается как подкаталог внутри тома «Снимки и резервные копии»
+// (переиспользуется существующее примонтирование ./data/snapshots, новые точки монтирования не добавляются).
+// Это ленивый кэш: он читается только при «переключении версии», в остальное время его можно
+// удалить в любой момент (цена — лишь повторная загрузка при следующем возврате).
+// Пользователям, которым нужна изоляция, можно указать DSH_VERSIONS_DIR на отдельный том,
+// например /root/.dsh-versions.
 const VERSIONS_DIR = process.env.DSH_VERSIONS_DIR || path.join(SNAPSHOTS_DIR, 'versions');
 const STORE_STAGING_DIR = path.join(VERSIONS_DIR, '.staging');
-// 测试钩子：允许把「活动核心父目录 / dsh 软链」指到临时目录，从而在单元测试中覆盖
-// 置换与回滚逻辑。生产环境不设置这些变量，行为完全一致。
+// Тестовый хук: позволяет направить «каталог-родитель активного ядра / символическую ссылку dsh»
+// во временный каталог, чтобы в юнит-тестах проверять логику подмены и отката.
+// В продакшене эти переменные не задаются, поведение полностью идентично.
 const LIVE_CORE_PARENT = process.env.DSH_TEST_CORE_PARENT || '/usr/local/lib/node_modules/@deepseek-ai';
 const LIVE_CORE_DIR = path.join(LIVE_CORE_PARENT, 'dsh');
 const DSH_BIN_LINK = process.env.DSH_TEST_BIN_LINK || '/usr/local/bin/dsh';
 const ROLLBACK_PRESERVED_DIR = path.join(LIVE_CORE_PARENT, '.dsh-rollback-preserved');
 const READY_FILE = '.ready';
 const GC_KEEP_DEFAULT = Number(process.env.DSH_VERSIONS_KEEP) || 3;
-// 切换前磁盘水位阈值（MB，默认 1536；可用 DSH_VERSIONS_MIN_FREE_MB 覆盖，便于低配环境与故障演练）
+// Порог свободного места на диске перед переключением (МБ, по умолчанию 1536; можно переопределить
+// через DSH_VERSIONS_MIN_FREE_MB для слабых сред и учёжных сценариев)
 const MIN_FREE_BYTES = Math.max(64, Number(process.env.DSH_VERSIONS_MIN_FREE_MB) || 1536) * 1024 * 1024;
 
-// 镜像版本标识：同一 dsh 版本号可能出现在不同项目镜像里（version.json 未变则 dshVersion 相同），
-// 记录进 .ready 便于诊断「归档来自哪个镜像」。
+// Идентификатор образа: один и тот же номер версии dsh может встречаться в образах разных проектов
+// (если version.json не менялся, dshVersion совпадает); записывается в .ready для диагностики
+// «из какого образа получен архив».
 const IMAGE_REVISION = (() => {
   const p = (VERSION_META && VERSION_META.latest && VERSION_META.latest.version) || 'unknown';
   const d = (VERSION_META && VERSION_META.supply && VERSION_META.supply.dshVersion) || 'unknown';
@@ -173,13 +183,13 @@ const IMAGE_REVISION = (() => {
 
 try { fs.mkdirSync(STORE_STAGING_DIR, { recursive: true }); } catch {}
 
-/** 执行外部命令并在失败时抛错（替代裸 spawnSync 的静默失败） */
+/** Запуск внешней команды с выбрасыванием ошибки при неудаче (вместо молчаливого отказа голого spawnSync) */
 function runSyncSafe(cmd, args, options = {}) {
   const res = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...options });
-  if (res.error) throw new Error(`执行 ${cmd} 失败: ${res.error.message}`);
+  if (res.error) throw new Error(`Не удалось выполнить ${cmd}: ${res.error.message}`);
   if (res.status !== 0) {
     const detail = String(res.stderr || res.stdout || '').trim().slice(0, 300);
-    throw new Error(`${cmd} ${args.slice(0, 2).join(' ')} … 退出码 ${res.status}${detail ? ': ' + detail : ''}`);
+    throw new Error(`${cmd} ${args.slice(0, 2).join(' ')} … код выхода ${res.status}${detail ? ': ' + detail : ''}`);
   }
   return res;
 }
@@ -189,11 +199,14 @@ function isNonEmptyDir(p) {
 }
 
 /**
- * 把目录 src 移动到 dst。
- * 关键坑（远程实测）：overlayfs 上「位于 lower 层（镜像只读层）的目录」无法被 rename——
- * 内核会返回 EXDEV（cross-device link not permitted）。活动核心 `/usr/local/lib/node_modules/
- * @deepseek-ai/dsh` 在容器启动后若未被改写，就恰好位于 lower 层，此时必须退化为「复制 + 删除」。
- * 语义等价，代价是多一次拷贝（仅每个容器世代首次切换时会命中该分支）。
+ * Перемещение каталога src в dst.
+ * Важная тонкость (проверено удалённо): каталог, расположенный на нижнем слое overlayfs
+ * (только для чтения слой образа), нельзя переименовать — ядро возвращает EXDEV
+ * (cross-device link not permitted). Активное ядро `/usr/local/lib/node_modules/
+ * @deepseek-ai/dsh`, если после запуска контейнера его не перезаписывали, как раз находится
+ * на нижнем слое; в этом случае приходится откатываться на «копирование + удаление».
+ * Семантически это эквивалентно, цена — одна дополнительная копия (ветка срабатывает лишь
+ * при первом переключении в рамках каждого поколения контейнера).
  * @returns {'rename'|'copy'}
  */
 function moveDirOrCopy(src, dst) {
@@ -209,14 +222,14 @@ function moveDirOrCopy(src, dst) {
   }
 }
 
-/** 用备份目录恢复活动核心（同样兼容 overlayfs 的 EXDEV） */
+/** Восстановление активного ядра из резервной копии (также совместимо с EXDEV на overlayfs) */
 function restoreCoreFromBackup(backupDir) {
-  if (!fs.existsSync(backupDir)) throw new Error('回滚点不存在，无法还原');
+  if (!fs.existsSync(backupDir)) throw new Error('Точка отката не существует, восстановление невозможно');
   try { fs.rmSync(LIVE_CORE_DIR, { recursive: true, force: true }); } catch {}
   moveDirOrCopy(backupDir, LIVE_CORE_DIR);
 }
 
-/** 统计目录的文件数与总字节（用于 .ready 完整性元数据） */
+/** Подсчёт числа файлов и суммарного размера в байтах каталога (для метаданных целостности .ready) */
 function measureDir(dir) {
   let files = 0;
   let bytes = 0;
@@ -241,11 +254,11 @@ function readReadyMarker(dir) {
   } catch { return null; }
 }
 
-/** 归档目录是否「完整可用」：.ready 签名 + package.json + 非空 node_modules，且 Node ABI / 架构匹配 */
+/** Полностью ли пригоден каталог архива: подпись .ready + package.json + непустой node_modules, а также совпадение ABI / архитектуры Node */
 function isReadyVersionDir(dir) {
   if (!dir || !fs.existsSync(path.join(dir, 'package.json'))) return false;
   const marker = readReadyMarker(dir);
-  if (!marker) return false; // 无签名 → 视为半成品，绝不部署
+  if (!marker) return false; // нет подписи → считается незавершённым, никогда не разворачивается
   if (marker.nodeAbi && String(marker.nodeAbi) !== String(process.versions.modules)) return false;
   if (marker.arch && marker.arch !== process.arch) return false;
   return isNonEmptyDir(path.join(dir, 'node_modules'));
@@ -272,13 +285,13 @@ function dirSizeBytes(dir) {
 }
 
 function formatBytes(n) {
-  if (!Number.isFinite(n)) return '未知';
+  if (!Number.isFinite(n)) return 'неизвестно';
   if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + ' GB';
   if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + ' MB';
   return (n / 1024).toFixed(0) + ' KB';
 }
 
-/** 目标路径是否落在某个真实挂载点下（用于判断版本库是否真的持久化） */
+/** Лежит ли целевой путь под каким-либо реальным точкой монтирования (для проверки, действительно ли хранилище версий персистентно) */
 function isMountedPath(p) {
   try {
     const info = fs.readFileSync('/proc/self/mountinfo', 'utf8');
@@ -289,7 +302,7 @@ function isMountedPath(p) {
   } catch { return false; }
 }
 
-/** 列出持久化版本库中的条目（含体积与最后使用时间） */
+/** Перечисление записей в персистентном хранилище версий (с размером и временем последнего использования) */
 function listStoreEntries() {
   const out = [];
   let names = [];
@@ -322,9 +335,10 @@ class DshManager {
     this.registry = process.env.NPM_REGISTRY || 'https://registry.npmmirror.com';
     this.launchToken = '';
     this.upstreamCookie = '';
-    // 持久化版本库（Issue #7）：容器重建 / 镜像更新后仍保留，回切免下载秒级还原
+    // Персистентное хранилище версий (Issue #7): сохраняется после пересоздания контейнера / обновления образа,
+    // возврат к предыдущей версии выполняется мгновенно без повторной загрузки
     this.versionsCacheDir = VERSIONS_DIR;
-    // 容器层就地回滚点受保护槽位（单槽位保留一份，不持久化）
+    // Защищённый слот локальной точки отката в слое контейнера (хранится одна копия, не персистентна)
     this.rollbackPreservedDir = ROLLBACK_PRESERVED_DIR;
     this.lastGcAt = 0;
     this.restartTimer = null;
@@ -338,36 +352,39 @@ class DshManager {
     this.maxAutoHealPerBoot = 5;
     this.autoHealCountInCurrentBoot = 0;
     this.autoIsolatedEvents = [];
-    // 生命周期操作串行队列：boot/stop/restart 依次执行，杜绝并发启动与守护自愈互相打架
+    // Последовательная очередь операций жизненного цикла: boot/stop/restart выполняются по очереди,
+    // что исключает одновременный запуск и конфликты между защитным самовосстановлением
     this._opChain = Promise.resolve();
-    // 崩溃时间窗口（M4）：只按"最近一段时间内的崩溃次数"熔断，而不是被一次就绪清零
+    // Окно аварий (M4): предохранитель срабатывает по «числу аварий за последние некоторое время»,
+    // а не сбрасывается одним успешным запуском до готовности
     this.crashWindow = [];
     try {
       fs.mkdirSync(this.versionsCacheDir, { recursive: true });
     } catch (e) {
-      // 不再静默：版本库不可写会导致「回切必须重新下载」，必须让运维看得见
-      console.warn(`[dsh-manager] ⚠️ 版本库目录不可用 (${this.versionsCacheDir}): ${e.message}；版本回切将退化为重新下载`);
+      // Без молчания: недоступное на запись хранилище версий приведёт к тому, что «возврат к прошлой версии потребует повторной загрузки»;
+      // это должно быть заметно сопровождающему персоналу
+      console.warn(`[dsh-manager] ⚠️ Каталог хранилища версий недоступен (${this.versionsCacheDir}): ${e.message}; возврат к предыдущей версии будет выполнен через повторную загрузку`);
     }
   }
 
-  // 把生命周期操作串行化：前序操作无论成功失败都不阻塞后续操作
+  // Сериализация операций жизненного цикла: предыдущая операция (успех или отказ) не блокирует последующие
   _enqueue(task) {
     const run = this._opChain.then(task, task);
-    // 看门狗（最后一道保险）：任务若 180s 内仍未 settle（内部 Promise 泄漏等），
-    // 记录告警并放行后续操作，避免整个生命周期队列被永久卡死。
+    // Сторожевой таймер (последний рубеж защиты): если задача не завершится за 180 с (утечка внутреннего Promise и т.п.),
+    // фиксируется предупреждение и последующие операции пропускаются, чтобы вся очередь жизненного цикла не зависла навсегда.
     let timer = null;
     const guarded = Promise.race([
       run,
       new Promise((resolve) => {
         timer = setTimeout(() => {
-          console.warn('[dsh-manager] ⚠️ 生命周期操作超过 180s 未返回，放行后续操作（看门狗触发）');
+          console.warn('[dsh-manager] ⚠️ Операция жизненного цикла не вернулась за 180 с, последующие операции пропускаются (сработал сторожевой таймер)');
           resolve({ ok: false, error: 'operation_timeout' });
         }, 180000);
         if (timer.unref) timer.unref();
       })
     ]);
-    // 关键：操作一旦 settle 就清掉计时器。原实现从不清除 → 即使操作早已成功，
-    // 进程在启动 180s 后仍会打印"看门狗触发"的假告警（远程实测到的就是这种假告警）。
+    // Важно: таймер снимается, как только операция завершилась. В исходной реализации он никогда не снимался → даже если операция давно уже успешно завершилась,
+    // процесс через 180 с после запуска всё равно печатал ложное предупреждение «сработал сторожевой таймер» (именно такие ложные срабатывания наблюдались удалённо).
     const clear = () => { if (timer) clearTimeout(timer); };
     guarded.then(clear, clear);
     this._opChain = guarded.then(() => {}, () => {});
@@ -377,7 +394,7 @@ class DshManager {
   setAutoHeal(enabled, maxPerBoot = 5) {
     this.autoHealEnabled = enabled !== false;
     this.maxAutoHealPerBoot = Math.max(1, Math.min(50, Number(maxPerBoot) || 5));
-    console.log(`[dsh-manager] 启动崩溃自愈与插件自动隔离策略已更新: ${this.autoHealEnabled ? '已开启' : '已关闭'} (单周期上限: ${this.maxAutoHealPerBoot})`);
+    console.log(`[dsh-manager] Политика самовосстановления при авариях запуска и автоизоляции плагинов обновлена: ${this.autoHealEnabled ? 'включена' : 'выключена'} (лимит за один цикл: ${this.maxAutoHealPerBoot})`);
   }
 
   getAutoIsolatedEvents() {
@@ -412,18 +429,18 @@ class DshManager {
         pluginsList = res.plugins;
       }
     } catch (e) {
-      console.warn('[dsh-manager] 获取插件列表进行崩溃分析失败:', e.message);
+      console.warn('[dsh-manager] Не удалось получить список плагинов для анализа аварий:', e.message);
       return null;
     }
 
-    // 严禁对系统核心组件进行隔离，仅针对非核心、启用状态的插件进行分析
+    // Строго запрещается изолировать системные ядерные компоненты; анализируются только неядерные включённые плагины
     const candidatePlugins = pluginsList.filter(p => !p.isCore && p.enabled && !p.isUninstalled);
     if (candidatePlugins.length === 0) return null;
 
-    // 1. 结构化 Cordis 加载器条目报错提取
-    // 匹配形如: failed to import loader entry archived-chats (dsh-archived-chats): ...
-    // 或: failed to apply loader entry include (cordis:include): ...
-    // 或: loader entry <id> (<name>): ...
+    // 1. Извлечение структурированных ошибок загрузчика Cordis о записях загрузчика
+    // Совпадения вида: failed to import loader entry archived-chats (dsh-archived-chats): ...
+    // или: failed to apply loader entry include (cordis:include): ...
+    // или: loader entry <id> (<name>): ...
     const cordisEntryRegex = /(?:loader entry|failed to (?:import|apply|load|resolve)[^:\n]*loader entry)\s+([a-zA-Z0-9_\-\.\@\/]+)(?:\s*\(([@a-zA-Z0-9_\-\.\/]+)\))?/gi;
     let m;
     while ((m = cordisEntryRegex.exec(logText)) !== null) {
@@ -437,13 +454,13 @@ class DshManager {
           return {
             name: p.name,
             reason: 'cordis_loader_entry_failure',
-            matched: `Cordis 加载器明确报告条目装载失败: ${entryId}${pkgName ? ` (${pkgName})` : ''}`
+            matched: `Загрузчик Cordis явно сообщил о сбое загрузки записи: ${entryId}${pkgName ? ` (${pkgName})` : ''}`
           };
         }
       }
     }
 
-    // 2. 括号包裹的明确包名检测 (Cordis 在错误信息中固定用括号注明包名，如 `(dsh-archived-chats)`)
+    // 2. Обнаружение явного имени пакета в скобках (Cordis всегда указывает имя пакета в скобках в сообщениях об ошибках, например `(dsh-archived-chats)`)
     for (const p of candidatePlugins) {
       if (p.isCore) continue;
       const escaped = p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -452,12 +469,12 @@ class DshManager {
         return {
           name: p.name,
           reason: 'plugin_paren_mention',
-          matched: `加载器报错信息明确标注故障拓展: (${p.name})`
+          matched: `Сообщение об ошибке загрузчика явно указывает на сбойное расширение: (${p.name})`
         };
       }
     }
 
-    // 3. 广义装载与依赖导入失败检测 (failed to import/load/apply ... <pluginName>)
+    // 3. Обнаружение общих сбоев загрузки и импорта зависимостей (failed to import/load/apply ... <pluginName>)
     for (const p of candidatePlugins) {
       if (p.isCore) continue;
       const escaped = p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -466,12 +483,12 @@ class DshManager {
         return {
           name: p.name,
           reason: 'failed_to_import',
-          matched: `日志检测到拓展装载失败: ${p.name}`
+          matched: `В журнале обнаружен сбой загрузки расширения: ${p.name}`
         };
       }
     }
 
-    // 4. 深度扫描：Node.js 异常调用栈定位 (node_modules/<name>/... 或 imported from ...<name>)
+    // 4. Глубокое сканирование: локализация по стеку вызовов Node.js (node_modules/<name>/... или imported from ...<name>)
     for (const p of candidatePlugins) {
       if (p.isCore) continue;
       const escaped = p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -480,13 +497,13 @@ class DshManager {
         return {
           name: p.name,
           reason: 'stack_trace_match',
-          matched: `调用堆栈直接定位到故障插件: ${p.name}`
+          matched: `Стек вызовов напрямую указывает на сбойный плагин: ${p.name}`
         };
       }
     }
 
-    // 5. Cordis Patch 配置冲突：必须是"结构化"的解析报错，且与插件名在**同一行**出现。
-    //    旧实现只要全文同时出现 "patch" 与插件名就命中，极易误伤（例如本项目的补丁脚本日志）。
+    // 5. Конфликт конфигурации патчей Cordis: требуется «структурированная» ошибка разбора, причём имя плагина должно встретиться **в одной строке**.
+    //    Старая реализация срабатывала при любом совпадении «patch» и имени плагина в тексте, что часто давало ложные срабатывания (например, на логи патч-скриптов этого проекта).
     for (const p of candidatePlugins) {
       if (p.isCore) continue;
       const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -497,13 +514,13 @@ class DshManager {
         return {
           name: p.name,
           reason: 'patch_conflict',
-          matched: `Cordis 补丁配置解析冲突: ${p.name}`
+          matched: `Конфликт разбора конфигурации патчей Cordis: ${p.name}`
         };
       }
     }
 
-    // 6. 插件自身标签的致命报错：要求**同一行**同时出现标签与错误标记。
-    //    旧实现是"全文任意位置同时出现"，别的插件报错也会误伤本插件。
+    // 6. Фатальные ошибки по собственному тегу плагина: тег и признак ошибки должны встретиться **в одной строке**.
+    //    Старая реализация искала их в произвольных местах текста, из-за чего ошибки других плагинов могли ложно обвинять этот плагин.
     for (const p of candidatePlugins) {
       if (p.isCore) continue;
       const short = p.name.replace(/^@.*\//, '');
@@ -513,7 +530,7 @@ class DshManager {
         return {
           name: p.name,
           reason: 'plugin_logger_error',
-          matched: `插件内部日志打印致命异常: [${short}]`
+          matched: `Во внутреннем журнале плагина напечатано фатальное исключение: [${short}]`
         };
       }
     }
@@ -559,8 +576,8 @@ class DshManager {
     try {
       if (!fs.existsSync(this.versionsCacheDir)) return [];
       return fs.readdirSync(this.versionsCacheDir).filter(name => {
-        if (name.startsWith('.')) return false; // 跳过 .staging 等内部目录
-        // 必须通过 .ready 完整性校验：半成品（只落了 package.json）绝不算「已缓存」
+        if (name.startsWith('.')) return false; // пропуск внутренних каталогов вроде .staging
+        // Обязательна проверка целостности .ready: неполный результат (с лежащим лишь package.json) ни в коем случае не считается «закэшированным»
         return isReadyVersionDir(path.join(this.versionsCacheDir, name));
       });
     } catch {
@@ -584,7 +601,7 @@ class DshManager {
     const liveList = liveMeta && liveMeta.compatibility && liveMeta.compatibility.adaptedVersions;
     if (Array.isArray(liveList) && liveList.length) return liveList;
 
-    // 单一数据源回退：本地 version.json -> DEFAULT_ADAPTED_VERSIONS
+    // Откат к единому источнику данных: локальный version.json -> DEFAULT_ADAPTED_VERSIONS
     const localList = VERSION_META && VERSION_META.compatibility && VERSION_META.compatibility.adaptedVersions;
     if (Array.isArray(localList) && localList.length) return localList;
     return DEFAULT_ADAPTED_VERSIONS;
@@ -633,7 +650,7 @@ class DshManager {
     let distTags = {};
     let versions = [];
 
-    // 优先使用原生异步 fetch 请求 registry，绝不阻塞主事件循环
+    // По возможности используем нативный асинхронный fetch к registry — он никогда не блокирует главный цикл событий
     try {
       const regUrl = this.registry.replace(/\/+$/, '') + '/@deepseek-ai/dsh';
       const resp = await fetch(regUrl, { signal: AbortSignal.timeout(6000) });
@@ -643,7 +660,7 @@ class DshManager {
         versions = Object.keys(pkgData.versions || {});
       }
     } catch (fetchErr) {
-      // 网络或镜像源异常时，回退至非阻塞异步 npm view
+      // При сбое сети или зеркала registry переключаемся на неблокирующий асинхронный npm view
       const runNpmAsync = (args) => new Promise((resolve) => {
         const child = spawn('npm', [...args, '--cache=/tmp/.npm-cache'], {
           env: { ...process.env, NPM_CONFIG_REGISTRY: this.registry }
@@ -664,7 +681,7 @@ class DshManager {
     }
 
     const current = this.getCurrentVersion();
-    // 优先选取真正的官方最新发布版本 (alpha / next / latest 预发布与稳定新版，或版本列表最高 semver，对齐 build.sh)
+    // По возможности выбираем настоящий последний официальный релиз (пререлизы alpha / next / latest и стабильные новые версии, либо максимальная semver из списка — как в build.sh)
     let latest = distTags.alpha || distTags.next || distTags.latest;
     if (Array.isArray(versions) && versions.length > 0) {
       const sorted = [...versions].sort(compareSemver);
@@ -695,22 +712,22 @@ class DshManager {
     return this.registry;
   }
 
-  // 对外入口：串行化后执行真正的启动逻辑
+  // Внешняя точка входа: после постановки в очередь выполняется настоящая логика запуска
   boot(onProbe) {
     return this._enqueue(() => this._bootInternal(onProbe));
   }
 
   _bootInternal(onProbe) {
-    // 反模式修复：`new Promise(async executor)` 里抛出的异常会成为未处理 rejection，
-    // Promise 永不 settle（进而卡死串行队列）。改为同步 executor + 异步实现函数。
+    // Исправление антипаттерна: исключение, выброшенное внутри `new Promise(async executor)`, становится необработанным rejection,
+    // промис никогда не завершится (и очередь, поставленная в очередь, зависнет). Заменено на синхронный executor + асинхронную функцию реализации.
     return new Promise((resolve) => {
-      // 注意：不能用 .then(resolve) 采用实现函数的"返回值"——实现函数是异步的，
-      // 它自己会在就绪/失败时调用 resolve，而其函数体可能在嵌套 then 链完成前就先返回，
-      // 若采用返回值会把 Promise 提前以 undefined 结算。这里只用 catch 兜住实现函数抛出的异常。
+      // Внимание: нельзя использовать .then(resolve) и брать «возвращаемое значение» функции реализации — она асинхронная,
+      // сама вызовет resolve при готовности/сбое, а её тело может вернуться раньше завершения вложенной цепочки then;
+      // использование возвращаемого значения завершило бы промис раньше времени с undefined. Здесь через catch перехватываем исключения реализации.
       Promise.resolve()
         .then(() => this._bootInternalImpl(onProbe, resolve))
         .catch((err) => {
-          console.error('[dsh-manager] 启动流程异常（已兜底 resolve）:', (err && err.message) || err);
+          console.error('[dsh-manager] Исключение в процессе запуска (resolve вызван в catch):', (err && err.message) || err);
           resolve({ ok: false, error: (err && err.message) || String(err) });
         });
     });
@@ -718,12 +735,12 @@ class DshManager {
 
   async _bootInternalImpl(onProbe, resolve) {
       this.manualStopped = false;
-      // 只有"进程确实还活着"才算已在运行；否则清理僵尸引用，避免误判后永不真正拉起
+      // «Уже запущен» считается только если процесс действительно жив; иначе чистим зомби-ссылку, чтобы после ложного срабатывания запуск всё равно произошёл
       if (this.proc && this.proc.exitCode === null && !this.proc.killed) {
         return resolve({ ok: true, alreadyRunning: true });
       }
       if (this.proc) {
-        console.warn('[dsh-manager] 检测到已退出的进程引用（僵尸），清理后继续启动');
+        console.warn('[dsh-manager] Обнаружена ссылка на уже завершённый процесс (зомби), очищаем и продолжаем запуск');
         this.proc = null;
         this.ready = false;
       }
@@ -733,7 +750,7 @@ class DshManager {
         this.restartTimer = null;
       }
 
-      // 启动前检查并修复 .credentials.yaml 与 .dsh 权限 (DSH 凭据服务强制校验 mode 600)
+      // Перед запуском проверяем и при необходимости исправляем права на .credentials.yaml и .dsh (служба учётных данных DSH требует mode 600)
       try {
         const credPath = path.join(DSH_DIR, '.credentials.yaml');
         if (fs.existsSync(credPath)) {
@@ -743,19 +760,19 @@ class DshManager {
           fs.chmodSync(DSH_DIR, 0o700);
         }
       } catch (err) {
-        console.warn('[dsh-manager] 校验/修复凭据文件权限失败:', err.message);
+        console.warn('[dsh-manager] Не удалось проверить/исправить права на файл учётных данных:', err.message);
       }
 
-      // 关键防冲突：清理可能遗留并霸占 DSH_PORT 的孤儿或外部重启进程
+      // Ключевая защита от конфликтов: освобождаем порт DSH_PORT от возможных осиротевших или внешних перезапущенных процессов
       await ensurePortReleased(DSH_PORT, 4000);
       await new Promise(r => setTimeout(r, 200));
 
-      console.log(`[dsh-manager] 启动 DSH 进程 (工作区: ${DSH_WORKSPACE}, 端口: ${DSH_PORT})...`);
+      console.log(`[dsh-manager] Запуск процесса DSH (рабочее пространство: ${DSH_WORKSPACE}, порт: ${DSH_PORT})...`);
       this.ready = false;
 
       const logStream = fs.createWriteStream(DSH_WEB_LOG, { flags: 'a' });
-      // 日志落盘失败（磁盘满/权限）不得让网关进程崩溃
-      logStream.on('error', (e) => console.warn('[dsh-manager] DSH 日志写入失败(已忽略):', e.message));
+      // Ошибка записи журнала на диск (диск заполнен/нет прав) не должна ронять процесс шлюза
+      logStream.on('error', (e) => console.warn('[dsh-manager] Не удалось записать журнал DSH (проигнорировано):', e.message));
       const env = {
         ...process.env,
         DSH_PORT: String(DSH_PORT),
@@ -763,15 +780,15 @@ class DshManager {
         NPM_CONFIG_REGISTRY: this.registry,
         NPM_REGISTRY: this.registry,
         PNPM_REGISTRY: this.registry,
-        // DSH 的语义是「$DSH_HOME 本身就是 harness home」（profile 位于 $DSH_HOME/profiles/<name>，
-        // 见 @deepseek-ai/dsh-home-paths 的 resolveDshHome），而本项目其余代码一律把 harness home
-        // 视为 $DSH_HOME/.dsh（即 DSH_DIR）。若直接把容器级 DSH_HOME（默认 /root）透传给子进程，
-        // DSH 会去读 /root/profiles/web（只有 dsh-base + dsh-web-app 两个官方 bundle），
-        // 于是安装到 /root/.dsh/profiles/web 的预装/自定义插件（dshmarket 市场、浏览器桌面、
-        // 思考强度等）永远不会被加载。这里显式把子进程的 DSH_HOME 收敛到 DSH_DIR，与全项目对齐。
+        // Семантика DSH: «$DSH_HOME сам по себе является harness home» (профили лежат в $DSH_HOME/profiles/<name>,
+        // см. resolveDshHome в @deepseek-ai/dsh-home-paths), тогда как остальной код проекта всюду считает harness home
+        // равным $DSH_HOME/.dsh (т.е. DSH_DIR). Если передать дочернему процессу контейнерный DSH_HOME (по умолчанию /root),
+        // DSH будет читать /root/profiles/web (там только два официальных бандла: dsh-base + dsh-web-app),
+        // и предустановленные/кастомные плагины, установленные в /root/.dsh/profiles/web (маркет dshmarket, браузерный десктоп,
+        // интенсивность размышлений и т.д.), никогда не будут загружены. Здесь явно сужаем DSH_HOME дочернего процесса до DSH_DIR, в соответствии со всем проектом.
         DSH_HOME: DSH_DIR
       };
-      // 彻底剥离 NODE_ENV=production，恢复纯净开发环境，避免工作区 install 跳过 devDependencies
+      // Полностью убираем NODE_ENV=production, возвращая чистую среду разработки, чтобы установка в рабочем пространстве не пропускала devDependencies
       delete env.NODE_ENV;
 
       const p = spawn('dsh', ['web', '--port', String(DSH_PORT), '--no-open'], {
@@ -782,8 +799,8 @@ class DshManager {
 
       this.proc = p;
 
-      // 日志脱敏：DSH 启动时会把访问令牌明文打印到 stdout（`dsh web: ...?token=xxx`），
-      // 在落盘 / 转发 / Admin 回溯视图之前统一抹掉，避免明文凭据长期堆积在日志里。
+      // Редактирование журнала: при запуске DSH печатает токен доступа в открытом виде в stdout (`dsh web: ...?token=xxx`);
+      // перед записью на диск / пересылкой / попаданием в панель просмотра истории Admin он вычищается, чтобы открытые учётные данные не накапливались в журналах.
       const redactLog = (d) => String(Buffer.isBuffer(d) ? d.toString('utf8') : d)
         .replace(/([?&]token=)[A-Za-z0-9._~-]+/gi, '$1<redacted>');
 
@@ -792,7 +809,7 @@ class DshManager {
         logStream.write(safe);
         process.stdout.write(safe);
 
-        // 收集最近日志用于崩溃根因排查（同样脱敏，避免令牌进入 Admin 回溯视图）
+        // Собираем последние журналы для разбора причины аварии (тоже с редактированием, чтобы токен не попал в панель истории Admin)
         const str = d.toString('utf8');
         const lines = str.split('\n').filter(Boolean);
         for (const l of lines) {
@@ -800,7 +817,7 @@ class DshManager {
           if (this.recentLogs.length > 80) this.recentLogs.shift();
         }
 
-        // 实时从 stdout 管道动态捕获启动令牌，零延迟换取官方签名 Cookie
+        // Динамически подхватываем из stdout-канала токен запуска — без задержки получаем официально подписанный Cookie
         const m = str.match(/token=([A-Za-z0-9._~-]{16,})/i);
         if (m) {
           const token = m[1].trim();
@@ -824,7 +841,7 @@ class DshManager {
       });
 
       p.on('error', err => {
-        console.error('[dsh-manager] DSH 启动错误:', err.message);
+        console.error('[dsh-manager] Ошибка запуска DSH:', err.message);
         this.proc = null;
         this.ready = false;
         this.lastExitInfo = { code: -1, sig: err.message, time: Date.now(), logs: this.recentLogs.slice(-20) };
@@ -832,36 +849,36 @@ class DshManager {
       });
 
       p.on('exit', (code, sig) => {
-        console.log(`[dsh-manager] DSH 已退出 (code=${code}, sig=${sig})`);
+        console.log(`[dsh-manager] DSH завершился (code=${code}, sig=${sig})`);
         if (code !== 0 && code !== null) {
           this.lastExitInfo = { code, sig, time: Date.now(), logs: this.recentLogs.slice(-20) };
         }
-        // 先记录"退出前是否已就绪"：下面会把 ready 置 false，
-        // 若直接判断 this.ready 会导致崩溃重启/熔断分支永远不可达（旧实现的隐藏 bug）。
+        // Сначала запоминаем «был ли готов до выхода»: ниже ready выставляется в false,
+        // и если судить напрямую по this.ready, ветки перезапуска после аварии/аварийной защиты стали бы недостижимы (скрытый баг старой реализации).
         const wasReady = this.ready;
         if (this.proc === p) {
           this.proc = null;
           this.ready = false;
         }
-        // 若处于手动停止状态，不自动拉起
+        // Если выполняется ручная остановка, автоподъём не выполняется
         if (this.manualStopped) {
-          console.log('[dsh-manager] DSH 处于手动停止状态，守护管理器已暂停自动重新拉起');
+          console.log('[dsh-manager] DSH находится в состоянии ручной остановки, служба надзора приостановила автоматический перезапуск');
           return;
         }
-        // 若在启动就绪探活期间即发生异常退出，由下方 waitReady 统一负责故障诊断、插件自动隔离与净化重启；
-        // 此处仅针对曾经成功就绪、但在后续运行中意外崩溃的情况执行带指数退避的守护重启，杜绝双重拉起与竞争
+        // Если аномальный выход произошёл ещё во время стартовой проверки готовности, диагностика сбоев, автоизоляция плагинов и очищающий перезапуск выполняются ниже централизованно через waitReady;
+        // здесь выполняется только надзорный перезапуск с экспоненциальной задержкой для случая, когда DSH уже был готов, но неожиданно упал позже, — чтобы исключить двойной подъём и гонки
         if (!wasReady) {
           return;
         }
-        // 若非主动调用 stop()，自动执行守护拉起（带"滑动窗口"熔断保护）
-        // 关键：不能再用"一次就绪成功就清零"——坏插件最典型的形态就是"就绪后立刻崩溃"，
-        // 那样每轮计数都回到 1，退避与熔断永不触发，形成无上限重启风暴。
+        // Если stop() не вызывался вручную, выполняется автонадзорный подъём (с защитой от аварий по «скользящему окну»)
+        // Ключево: нельзя обнулять счётчик после первого успешного готова — самый типичный вид сбойного плагина: «готов — и сразу падает»,
+        // тогда счётчик каждый раз возвращался к 1, а откат и аварийная защита никогда не срабатывали, превращая всё в неограниченный шторм перезапусков.
         if (!this.stopping && !this.installing) {
           const now = Date.now();
-          const CRASH_WINDOW_MS = 120000; // 2 分钟滑动窗口
+          const CRASH_WINDOW_MS = 120000; // скользящее окно 2 минуты
           const MAX_CRASHES = 5;
 
-          // 曾稳定运行超过一个窗口 → 视为健康历史，清空窗口
+          // DSH стабильно работал дольше одного окна → считаем здоровой историей и обнуляем окно
           if (this.startTime && now - this.startTime > CRASH_WINDOW_MS) {
             this.crashWindow = [];
           }
@@ -871,28 +888,28 @@ class DshManager {
           const crashes = this.crashWindow.length;
 
           if (crashes > MAX_CRASHES) {
-            console.error(`[dsh-manager] 警告: DSH 在 ${CRASH_WINDOW_MS / 1000}s 内已崩溃 ${crashes} 次（>${MAX_CRASHES}），已暂停自动拉起以保护系统。请在管理后台检查配置或恢复快照。`);
+            console.error(`[dsh-manager] Предупреждение: DSH упал ${crashes} раз(а) за ${CRASH_WINDOW_MS / 1000} с (>${MAX_CRASHES}), автоподъём приостановлен для защиты системы. Проверьте конфигурацию в панели администрирования или восстановите снимок.`);
             return;
           }
 
           const delay = Math.min(1000 * Math.pow(1.5, crashes - 1), 10000);
-          console.log(`[dsh-manager] DSH 进程退出，守护管理器将在 ${(delay / 1000).toFixed(1)} 秒后自动重新拉起 DSH（窗口内第 ${crashes} 次）...`);
+          console.log(`[dsh-manager] Процесс DSH завершился, служба надзора автоматически перезапустит DSH через ${(delay / 1000).toFixed(1)} с (попытка ${crashes} в окне)...`);
           clearTimeout(this.restartTimer);
           this.restartTimer = setTimeout(() => {
             if (!this.stopping && !this.installing && !this.proc) {
-              this.boot().catch(err => console.error('[dsh-manager] 自动拉起 DSH 失败:', err.message));
+              this.boot().catch(err => console.error('[dsh-manager] Не удалось автоматически перезапустить DSH:', err.message));
             }
           }, delay);
         }
       });
 
-      // 等待真正就绪（杜绝外部假冒就绪）
-      // 注意：外层是 new Promise(async executor)，回调里任何抛出都会让该 Promise 永不 settle
-      // （这是旧实现的真实死锁来源——会把串行队列一起卡死）。这里显式 try/catch + catch 兜底。
+      // Ждём настоящей готовности (защищаемся от ложной готовности извне)
+      // Внимание: снаружи это new Promise(async executor), любое исключение в колбэке не даёт промису завершиться
+      // (настоящий источник дедлока в старой реализации — он вместе подвешивал и очередь). Здесь явные try/catch + перехват в catch.
       this.waitReady(60000, onProbe).then(async ok => {
        try {
         this.ready = ok;
-        console.log(ok ? '[dsh-manager] DSH 已就绪' : '[dsh-manager] DSH 启动超时或崩溃');
+        console.log(ok ? '[dsh-manager] DSH готов' : '[dsh-manager] DSH не уложился в таймаут запуска или упал');
         if (ok) {
           this.autoHealCountInCurrentBoot = 0;
           this.startTime = Date.now();
@@ -903,22 +920,22 @@ class DshManager {
         }
 
         // ==========================================================
-        // 【启动失败自愈与故障插件自动隔离】
-        // 限制：1. 开启了自愈功能 (autoHealEnabled)
-        //       2. 单次启动周期内累计隔离未超过上限 (上限: 3 个)
-        //       3. 未处于主动停止或升级安装状态
+        // 【Самовосстановление при сбое запуска и автоизоляция сбойных плагинов】
+        // Ограничения: 1. Функция самовосстановления включена (autoHealEnabled)
+        //              2. За один цикл запуска количество изоляций не превысило лимит (лимит: 3)
+        //              3. Нет ручной остановки или установки с обновлением
         // ==========================================================
         if (this.autoHealEnabled && !this.stopping && !this.installing) {
           if (this.autoHealCountInCurrentBoot < this.maxAutoHealPerBoot) {
             const detected = this.detectCrashingPlugin(this.recentLogs);
             if (detected) {
               this.autoHealCountInCurrentBoot++;
-              console.warn(`[dsh-manager] 🛡️ 【启动故障自愈触发 (${this.autoHealCountInCurrentBoot}/${this.maxAutoHealPerBoot})】检测到拓展「${detected.name}」引发 DSH 启动失败 (${detected.matched})！`);
-              console.log(`[dsh-manager] 正在自动隔离并停用拓展「${detected.name}」以恢复系统可用性...`);
+              console.warn(`[dsh-manager] 🛡️ 【Сработало самовосстановление сбоя запуска (${this.autoHealCountInCurrentBoot}/${this.maxAutoHealPerBoot})】Обнаружено расширение «${detected.name}», вызывающее сбой запуска DSH (${detected.matched})!`);
+              console.log(`[dsh-manager] Автоматически изолируем и отключаем расширение «${detected.name}», чтобы вернуть работоспособность системы...`);
 
               try {
                 const pm = require('./plugin-manager');
-                // P6：togglePlugin 现在会在 profile 写锁内完成"读-改-写"，必须 await
+                // P6: togglePlugin теперь выполняет «прочитать-изменить-записать» внутри блокировки записи профиля, поэтому нужен await
                 await pm.togglePlugin(detected.name, false);
 
                 const event = {
@@ -931,33 +948,33 @@ class DshManager {
                 this.autoIsolatedEvents.unshift(event);
                 if (this.autoIsolatedEvents.length > 10) this.autoIsolatedEvents.pop();
 
-                console.log(`[dsh-manager] 拓展「${detected.name}」已自动停用并固化状态，立即重新拉起 DSH 核心...`);
+                console.log(`[dsh-manager] Расширение «${detected.name}» автоматически отключено и состояние зафиксировано, немедленно перезапускаем ядро DSH...`);
                 await ensurePortReleased(DSH_PORT, 3000);
                 const healBootRes = await this._bootInternal(onProbe);
                 return resolve(healBootRes);
               } catch (healErr) {
-                console.error('[dsh-manager] 执行插件自动隔离失败:', healErr.message);
+                console.error('[dsh-manager] Не удалось выполнить автоизоляцию плагина:', healErr.message);
               }
             } else {
-              console.log('[dsh-manager] 未能从最近运行日志中定位到明确的第三方故障拓展，跳过自动隔离');
+              console.log('[dsh-manager] В последних журналах работы не удалось выявить явное стороннее сбойное расширение — автоизоляция пропущена');
             }
           } else {
-            console.warn(`[dsh-manager] ⚠️ 当前启动周期内自动隔离拓展次数已达上限 (${this.maxAutoHealPerBoot} 个)，已停止自动隔离以防死锁`);
+            console.warn(`[dsh-manager] ⚠️ За текущий цикл запуска достигнут лимит автоизоляции расширений (${this.maxAutoHealPerBoot}), автоизоляция остановлена во избежание дедлока`);
           }
         }
 
         resolve({ ok: false });
        } catch (e) {
-        console.error('[dsh-manager] 启动后就绪处理异常（已兜底 resolve）:', (e && e.message) || e);
+        console.error('[dsh-manager] Исключение при обработке готовности после запуска (resolve вызван в catch):', (e && e.message) || e);
         resolve({ ok: false, error: (e && e.message) || String(e) });
        }
       }).catch(err => {
-        console.error('[dsh-manager] waitReady 异常（已兜底 resolve）:', (err && err.message) || err);
+        console.error('[dsh-manager] Исключение в waitReady (resolve вызван в catch):', (err && err.message) || err);
         resolve({ ok: false, error: (err && err.message) || String(err) });
       });
   }
 
-  // 对外入口：串行化后执行真正的停止逻辑
+  // Внешняя точка входа: после постановки в очередь выполняется настоящая логика остановки
   stop() {
     return this._enqueue(() => this._stopInternal());
   }
@@ -975,7 +992,7 @@ class DshManager {
       this.proc = null;
       this.ready = false;
 
-      // 无论 this.proc 是否存在，强制清空 3079 端口及所有孤儿 node dsh 进程
+      // Независимо от того, есть ли this.proc, принудительно освобождаем порт 3079 и все осиротевшие процессы node dsh
       killPortProcess(DSH_PORT);
 
       if (!p) {
@@ -983,7 +1000,7 @@ class DshManager {
         return resolve({ ok: true });
       }
 
-      console.log('[dsh-manager] 停止 DSH 进程...');
+      console.log('[dsh-manager] Остановка процесса DSH...');
       let settled = false;
       const done = (extra = {}) => {
         if (settled) return;
@@ -999,9 +1016,9 @@ class DshManager {
         killPortProcess(DSH_PORT);
       }, 4000);
 
-      // 兜底：极端情况下进程杀不掉/exit 事件丢失时也必须返回，避免调用方（含串行队列）永久挂起
+      // Подстраховка: в крайнем случае, если процесс не удаётся убить или событие exit потеряно, всё равно нужно вернуть результат, чтобы вызывающий код (включая очередь) не завис навсегда
       const hardTimer = setTimeout(() => {
-        console.warn('[dsh-manager] 停止 DSH 超时（9s），强制返回');
+        console.warn('[dsh-manager] Таймаут остановки DSH (9 с), принудительный возврат результата');
         done({ forced: true });
       }, 9000);
 
@@ -1018,7 +1035,7 @@ class DshManager {
     });
   }
 
-  // 重启 = 同一个队列任务内先停后起，避免中间被其它操作插入
+  // Перезапуск = остановка, а затем запуск в рамках одной задачи очереди, чтобы между ними не вклинились другие операции
   async restart(onProbe) {
     return this._enqueue(async () => {
       await this._stopInternal();
@@ -1049,7 +1066,7 @@ class DshManager {
         }
       }
     } catch (err) {
-      console.warn('[dsh-manager] 换取会话 Cookie 失败:', err.message);
+      console.warn('[dsh-manager] Не удалось получить сессионный Cookie:', err.message);
     }
     return this.upstreamCookie;
   }
@@ -1065,12 +1082,12 @@ class DshManager {
     let attempts = 0;
     while (Date.now() < deadline) {
       attempts++;
-      // 若子进程已退出或崩溃，坚决判定为未就绪，杜绝外部假冒就绪
+      // Если дочерний процесс уже завершился или упал, однозначно считаем систему неготовой — защищаемся от ложной готовности извне
       if (!this.proc || this.proc.exitCode !== null || this.proc.killed) {
         return false;
       }
       try {
-        // 必须带超时：若端口被"连上但不响应"的进程占住，无超时的 fetch 会让整个探活循环永久挂起
+        // Обязательно с таймаутом: если порт занят процессом, который «принимает соединение, но не отвечает», fetch без таймаута навечно подвесил бы весь цикл проверки готовности
         const res = await fetch(`http://127.0.0.1:${DSH_PORT}/`, { signal: AbortSignal.timeout(3000) });
         if (res.status < 500 && this.proc && this.proc.exitCode === null) {
           return true;
@@ -1085,24 +1102,24 @@ class DshManager {
     return false;
   }
 
-  /** 版本号是否合法（供 Admin API 入口复用同一套校验） */
+  /** Допустим ли номер версии (единая проверка переиспользуется на входе в Admin API) */
   isValidVersion(value) {
     return isValidVersion(value);
   }
 
   async installVersion(version, onProgress, onLog, options = {}) {
-    // 入口强校验：版本号必须是合法 semver，杜绝 `../` 目录穿越与 npm 说明符注入
+    // Жёсткая проверка на входе: номер версии должен быть корректным semver — защищаемся от обхода каталогов через `../` и внедрения npm-спецификаторов
     const normalizedVersion = typeof version === 'string' ? version.trim() : '';
     if (!isValidVersion(normalizedVersion)) {
-      return { ok: false, error: `版本号格式不合法: ${String(version).slice(0, 64)}` };
+      return { ok: false, error: `Некорректный формат номера версии: ${String(version).slice(0, 64)}` };
     }
     version = normalizedVersion;
 
-    if (this.installing) return { ok: false, error: '已有安装任务正在进行中' };
+    if (this.installing) return { ok: false, error: 'Уже выполняется другая задача установки' };
     this.installing = true;
     this.installLog = [];
 
-    // 兼容只传入单个回调 (line => ...) 的情况
+    // Совместимость со случаем, когда передан только один колбэк (line => ...)
     if (typeof onProgress === 'function' && typeof onLog !== 'function') {
       onLog = onProgress;
       onProgress = null;
@@ -1122,98 +1139,98 @@ class DshManager {
     };
 
     const previousVersion = this.getCurrentVersion() || '0.1.2-rc.1';
-    // 是否归档当前引擎版本：由切换前弹窗的勾选决定（默认勾选，用户可取消）。
-    // 归档是纯用户功能——熔断回滚走「切换期间保留的回滚点」，不依赖它。
+    // Архивировать ли текущую версию движка: решается флажком в диалоге перед переключением (по умолчанию включён, пользователь может снять).
+    // Архивация — чисто пользовательская функция: аварийный откат использует «точку отката, сохранённую на время переключения», и от неё не зависит.
     const archiveCurrent = options && options.archiveCurrent === true;
-    let stagingDir = null; // 容器层待激活目录（失败时需清理，避免残留）
-    let tmpPrefix = null; // npm 临时前缀（必须在 try 之外声明，否则 catch 块看不到）
-    let rollbackDir = null; // 置换时保留的旧核心回滚点（探活通过后才清理）
-    let coreMutated = false; // 是否已开始改动现网核心（未改动则失败时无需熔断回滚）
+    let stagingDir = null; // каталог контейнерного слоя, ожидающий активации (при сбое нужно убрать, чтобы не осталось мусора)
+    let tmpPrefix = null; // временный префикс npm (объявляется вне try, иначе catch его не увидит)
+    let rollbackDir = null; // точка отката со старым ядром, сохранённая на время подмены (убирается только после успешной проверки активности)
+    let coreMutated = false; // начали ли мы менять работающее ядро (если нет — при сбое аварийный откат не нужен)
 
     try {
-      // === 阶段 1/5: 切换预检与环境检查 ===
-      emitProgress({ step: 1, total: 5, percent: 10, label: '环境预检与版本兼容性评估', mode: 'install' });
+      // === Этап 1/5: предварительная проверка переключения и окружения ===
+      emitProgress({ step: 1, total: 5, percent: 10, label: 'Предварительная проверка окружения и оценка совместимости версий', mode: 'install' });
       log(`======================================================================`);
-      log(`=== [阶段 1/5] 切换预检: 当前运行版本 ${previousVersion} -> 目标版本 ${version} ===`);
+      log(`=== [Этап 1/5] Предварительная проверка переключения: текущая версия ${previousVersion} -> целевая версия ${version} ===`);
       if (version === previousVersion) {
-        log(`ℹ️ 目标版本与当前运行版本一致 (${version})，将执行环境重新装配与就绪校验。`);
+        log(`ℹ️ Целевая версия совпадает с текущей (${version}) — будет выполнена пересборка окружения и проверка готовности.`);
       }
 
-      // 版本特性与数据兼容性检查
+      // Проверка функциональной совместимости версий и совместимости данных
       const isAdapted = this.isAdaptedVersion(version);
       if (!isAdapted) {
-        log('⚠️ [适配性安全提醒] 目标版本未经过当前 Docker 镜像特殊深度适配测试！');
-        log('💡 [镜像更新建议] 针对官方最新发布，强烈推荐直接更新 Docker 镜像 (docker compose pull && docker compose up -d) 获取最新针对性适配！');
-        log('⚠️ 如在线切换后遇到启动异常、插件失效或界面异常，请更新 Docker 镜像或前往 GitHub Issues 交流反馈。');
+        log('⚠️ [Предупреждение о совместимости] Целевая версия не проходила глубокие адаптационные тесты для этого Docker-образа!');
+        log('💡 [Рекомендация по обновлению образа] Для последнего официального релиза настоятельно рекомендуется напрямую обновить Docker-образ (docker compose pull && docker compose up -d), чтобы получить свежую адресную адаптацию!');
+        log('⚠️ Если после онлайн-переключения возникнут сбои запуска, отказы плагинов или проблемы интерфейса — обновите Docker-образ или напишите в GitHub Issues.');
       } else {
-        log(`✔ 目标版本 ${version} 属于当前镜像官方深度适配版本，已通过针对性联调测试。`);
+        log(`✔ Целевая версия ${version} входит в число официально глубоко адаптированных версий этого образа и прошла адресные интеграционные тесты.`);
       }
 
       if (compareSemver(version, '0.1.5-rc.1') < 0 && compareSemver(previousVersion, '0.1.5-rc.1') >= 0) {
-        log('⚠️ [版本安全警告] 您正在从 0.1.5+ 系列降级至旧版本！');
-        log('⚠️ 官方说明：0.1.5 起会话数据格式已升级为 V3 且单向不可逆，降级后旧版本 DSH 无法加载 V3 会话记录。');
-        log('⚠️ 强烈建议在降级前确保已创建配置与会话快照备份。');
+        log('⚠️ [Предупреждение о версии] Вы выполняете даунгрейд со серии 0.1.5+ на более старую версию!');
+        log('⚠️ По официальной документации: начиная с 0.1.5 формат данных сессий обновлён до V3 и необратим; после даунгрейда старые версии DSH не смогут загрузить записи сессий V3.');
+        log('⚠️ Настоятельно рекомендуется перед даунгрейдом убедиться, что созданы резервные копии конфигурации и снимков сессий.');
       } else if (compareSemver(version, '0.1.5-rc.1') >= 0 && compareSemver(previousVersion, '0.1.5-rc.1') < 0) {
-        log('ℹ️ [版本升级提示] 准备升级至 0.1.5+ 系列：将启用 DeepSeek-V41-Flash、右侧新版 Sidebar 预览、出站代理继承及 V3 会话格式。');
+        log('ℹ️ [Подсказка об обновлении] Готовимся к обновлению до серии 0.1.5+: будут включены DeepSeek-V41-Flash, новый правый Sidebar-превью, наследование исходящего прокси и формат сессий V3.');
       }
-      log(`✔ 预检通过：环境就绪，软件源: ${this.registry}`);
+      log(`✔ Предварительная проверка пройдена: окружение готово, источник пакетов: ${this.registry}`);
 
-      // 磁盘水位预检（前置闸门）：归档旧版本 + 下载新版本都会写入版本库卷，
-      // 提前拦截可避免磁盘将满时白下载 540MB。
+      // Предварительная проверка уровня занятости диска (входной шлюз): и архивация старой версии, и загрузка новой пишут в том хранилища версий,
+      // раннее прерывание позволяет избежать бесполезной загрузки 540 МБ при почти заполненном диске.
       this._assertDiskSpace([this.versionsCacheDir, LIVE_CORE_PARENT], MIN_FREE_BYTES, log);
 
-      // === 阶段 2/5: （可选）归档当前引擎至持久化版本库 ===
-      emitProgress({ step: 2, total: 5, percent: 25, label: archiveCurrent ? '备份当前引擎版本' : '跳过引擎备份', mode: 'install' });
-      log(`=== [阶段 2/5] 当前引擎版本归档（${archiveCurrent ? '用户已勾选' : '未勾选 → 跳过'}） ===`);
-      log(`📦 版本库: ${this.versionsCacheDir}${isMountedPath(this.versionsCacheDir) ? ' (持久化卷 ✔，容器重建/镜像更新后仍保留)' : ' (⚠️ 不在挂载点内：容器重建后归档会丢失)'}`);
+      // === Этап 2/5: (по желанию) архивация текущего движка в персистентное хранилище версий ===
+      emitProgress({ step: 2, total: 5, percent: 25, label: archiveCurrent ? 'Резервное копирование текущей версии движка' : 'Пропуск резервного копирования движка', mode: 'install' });
+      log(`=== [Этап 2/5] Архивация текущей версии движка (${archiveCurrent ? 'отмечено пользователем' : 'не отмечено → пропуск'}) ===`);
+      log(`📦 Хранилище версий: ${this.versionsCacheDir}${isMountedPath(this.versionsCacheDir) ? ' (персистентный том ✔, сохраняется при пересоздании контейнера/обновлении образа)' : ' (⚠️ вне точки монтирования: архивы потеряются при пересоздании контейнера)'}`);
       if (!archiveCurrent) {
-        log(`ℹ️ 未勾选「归档当前引擎」→ 跳过。切换失败仍会自动秒级回滚（走切换期间保留的回滚点，不依赖归档、不联网）。`);
+        log(`ℹ️ Архивация текущего движка не отмечена → пропуск. При сбое переключения всё равно произойдёт мгновенный автоматический откат (через точку отката, сохранённую на время переключения — без зависимости от архива и сети).`);
       } else if (!isValidVersion(previousVersion)) {
-        log(`⚠️ 跳过归档：当前版本号不合法 (${previousVersion})，不向版本库写入脏目录`);
+        log(`⚠️ Пропуск архивации: текущий номер версии некорректен (${previousVersion}), не записываем грязный каталог в хранилище версий`);
       } else {
         const prevArchive = resolveWithinDir(this.versionsCacheDir, previousVersion);
         if (isReadyVersionDir(prevArchive)) {
           this._touchVersionUsage(previousVersion);
-          log(`✔ 版本库中已存在完整归档 ${previousVersion}，无需重复归档`);
+          log(`✔ Полный архив ${previousVersion} уже есть в хранилище версий, повторная архивация не нужна`);
         } else {
           if (fs.existsSync(prevArchive)) {
-            log(`⚠️ 检测到不完整的旧归档 ${previousVersion}，删除重建（避免残缺版本被误判为可用）`);
+            log(`⚠️ Обнаружен неполный старый архив ${previousVersion}, удаляем и создаём заново (чтобы повреждённая версия не была ошибочно принята за рабочую)`);
             fs.rmSync(prevArchive, { recursive: true, force: true });
           }
           if (fs.existsSync(path.join(LIVE_CORE_DIR, 'package.json'))) {
-            log(`正在归档当前引擎 ${previousVersion} 至持久化版本库...`);
+            log(`Архивируем текущий движок ${previousVersion} в персистентное хранилище версий...`);
             const archTmp = path.join(STORE_STAGING_DIR, `archive-${process.pid}-${Date.now()}`);
             try {
               fs.mkdirSync(archTmp, { recursive: true });
               runSyncSafe('cp', ['-a', LIVE_CORE_DIR + '/.', archTmp + '/']);
               writeReadyMarker(archTmp, previousVersion);
               fs.renameSync(archTmp, prevArchive);
-              log(`✔ 已归档 ${previousVersion} (${formatBytes(dirSizeBytes(prevArchive))})，之后切回本版本免下载`);
+              log(`✔ ${previousVersion} заархивирован (${formatBytes(dirSizeBytes(prevArchive))}), при возврате на эту версию загрузка не понадобится`);
             } catch (e) {
               try { fs.rmSync(archTmp, { recursive: true, force: true }); } catch {}
-              log(`⚠️ 归档失败（不影响本次切换）: ${e.message}`);
+              log(`⚠️ Не удалось заархивировать (на переключение не влияет): ${e.message}`);
             }
           } else {
-            log(`ℹ️ 未找到活动核心，跳过归档`);
+            log(`ℹ️ Активное ядро не найдено, архивация пропущена`);
           }
         }
       }
 
-      // === 阶段 3/5: 部署目标核心版本（先落 staging，再原子置换，绝不先删后拷） ===
-      emitProgress({ step: 3, total: 5, percent: 40, label: '获取目标版本核心包', mode: 'install' });
-      log(`=== [阶段 3/5] 部署目标核心版本 @deepseek-ai/dsh@${version} ===`);
+      // === Этап 3/5: развёртывание целевой версии ядра (сначала в staging, затем атомарная подмена; никогда не «удалить, а потом скопировать») ===
+      emitProgress({ step: 3, total: 5, percent: 40, label: 'Получение пакета ядра целевой версии', mode: 'install' });
+      log(`=== [Этап 3/5] Развёртывание целевой версии ядра @deepseek-ai/dsh@${version} ===`);
       const targetArchive = resolveWithinDir(this.versionsCacheDir, version);
       let sourceDir = null;
       if (isReadyVersionDir(targetArchive)) {
         sourceDir = targetArchive;
         this._touchVersionUsage(version);
-        log(`⚡ [免下载] 命中持久化版本库 ${version}，直接从本地归档部署（无需联网）`);
+        log(`⚡ [Без загрузки] Найден ${version} в персистентном хранилище версий, разворачиваем напрямую из локального архива (без сети)`);
       } else {
         if (fs.existsSync(targetArchive)) {
-          log(`⚠️ 版本库中的 ${version} 归档不完整，已忽略并改为重新下载`);
+          log(`⚠️ Архив ${version} в хранилище версий неполон, пропускаем его и качаем заново`);
           fs.rmSync(targetArchive, { recursive: true, force: true });
         }
-        log(`正在从 npm 镜像源下载并安装 @deepseek-ai/dsh@${version} (源: ${this.registry})...`);
+        log(`Загружаем и устанавливаем @deepseek-ai/dsh@${version} из npm-зеркала (источник: ${this.registry})...`);
         const tmpPrefixPath = path.join(STORE_STAGING_DIR, `npm-${process.pid}-${Date.now()}`);
         tmpPrefix = tmpPrefixPath;
         fs.mkdirSync(tmpPrefixPath, { recursive: true });
@@ -1227,16 +1244,16 @@ class DshManager {
         const startTime = Date.now();
         const child = spawn('npm', installArgs, { env: process.env });
 
-        // 动态心跳脉冲计时器，防止 npm 下载期间控制台静默假死
+        // Динамический таймер «сердцебиения», чтобы консоль не выглядела зависшей во время загрузки npm
         const heartbeat = setInterval(() => {
           const sec = Math.floor((Date.now() - startTime) / 1000);
           const dynamicPercent = Math.min(59, 40 + Math.floor(sec * 1.2));
-          log(`⏳ [npm 依赖拉取中] 正在下载并解压核心依赖包，已耗时 ${sec}s...`);
+          log(`⏳ [Зависимости npm качаются] Скачиваем и распаковываем пакеты зависимостей ядра, прошло ${sec} с...`);
           emitProgress({
             step: 3,
             total: 5,
             percent: dynamicPercent,
-            label: `下载核心依赖包 (已耗时 ${sec}s)...`,
+            label: `Загрузка пакетов зависимостей ядра (прошло ${sec} с)...`,
             mode: 'install'
           });
         }, 2000);
@@ -1253,211 +1270,211 @@ class DshManager {
 
         if (exitCode !== 0) {
           try { fs.rmSync(tmpPrefix, { recursive: true, force: true }); } catch {}
-          throw new Error(`npm install 安装异常，退出码: ${exitCode}`);
+          throw new Error(`Сбой установки npm install, код выхода: ${exitCode}`);
         }
         const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-        log(`✔ npm 下载并解压完成，总耗时 ${totalSec}s`);
-        // 镜像构建期会对 node-pty 做原生重建（Dockerfile）；在线下载同样补齐，避免终端原生模块缺失
+        log(`✔ npm скачал и распаковал, общее время ${totalSec} с`);
+        // При сборке образа node-pty пересобирается нативно (Dockerfile); при онлайн-загрузке это тоже доделываем, чтобы в терминале не хватало нативного модуля
         try {
           const rb = spawnSync('npm', ['rebuild', 'node-pty', '--foreground-scripts', '--prefix', tmpPrefixPath], { encoding: 'utf8', timeout: 180000 });
-          if (rb.status !== 0) log(`⚠️ node-pty 原生重建未成功（不阻断切换）: ${String(rb.stderr || '').trim().slice(0, 200)}`);
-          else log(`✔ node-pty 原生模块已就绪`);
+          if (rb.status !== 0) log(`⚠️ Нативная пересборка node-pty не удалась (переключение не блокируется): ${String(rb.stderr || '').trim().slice(0, 200)}`);
+          else log(`✔ Нативный модуль node-pty готов`);
         } catch (e) {
-          log(`⚠️ node-pty 原生重建异常（不阻断切换）: ${e.message}`);
+          log(`⚠️ Ошибка нативной пересборки node-pty (переключение не блокируется): ${e.message}`);
         }
         sourceDir = path.join(tmpPrefixPath, 'lib/node_modules/@deepseek-ai/dsh');
         if (!fs.existsSync(path.join(sourceDir, 'package.json'))) {
-          throw new Error('npm 安装完成但未找到 @deepseek-ai/dsh 产物');
+          throw new Error('npm install завершился, но артефакт @deepseek-ai/dsh не найден');
         }
-        // 注意：这里不再「下载即归档」——归档是用户显式选择的行为（见阶段 2），
-        // 系统不会在后台悄悄占用磁盘。
-        emitProgress({ step: 3, total: 5, percent: 60, label: '目标版本下载安装完成', mode: 'install' });
+        // Внимание: теперь нет схемы «скачал — и сразу заархивировал» — архивация выполняется только по явному выбору пользователя (см. этап 2),
+        // система не занимает диск в фоновом режиме молча.
+        emitProgress({ step: 3, total: 5, percent: 60, label: 'Загрузка и установка целевой версии завершены', mode: 'install' });
       }
 
-      // 磁盘水位预检：版本库卷与容器层都要有足够空间，不足则干净中止
+      // Предварительная проверка места на диске: и том хранилища версий, и контейнерный слой должны иметь достаточно места, иначе — чистое прерывание
       this._assertDiskSpace([this.versionsCacheDir, LIVE_CORE_PARENT], MIN_FREE_BYTES, log);
 
-      // 构建隔离 staging（与活动核心同文件系统 → 优先 rename；overlayfs lower 层会退化为复制）
+      // Строим изолированный staging (на той же файловой системе, что активное ядро → приоритет у rename; на lower-слое overlayfs происходит деградация до копирования)
       const stagingPath = path.join(LIVE_CORE_PARENT, `.dsh-staging-${process.pid}-${Date.now()}`);
       stagingDir = stagingPath;
       fs.mkdirSync(stagingPath, { recursive: true });
       runSyncSafe('cp', ['-a', sourceDir + '/.', stagingPath + '/']);
       const stagedPkg = JSON.parse(fs.readFileSync(path.join(stagingPath, 'package.json'), 'utf8'));
       if (stagedPkg.version !== version) {
-        throw new Error(`staging 版本校验失败：期望 ${version}，实际 ${stagedPkg.version}`);
+        throw new Error(`Ошибка проверки версии в staging: ожидалась ${version}, получена ${stagedPkg.version}`);
       }
-      log(`✔ 目标版本 ${version} 已在隔离 staging 目录就绪（现网服务全程未受影响）`);
-      // staging 已就绪，npm 临时前缀不再需要（避免在持久化卷上遗留 ~540MB 垃圾）
+      log(`✔ Целевая версия ${version} готова в изолированном staging-каталоге (работающий сервис на всём протяжении не затрагивался)`);
+      // staging готов, временный префикс npm больше не нужен (иначе на персистентном томе останется ~540 МБ мусора)
       if (tmpPrefix) { try { fs.rmSync(tmpPrefix, { recursive: true, force: true }); } catch {} tmpPrefix = null; }
 
-      // 原子置换：先停进程（杜绝旧进程惰性 require 到新树），再 rename
-      log(`正在停止 DSH 进程以执行核心目录原子置换...`);
+      // Атомарная подмена: сначала останавливаем процесс (чтобы старый процесс лениво не подтянул require из нового дерева), затем rename
+      log(`Останавливаем процесс DSH для атомарной подмены каталога ядра...`);
       coreMutated = true;
       await this.stop();
       rollbackDir = this._atomicSwapCore(stagingPath);
       stagingDir = null;
-      log(`✔ 核心目录已完成原子置换（staging → live，全程无「先删后拷」窗口）`);
+      log(`✔ Атомарная подмена каталога ядра выполнена (staging → live, без окна «сначала удалить, потом скопировать»)`);
 
-      // === 阶段 4/5: 插件装配与宿主补丁自愈 ===
-      emitProgress({ step: 4, total: 5, percent: 70, label: '插件装配与补丁自愈', mode: 'install' });
-      log(`=== [阶段 4/5] 插件环境装配与客户端补丁注入 ===`);
+      // === Этап 4/5: сборка плагинов и самовосстановление патчей хоста ===
+      emitProgress({ step: 4, total: 5, percent: 70, label: 'Сборка плагинов и самовосстановление патчей', mode: 'install' });
+      log(`=== [Этап 4/5] Сборка окружения плагинов и внедрение клиентских патчей ===`);
       if (fs.existsSync('/app/scripts/install-plugin.mjs')) {
-        log(`> 正在同步并链接插件依赖至新核心 (schemastery & dsh-browser-desktop)...`);
+        log(`> Синхронизируем и связываем зависимости плагинов с новым ядром (schemastery и dsh-browser-desktop)...`);
         const res = spawnSync('node', ['/app/scripts/install-plugin.mjs'], { encoding: 'utf8' });
         if (res.stdout) log(res.stdout.trim());
       }
       if (fs.existsSync('/app/scripts/patch-dsh-client.mjs')) {
-        log(`> 正在注入客户端回环宿主持久化补丁...`);
+        log(`> Внедряем персистентный патч клиентского loopback-хоста...`);
         const res = spawnSync('node', ['/app/scripts/patch-dsh-client.mjs'], { encoding: 'utf8' });
         if (res.stdout) log(res.stdout.trim());
       }
-      log(`✔ 插件与宿主补丁自愈适配完成`);
-      emitProgress({ step: 4, total: 5, percent: 80, label: '插件与补丁适配就绪', mode: 'install' });
+      log(`✔ Самовосстановление и адаптация плагинов и патчей хоста завершены`);
+      emitProgress({ step: 4, total: 5, percent: 80, label: 'Адаптация плагинов и патчей готова', mode: 'install' });
 
-      // === 阶段 5/5: 核心服务拉起与健康就绪探活 ===
-      emitProgress({ step: 5, total: 5, percent: 85, label: '拉起新服务并健康探活', mode: 'install' });
-      log(`=== [阶段 5/5] 拉起新版本 DSH (${version}) 并执行健康就绪探活 ===`);
+      // === Этап 5/5: подъём нового ядра и проверка готовности ===
+      emitProgress({ step: 5, total: 5, percent: 85, label: 'Подъём нового сервиса и проверка готовности', mode: 'install' });
+      log(`=== [Этап 5/5] Поднимаем новую версию DSH (${version}) и выполняем проверку готовности ===`);
       this.lastExitInfo = null;
       this.recentLogs = [];
 
       const bootRes = await this.restart((probe) => {
         const dynamicPercent = Math.min(97, 85 + Math.floor(probe.attempts * 0.8));
-        log(`🔍 [健康探活] 正在探测端口 ${DSH_PORT} 就绪响应 (第 ${probe.attempts} 次, 已等待 ${probe.elapsedSec}s)...`);
+        log(`🔍 [Проверка готовности] Опрашиваем порт ${DSH_PORT} на отклик о готовности (попытка ${probe.attempts}, ждём ${probe.elapsedSec} с)...`);
         emitProgress({
           step: 5,
           total: 5,
           percent: dynamicPercent,
-          label: `端口健康就绪探活中 (${probe.attempts}/30)...`,
+          label: `Проверка готовности порта (${probe.attempts}/30)...`,
           mode: 'install'
         });
       });
 
       if (!bootRes.ok) {
-        let failDetail = `新版本 ${version} 启动后未能通过端口健康就绪探测`;
+        let failDetail = `Новая версия ${version} не прошла проверку готовности порта после запуска`;
         if (this.lastExitInfo) {
-          failDetail = `新版本进程启动异常退出 (Exit Code: ${this.lastExitInfo.code}, Signal: ${this.lastExitInfo.sig || 'none'})`;
+          failDetail = `Процесс новой версии аварийно завершился при запуске (Exit Code: ${this.lastExitInfo.code}, Signal: ${this.lastExitInfo.sig || 'none'})`;
         }
         throw new Error(failDetail);
       }
 
       const currentVer = this.getCurrentVersion();
-      // 探活通过：切换已经成功，将本次换下的核心提升为受保护槽位（不再自动清理，单槽位保留一份）
+      // Проверка готовности пройдена: переключение успешно, снятое ядро продвигаем в защищённый слот (автоочистке не подлежит, хранится одна копия в единственном слоте)
       if (rollbackDir && fs.existsSync(rollbackDir)) {
         try {
           this._promoteToPreservedRollback(rollbackDir, previousVersion);
-          log(`✔ 前序核心已转为就地回滚点保留，如需释放空间请到【快照与备份】面板手动清理`);
+          log(`✔ Прежнее ядро сохранено как точка отката на месте; для освобождения места очистите её вручную на панели «Снимки и резервные копии»`);
         } catch (promoteErr) {
-          log(`⚠️ 回滚点提升保留非致命跳过: ${promoteErr.message}`);
+          log(`⚠️ Продвижение точки отката в защищённый слот пропущено (не критично): ${promoteErr.message}`);
         }
         rollbackDir = null;
       }
-      // 切换主流程完成：先解除安装中互斥锁，允许后续的后台 GC 与状态查询正常执行
+      // Основной процесс переключения завершён: снимаем межоперационную блокировку установки, чтобы фоновая GC и запросы статуса могли работать
       this.installing = false;
       this.lastKnownVersion = '';
 
-      // 注意：不再自动归档新版本——归档是用户在切换前勾选的行为（阶段 2）。
-      // 版本库容量治理：LRU 保留（默认 3 份），活动版本与镜像出厂基准版本永不被清理
+      // Внимание: новая версия больше не архивируется автоматически — архивация выполняется по явному выбору пользователя перед переключением (этап 2).
+      // Управление местом в хранилище версий: хранение по LRU (по умолчанию 3 копии); активная версия и базовая версия образа никогда не чистятся
       try {
         const gc = this.gcVersions({ keepN: GC_KEEP_DEFAULT, activeVersion: currentVer });
         if (gc && gc.ok && Array.isArray(gc.removed) && gc.removed.length) {
-          log(`🧹 版本库 GC：已清理 ${gc.removed.length} 个旧版本，释放 ${formatBytes(gc.freedBytes)}`);
+          log(`🧹 GC хранилища версий: удалено старых версий: ${gc.removed.length}, освобождено ${formatBytes(gc.freedBytes)}`);
         }
       } catch (e) {
-        log(`⚠️ 版本库 GC 跳过: ${e.message}`);
+        log(`⚠️ GC хранилища версий пропущен: ${e.message}`);
       }
 
       emitProgress({
         step: 5,
         total: 5,
         percent: 100,
-        label: `切换完成！核心已成功升级至 v${currentVer}`,
+        label: `Переключение завершено! Ядро успешно обновлено до v${currentVer}`,
         mode: 'install'
       });
 
       log(`======================================================================`);
-      log(`🎉 [SUCCESS] DSH 核心版本切换成功！`);
-      log(`🚀 当前运行版本: v${currentVer} (服务已健康就绪)`);
-      log(`🌐 工作区访问地址: http://127.0.0.1:${DSH_PORT}`);
+      log(`🎉 [SUCCESS] Переключение версии ядра DSH успешно завершено!`);
+      log(`🚀 Текущая работающая версия: v${currentVer} (сервис здоров и готов)`);
+      log(`🌐 Адрес рабочего пространства: http://127.0.0.1:${DSH_PORT}`);
       log(`======================================================================`);
 
       return { ok: true, version: currentVer };
 
     } catch (err) {
-      // 清理未激活的 staging 残留（绝不触碰活动核心）
+      // Убираем неактивированные остатки staging (активное ядро не трогаем ни в коем случае)
       if (stagingDir) { try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch {} stagingDir = null; }
       if (tmpPrefix) { try { fs.rmSync(tmpPrefix, { recursive: true, force: true }); } catch {} tmpPrefix = null; }
       log(`======================================================================`);
-      log(`❌ 新版本安装或启动失败: ${err.message}`);
-      // 打印失败根因分析
-      log(`----------------- 🔍 [新版本失败根因排查] -----------------`);
+      log(`❌ Не удалось установить или запустить новую версию: ${err.message}`);
+      // Выводим анализ причины сбоя
+      log(`----------------- 🔍 [Разбор причины сбоя новой версии] -----------------`);
       if (this.lastExitInfo) {
-        log(`进程退出状态: Code=${this.lastExitInfo.code}, Sig=${this.lastExitInfo.sig || 'none'}`);
+        log(`Статус завершения процесса: Code=${this.lastExitInfo.code}, Sig=${this.lastExitInfo.sig || 'none'}`);
         if (this.lastExitInfo.logs && this.lastExitInfo.logs.length > 0) {
-          log(`进程最后输出片段:`);
+          log(`Последние фрагменты вывода процесса:`);
           this.lastExitInfo.logs.slice(-8).forEach(l => log(`  | ${l}`));
         }
       } else {
-        log(`可能原因: 进程在 60 秒内未监听端口 ${DSH_PORT}，或端口无有效 HTTP 响应`);
+        log(`Вероятная причина: процесс не начал слушать порт ${DSH_PORT} за 60 с, либо порт не отдаёт корректный HTTP-ответ`);
       }
       log(`-----------------------------------------------------------`);
       if (!coreMutated) {
-        // 尚未触碰现网核心（预检/下载/校验阶段失败）：无需停服回滚，服务继续原样运行
-        log(`ℹ️ 现网核心未做任何改动，无需熔断回滚；服务继续运行在当前版本 v${previousVersion}`);
+        // Работающее ядро ещё не тронуто (сбой на этапе предпроверки/загрузки/проверки): остановка и откат не нужны, сервис продолжает работать
+        log(`ℹ️ Работающее ядро не изменено, аварийный откат не требуется; сервис продолжает работать на версии v${previousVersion}`);
         this.installing = false;
         this.lastKnownVersion = '';
-        return { ok: false, error: `切换已中止（现网未受影响）: ${err.message}`, untouched: true, version: previousVersion };
+        return { ok: false, error: `Переключение прервано (работающий сервис не затронут): ${err.message}`, untouched: true, version: previousVersion };
       }
-      // 置换阶段抛错时可能已生成回滚点（见 _atomicSwapCore 的 err.rollbackDir），这里接过来兜底还原
+      // При сбое в фазе подмены могла уже появиться точка отката (см. err.rollbackDir в _atomicSwapCore) — подхватываем её для подстраховочного восстановления
       if (!rollbackDir && err && err.rollbackDir && fs.existsSync(err.rollbackDir)) {
         rollbackDir = err.rollbackDir;
-        log(`ℹ️ 检测到置换阶段留下的回滚点，将优先从它还原`);
+        log(`ℹ️ Обнаружена точка отката, оставшаяся от фазы подмены, — восстанавливаемся в первую очередь из неё`);
       }
-      log(`⚠️ 触发安全熔断保护机制：正在秒级自动回滚至稳定版本 v${previousVersion}...`);
+      log(`⚠️ Срабатывает защита аварийного отката: мгновенно откатываемся на стабильную версию v${previousVersion}...`);
       log(`======================================================================`);
 
       emitProgress({
         step: 1,
         total: 3,
         percent: 30,
-        label: `🛡️ 触发安全熔断：正在秒级还原稳定版本 v${previousVersion}...`,
+        label: `🛡️ Срабатывает аварийный откат: мгновенно восстанавливаем стабильную версию v${previousVersion}...`,
         mode: 'rollback'
       });
 
       try {
         if (rollbackDir && fs.existsSync(rollbackDir)) {
-          // 首选：切换期间保留的旧核心回滚点 —— 本地秒级还原，不联网、不依赖归档
-          log(`[回滚 1/3] ⚡ 从切换期间保留的回滚点秒级还原稳定核心 ${previousVersion}（无需归档/联网）...`);
+          // Первый вариант: точка отката со старым ядром, сохранённая на время переключения — мгновенное локальное восстановление, без сети и без зависимости от архива
+          log(`[Откат 1/3] ⚡ Мгновенно восстанавливаем стабильное ядро ${previousVersion} из точки отката, сохранённой на время переключения (без архива/сети)...`);
           await this.stop();
           this._restoreFromRollbackDir(rollbackDir);
           rollbackDir = null;
-          log(`✔ 稳定核心已从回滚点秒级还原完毕`);
+          log(`✔ Стабильное ядро мгновенно восстановлено из точки отката`);
         } else {
           const prevCached = resolveWithinDir(this.versionsCacheDir, previousVersion);
           if (isReadyVersionDir(prevCached)) {
-            log(`[回滚 1/3] ⚡ 从持久化版本库免下载还原稳定核心 ${previousVersion}...`);
+            log(`[Откат 1/3] ⚡ Восстанавливаем стабильное ядро ${previousVersion} из персистентного хранилища версий без загрузки...`);
             await this.stop();
             const rbStaging = path.join(LIVE_CORE_PARENT, `.dsh-staging-rb-${process.pid}-${Date.now()}`);
             fs.mkdirSync(rbStaging, { recursive: true });
             try {
               runSyncSafe('cp', ['-a', prevCached + '/.', rbStaging + '/']);
-              this._disposeRollbackDir(this._atomicSwapCore(rbStaging)); // 换下来的坏核心立即丢弃
+              this._disposeRollbackDir(this._atomicSwapCore(rbStaging)); // снятое сбойное ядро отбрасываем немедленно
             } catch (rbSwapErr) {
               try { fs.rmSync(rbStaging, { recursive: true, force: true }); } catch {}
               throw rbSwapErr;
             }
-            log(`✔ 稳定核心文件已免下载还原完毕`);
+            log(`✔ Файлы стабильного ядра восстановлены без загрузки`);
           } else {
-            log(`[回滚 1/3] 版本库无完整归档，从 npm 源重新拉回稳定版本 ${previousVersion}...`);
+            log(`[Откат 1/3] В хранилище версий нет полного архива, качаем стабильную версию ${previousVersion} заново из npm...`);
             const rbArgs = [
               'install', '-g', '--omit=dev', '--no-audit', '--no-fund',
               `--registry=${this.registry}`,
               `@deepseek-ai/dsh@${previousVersion}`
             ];
             const rbChild = spawn('npm', rbArgs, { env: process.env });
-            rbChild.stdout.on('data', d => d.toString().split('\n').map(l => l.trim()).filter(Boolean).forEach(l => log(`[回滚] ${l}`)));
-            rbChild.stderr.on('data', d => d.toString().split('\n').map(l => l.trim()).filter(Boolean).forEach(l => log(`[回滚] ${l}`)));
+            rbChild.stdout.on('data', d => d.toString().split('\n').map(l => l.trim()).filter(Boolean).forEach(l => log(`[Откат] ${l}`)));
+            rbChild.stderr.on('data', d => d.toString().split('\n').map(l => l.trim()).filter(Boolean).forEach(l => log(`[Откат] ${l}`)));
             const rbExit = await new Promise(r => rbChild.on('close', r));
-            if (rbExit !== 0) throw new Error(`npm 回滚安装异常，退出码: ${rbExit}`);
+            if (rbExit !== 0) throw new Error(`Сбой установки npm при откате, код выхода: ${rbExit}`);
             try { runSyncSafe('ln', ['-sfn', path.join(LIVE_CORE_DIR, 'lib/bin.js'), DSH_BIN_LINK]); } catch {}
           }
         }
@@ -1466,98 +1483,98 @@ class DshManager {
           step: 2,
           total: 3,
           percent: 65,
-          label: `🛡️ 熔断回滚 [2/3]: 恢复稳定版本插件配置与补丁`,
+          label: `🛡️ Аварийный откат [2/3]: восстановление конфигурации плагинов и патчей стабильной версии`,
           mode: 'rollback'
         });
-        log('[回滚 2/3] 正在重新执行插件配置与依赖自愈...');
+        log('[Откат 2/3] Повторно выполняем настройку плагинов и самовосстановление зависимостей...');
         if (fs.existsSync('/app/scripts/install-plugin.mjs')) {
           spawnSync('node', ['/app/scripts/install-plugin.mjs'], { encoding: 'utf8' });
         }
         if (fs.existsSync('/app/scripts/patch-dsh-client.mjs')) {
           spawnSync('node', ['/app/scripts/patch-dsh-client.mjs'], { encoding: 'utf8' });
         }
-        log(`✔ 插件与补丁配置已复位`);
+        log(`✔ Конфигурация плагинов и патчей возвращена в исходное состояние`);
 
         emitProgress({
           step: 3,
           total: 3,
           percent: 85,
-          label: `🛡️ 熔断回滚 [3/3]: 正在重新拉起稳定核心并探活...`,
+          label: `🛡️ Аварийный откат [3/3]: перезапуск стабильного ядра и проверка готовности...`,
           mode: 'rollback'
         });
-        log(`[回滚 3/3] 正在重新拉起稳定版本 ${previousVersion}...`);
+        log(`[Откат 3/3] Снова поднимаем стабильную версию ${previousVersion}...`);
         const rbBoot = await this.restart((probe) => {
-          log(`🔍 [回滚探活] 正在探测稳定版本端口 ${DSH_PORT} (第 ${probe.attempts} 次, 已等待 ${probe.elapsedSec}s)...`);
+          log(`🔍 [Проверка готовности после отката] Опрашиваем порт ${DSH_PORT} стабильной версии (попытка ${probe.attempts}, ждём ${probe.elapsedSec} с)...`);
           emitProgress({
             step: 3,
             total: 3,
             percent: Math.min(98, 85 + probe.attempts * 2),
-            label: `🛡️ 熔断回滚 [3/3]: 稳定版本就绪探活中 (${probe.attempts}/30)...`,
+            label: `🛡️ Аварийный откат [3/3]: проверка готовности стабильной версии (${probe.attempts}/30)...`,
             mode: 'rollback'
           });
         });
-        if (!rbBoot.ok) throw new Error(`稳定版本重启失败，无法进入正常就绪状态`);
+        if (!rbBoot.ok) throw new Error(`Не удалось перезапустить стабильную версию, система не перешла в нормальное готовое состояние`);
 
         emitProgress({
           step: 3,
           total: 3,
           percent: 100,
-          label: `🛡️ 自动回滚完成！系统已恢复至稳定版本 v${previousVersion}`,
+          label: `🛡️ Автоматический откат завершён! Система восстановлена до стабильной версии v${previousVersion}`,
           mode: 'rollback'
         });
 
         log(`======================================================================`);
-        log(`✅ [安全熔断成功] 系统已完好恢复至稳定可用版本: v${previousVersion}`);
-        log(`✔ 确认当前运行版本 (dsh --version): ${this.getCurrentVersion()}`);
-        log(`✔ 服务状态: 正常运行在 http://127.0.0.1:${DSH_PORT}`);
+        log(`✅ [Аварийный откат успешен] Система полностью восстановлена до стабильной рабочей версии: v${previousVersion}`);
+        log(`✔ Проверяем текущую работающую версию (dsh --version): ${this.getCurrentVersion()}`);
+        log(`✔ Статус сервиса: нормальная работа на http://127.0.0.1:${DSH_PORT}`);
         log(`======================================================================`);
 
         this.installing = false;
-        this.lastKnownVersion = ''; // 回滚后同样让版本缓存失效
+        this.lastKnownVersion = ''; // после отката кэш версии тоже сбрасываем
         return {
           ok: false,
-          error: `目标版本 ${version} 启动失败: ${err.message}，系统已自动安全回滚至稳定版本 ${previousVersion}`,
+          error: `Не удалось запустить целевую версию ${version}: ${err.message}, система автоматически безопасно откатилась на стабильную версию ${previousVersion}`,
           rolledBack: true,
           version: previousVersion
         };
       } catch (rbErr) {
-        log(`💥 [严重警报] 自动回滚遇到异常: ${rbErr.message}`);
-        // 兜底 1：活动核心缺失但回滚点还在 → 尽力还原，避免容器变砖
+        log(`💥 [КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ] Автоматический откат завершился с исключением: ${rbErr.message}`);
+        // Подстраховка 1: активного ядра нет, но точка отката сохранилась → восстанавливаемся изо всех сил, чтобы контейнер не превратился в «кирпич»
         if (rollbackDir && fs.existsSync(rollbackDir) && !fs.existsSync(path.join(LIVE_CORE_DIR, 'package.json'))) {
           try {
             this._restoreFromRollbackDir(rollbackDir);
             rollbackDir = null;
-            log(`🛡️ [兜底还原] 已从回滚点紧急还原原核心。`);
+            log(`🛡️ [Подстраховочное восстановление] Прежнее ядро срочно восстановлено из точки отката.`);
           } catch (e2) {
-            log(`💥 [兜底还原失败] 回滚点保留于 ${rollbackDir}，可重启容器由 entrypoint 自愈。`);
+            log(`💥 [Подстраховочное восстановление не удалось] Точка отката сохранена в ${rollbackDir}, можно перезапустить контейнер для самовосстановления через entrypoint.`);
           }
         }
-        // 兜底 2：核心文件已在（很可能已是旧版），但服务没起来 → 尽力拉起，避免"核心在却不可用"
+        // Подстраховка 2: файлы ядра на месте (скорее всего уже старые), но сервис не поднялся → стараемся поднять, чтобы не было ситуации «ядро есть, а работать нечем»
         let booted = false;
         if (fs.existsSync(path.join(LIVE_CORE_DIR, 'package.json'))) {
           try {
             const b = await this.boot();
             booted = !!(b && b.ok);
-            if (booted) log(`🛡️ [兜底启动] 已重新拉起 DSH 服务。`);
+            if (booted) log(`🛡️ [Подстраховочный запуск] Сервис DSH снова поднят.`);
           } catch (e3) {
-            log(`⚠️ 兜底启动失败: ${e3.message}`);
+            log(`⚠️ Подстраховочный запуск не удался: ${e3.message}`);
           }
         }
         this.installing = false;
         return {
           ok: false,
-          error: `切换失败且回滚异常: ${rbErr.message}`,
+          error: `Переключение не удалось, откат завершился с ошибкой: ${rbErr.message}`,
           rolledBack: booted,
           version: previousVersion,
-          hint: booted ? '服务已重新拉起' : '核心文件仍在，但服务可能未就绪，建议重启容器'
+          hint: booted ? 'Сервис снова поднят' : 'Файлы ядра на месте, но сервис может быть не готов — рекомендуется перезапустить контейнер'
         };
       }
     }
   }
 
-  // === 版本库治理与原子置换原语 (Issue #7) ===
+  // === Управление хранилищем версий и примитивы атомарной подмены (Issue #7) ===
 
-  /** 标记版本最近使用时间（LRU 依据）；失败不影响主流程 */
+  /** Пометить время последнего использования версии (основание для LRU); сбой не влияет на основной поток */
   _touchVersionUsage(version) {
     try {
       const dir = resolveWithinDir(this.versionsCacheDir, version);
@@ -1567,20 +1584,20 @@ class DshManager {
   }
 
   /**
-   * 原子置换活动核心目录：staging → live。
-   * 先把 live rename 到临时回滚点 (.dsh-rollback-tmp-*)，再把 staging rename 成 live（同文件系统，毫秒级）。
-   * 任一步失败立即把回滚点还原，保证「要么全旧、要么全新」，绝不出现半死半生。
+   * Атомарная подмена активного каталога ядра: staging → live.
+   * Сначала переименовываем live во временную точку отката (.dsh-rollback-tmp-*), затем переименовываем staging в live (одна файловая система, миллисекунды).
+   * При сбое любого шага точка отката немедленно восстанавливается — гарантированно «либо всё старое, либо всё новое», полусостояния исключены.
    */
   _atomicSwapCore(stagingDirPath) {
     const backupDir = path.join(LIVE_CORE_PARENT, `.dsh-rollback-tmp-${process.pid}-${Date.now()}`);
     let moved = false;
     if (fs.existsSync(LIVE_CORE_DIR)) {
-      // 先把现网核心挪到回滚点（lower 层目录在 overlayfs 上会退化为复制+删除）
+      // Сначала убираем работающее ядро в точку отката (каталог lower-слоя на overlayfs деградирует до копирования с удалением)
       try {
         moveDirOrCopy(LIVE_CORE_DIR, backupDir);
       } catch (e) {
-        // 把已生成的（可能是完整副本的）回滚点挂在错误上，供调用方兜底还原
-        const err = new Error(`核心目录置换失败（无法暂存原核心）: ${e.message}`);
+        // Подвешиваем уже созданную (возможно, полную) точку отката на объект ошибки — вызывающий код сможет восстановиться из неё
+        const err = new Error(`Сбой подмены каталога ядра (не удалось сохранить исходное ядро): ${e.message}`);
         if (fs.existsSync(backupDir)) err.rollbackDir = backupDir;
         throw err;
       }
@@ -1589,27 +1606,27 @@ class DshManager {
     try {
       fs.renameSync(stagingDirPath, LIVE_CORE_DIR);
     } catch (e) {
-      // 置换失败：立即还原回滚点，保证「要么全旧、要么全新」
+      // Подмена не удалась: немедленно восстанавливаемся из точки отката — гарантируем «либо всё старое, либо всё новое»
       if (moved) {
         try { restoreCoreFromBackup(backupDir); }
-        catch (err) { console.error('[dsh-manager] 💥 还原原核心失败（需人工介入/重启容器自愈）:', err.message); }
+        catch (err) { console.error('[dsh-manager] 💥 Не удалось восстановить исходное ядро (нужно ручное вмешательство/перезапуск контейнера для самовосстановления):', err.message); }
       }
-      throw new Error(`核心目录置换失败（已尝试还原原核心）: ${e.message}`);
+      throw new Error(`Сбой подмены каталога ядра (попытка восстановления исходного ядра выполнена): ${e.message}`);
     }
-    // bin 软链目标路径固定不变，刷新失败不影响可用性 → best-effort
+    // Целевой путь симлинка bin не меняется, сбой обновления на работоспособность не влияет → best-effort
     try {
       runSyncSafe('ln', ['-sfn', path.join(LIVE_CORE_DIR, 'lib/bin.js'), DSH_BIN_LINK]);
     } catch (e) {
-      console.warn(`[dsh-manager] ⚠️ dsh 软链刷新失败（不影响运行）: ${e.message}`);
+      console.warn(`[dsh-manager] ⚠️ Не удалось обновить симлинк dsh (на работу не влияет): ${e.message}`);
     }
-    // 关键：不在这里删除回滚点。回滚点保留到「健康探活通过」为止，
-    // 这样探活失败时的熔断回滚可以直接本地还原——既不依赖持久化归档，也不需要联网。
+    // Ключево: точку отката здесь не удаляем. Она сохраняется до «успешной проверки готовности»,
+    // чтобы при неудаче проверки аварийный откат мог восстановиться напрямую локально — без персистентного архива и без сети.
     return moved ? backupDir : null;
   }
 
   /**
-   * 将临时回滚目录提升为容器层受保护的单槽位就地回滚点 (.dsh-rollback-preserved)
-   * 若已有旧备件，在提升成功后再删除旧的，保证轮替不提前破坏
+   * Продвигаем временную точку отката в защищённый однослотовый слот точки отката на месте (.dsh-rollback-preserved) в контейнерном слое
+   * Если старый резервный экземпляр уже есть, он удаляется только после успешного продвижения — ротация не разрушает ничего преждевременно
    */
   _promoteToPreservedRollback(tmpDir, version = '') {
     if (!tmpDir || !fs.existsSync(tmpDir)) return;
@@ -1622,11 +1639,11 @@ class DshManager {
         ver = pkg.version || '';
       } catch {}
     }
-    // 写入完整的 .ready 元数据标记（含 nodeAbi / arch / sizeBytes / createdAt 等）
+    // Записываем полную метку .ready (с nodeAbi / arch / sizeBytes / createdAt и т.д.)
     try {
       writeReadyMarker(tmpDir, ver || 'unknown');
     } catch (e) {
-      console.warn(`[dsh-manager] ⚠️ 回滚点元数据写入跳过: ${e.message}`);
+      console.warn(`[dsh-manager] ⚠️ Запись метаданных точки отката пропущена: ${e.message}`);
     }
 
     const oldPreserved = path.join(LIVE_CORE_PARENT, `.dsh-rollback-old-${process.pid}-${Date.now()}`);
@@ -1637,7 +1654,7 @@ class DshManager {
         moveDirOrCopy(ROLLBACK_PRESERVED_DIR, oldPreserved);
         movedOld = true;
       } catch (e) {
-        console.warn(`[dsh-manager] ⚠️ 暂存旧回滚点备件失败: ${e.message}`);
+        console.warn(`[dsh-manager] ⚠️ Не удалось сохранить старый резервный экземпляр точки отката: ${e.message}`);
       }
     }
 
@@ -1650,60 +1667,60 @@ class DshManager {
       if (movedOld && fs.existsSync(oldPreserved) && !fs.existsSync(ROLLBACK_PRESERVED_DIR)) {
         try { moveDirOrCopy(oldPreserved, ROLLBACK_PRESERVED_DIR); } catch {}
       }
-      throw new Error(`回滚点提升至受保护槽位失败: ${err.message}`);
+      throw new Error(`Сбой продвижения точки отката в защищённый слот: ${err.message}`);
     }
   }
 
-  /** 清理切换期间产生的临时回滚点目录 */
+  /** Уборка временной точки отката, созданной на время переключения */
   _disposeRollbackDir(dir) {
     if (!dir) return;
     try { fs.rmSync(dir, { recursive: true, force: true }); }
-    catch (e) { console.warn(`[dsh-manager] ⚠️ 清理回滚点失败（不影响运行）: ${e.message}`); }
+    catch (e) { console.warn(`[dsh-manager] ⚠️ Не удалось убрать точку отката (на работу не влияет): ${e.message}`); }
   }
 
-  /** 从回滚点目录还原活动核心（熔断回滚或就地还原路径，带 ABI 校验） */
+  /** Восстановление активного ядра из каталога точки отката (путь аварийного отката или восстановления на месте, с проверкой ABI) */
   _restoreFromRollbackDir(dir) {
-    if (!dir || !fs.existsSync(dir)) throw new Error('回滚点不存在，无法还原');
+    if (!dir || !fs.existsSync(dir)) throw new Error('Точка отката не существует, восстановление невозможно');
     if (!fs.existsSync(path.join(dir, 'package.json'))) {
-      throw new Error('回滚点目录不完整（缺失 package.json），无法还原');
+      throw new Error('Каталог точки отката неполон (отсутствует package.json), восстановление невозможно');
     }
     const marker = readReadyMarker(dir);
     if (marker) {
       if (marker.nodeAbi && String(marker.nodeAbi) !== String(process.versions.modules)) {
-        throw new Error(`回滚点 Node ABI (${marker.nodeAbi}) 与当前运行环境 (${process.versions.modules}) 不匹配，已拒绝还原`);
+        throw new Error(`Node ABI точки отката (${marker.nodeAbi}) не совпадает с текущей средой выполнения (${process.versions.modules}), восстановление отклонено`);
       }
       if (marker.arch && marker.arch !== process.arch) {
-        throw new Error(`回滚点系统架构 (${marker.arch}) 与当前运行环境 (${process.arch}) 不匹配，已拒绝还原`);
+        throw new Error(`Архитектура точки отката (${marker.arch}) не совпадает с текущей средой выполнения (${process.arch}), восстановление отклонено`);
       }
     }
     restoreCoreFromBackup(dir);
   }
 
-  /** 磁盘水位预检：切换前确认目标路径有足够空间，不足则干净中止（现网服务不受影响） */
+  /** Предварительная проверка места на диске: перед переключением убеждаемся, что в целевых путях хватает места, иначе — чистое прерывание (работающий сервис не затрагивается) */
   _assertDiskSpace(paths, needBytes, log = () => {}) {
     for (const p of paths) {
       try {
         const st = fs.statfsSync(p);
         const free = st.bavail * st.bsize;
         if (free < needBytes) {
-          let hint = '（可先到【快照与备份】面板清理回滚点释放空间）';
+          let hint = ' (сначала можно освободить место: удалите точку отката на странице резервного копирования)';
           try {
             const rb = this.getRollbackPoint ? this.getRollbackPoint() : null;
             if (rb && rb.exists && rb.sizeFormatted) {
-              hint = `（可先到【快照与备份】面板清理回滚点释放 ${rb.sizeFormatted} 空间）`;
+              hint = ` (сначала можно освободить ${rb.sizeFormatted}: удалите точку отката на странице резервного копирования)`;
             }
           } catch {}
-          throw new Error(`磁盘空间不足：${p} 可用 ${formatBytes(free)}，切换至少需要 ${formatBytes(needBytes)}${hint}（已拒绝切换，现网服务保持运行）`);
+          throw new Error(`Недостаточно дискового пространства: ${p} доступно ${formatBytes(free)}, для переключения требуется не менее ${formatBytes(needBytes)}${hint} (переключение отклонено, сервис продолжает работать)`);
         }
-        log(`✔ 磁盘水位检查通过 ${p}: 可用 ${formatBytes(free)}`);
+        log(`✔ Проверка дискового пространства пройдена ${p}: доступно ${formatBytes(free)}`);
       } catch (e) {
-        if (/磁盘空间不足/.test(e.message)) throw e;
-        log(`ℹ️ 跳过磁盘水位检查 ${p}: ${e.message}`);
+        if (/Недостаточно дискового пространства/.test(e.message)) throw e;
+        log(`ℹ️ Пропуск проверки места на диске ${p}: ${e.message}`);
       }
     }
   }
 
-  /** 版本库统计：容量、挂载状态、各版本体积与状态 */
+  /** Статистика хранилища версий: ёмкость, состояние монтирования, объём и статус каждой версии */
   getVersionsStoreStats() {
     const activeVersion = this.getCurrentVersion();
     const pinnedVersion = FALLBACK_DSH_VERSION;
@@ -1738,11 +1755,11 @@ class DshManager {
   }
 
   /**
-   * 版本库 LRU 清理：保留 keepN 份最近使用版本 + 活动版本 + 镜像出厂基准版本。
-   * 返回清理清单与释放空间；dryRun 只预览不删除。
+   * Очистка хранилища версий по LRU: сохраняем keepN недавно использованных версий + активную версию + базовую версию образа.
+   * Возвращаем список удалённых и освобождённое место; dryRun только показывает, ничего не удаляя.
    */
   gcVersions({ keepN = GC_KEEP_DEFAULT, dryRun = false, activeVersion = null } = {}) {
-    if (this.installing) return { ok: false, error: '版本切换进行中，已拒绝并发清理' };
+    if (this.installing) return { ok: false, error: 'Идёт переключение версии, параллельная очистка отклонена' };
     const entries = listStoreEntries().filter(e => e.ready);
     const keep = new Set();
     const n = Math.max(1, Number(keepN) || GC_KEEP_DEFAULT);
@@ -1758,23 +1775,23 @@ class DshManager {
         fs.rmSync(e.dir, { recursive: true, force: true });
         removed.push({ version: e.version, bytes: e.sizeBytes });
       } catch (err) {
-        console.warn(`[dsh-manager] 版本库清理失败 ${e.version}: ${err.message}`);
+        console.warn(`[dsh-manager] Сбой очистки в хранилище версий ${e.version}: ${err.message}`);
       }
     }
-    // 顺带清理过期的 staging 残留（>1 小时）
+    // Заодно убираем просроченные остатки staging (>1 часа)
     if (!dryRun) this.cleanupStagingOrphans();
     this.lastGcAt = Date.now();
     return { ok: true, dir: this.versionsCacheDir, kept: [...keep], removed, freedBytes: removed.reduce((s, r) => s + (r.bytes || 0), 0), dryRun };
   }
 
-  /** 清理版本库 staging 与容器层 staging/rollback 残留（启动与 GC 时调用） */
+  /** Уборка остатков staging в хранилище версий и staging/rollback в контейнерном слое (вызывается при запуске и при GC) */
   cleanupStagingOrphans(maxAgeMs = 3600 * 1000) {
     const now = Date.now();
     for (const dir of [STORE_STAGING_DIR, LIVE_CORE_PARENT]) {
       let names = [];
       try { names = fs.readdirSync(dir); } catch { continue; }
       for (const name of names) {
-        // 显式跳过受保护的就地回滚点单槽位备件，绝不自动清理
+        // Явно пропускаем защищённый однослотовый резервный экземпляр точки отката на месте — автоочистке не подлежит
         if (name === '.dsh-rollback-preserved') continue;
         const isStoreStaging = dir === STORE_STAGING_DIR;
         if (!isStoreStaging && !/^\.dsh-(staging|rollback)-/.test(name)) continue;
@@ -1783,30 +1800,30 @@ class DshManager {
           const st = fs.statSync(p);
           if (now - st.mtimeMs < maxAgeMs) continue;
           fs.rmSync(p, { recursive: true, force: true });
-          console.log(`[dsh-manager] 已清理过期残留: ${p}`);
+          console.log(`[dsh-manager] Убраны просроченные остатки: ${p}`);
         } catch {}
       }
     }
   }
 
-  /** 删除版本库中的指定版本（活动版本与镜像出厂基准版本受保护） */
+  /** Удалить указанную версию из хранилища (активная версия и базовая версия образа защищены) */
   deleteCachedVersion(version) {
-    if (this.installing) return { ok: false, error: '版本切换进行中，已拒绝并发删除' };
-    if (!isValidVersion(version)) return { ok: false, error: '版本号格式不合法' };
+    if (this.installing) return { ok: false, error: 'Идёт переключение версии, параллельное удаление отклонено' };
+    if (!isValidVersion(version)) return { ok: false, error: 'Некорректный формат номера версии' };
     const activeVersion = this.getCurrentVersion();
-    if (version === activeVersion) return { ok: false, error: `版本 ${version} 正在运行，禁止删除` };
-    if (version === FALLBACK_DSH_VERSION) return { ok: false, error: `版本 ${version} 为镜像出厂基准版本，禁止删除` };
+    if (version === activeVersion) return { ok: false, error: `Версия ${version} сейчас запущена, удаление запрещено` };
+    if (version === FALLBACK_DSH_VERSION) return { ok: false, error: `Версия ${version} является базовой версией образа, удаление запрещено` };
     let dir;
     try { dir = resolveWithinDir(this.versionsCacheDir, version); } catch (e) { return { ok: false, error: e.message }; }
-    if (!fs.existsSync(dir)) return { ok: false, error: `版本库中不存在版本 ${version}` };
+    if (!fs.existsSync(dir)) return { ok: false, error: `Версии ${version} нет в хранилище версий` };
     fs.rmSync(dir, { recursive: true, force: true });
     return { ok: true, version, dir };
   }
 
-  // === 就地回滚点管理与就地还原 (Issue #7 引擎回滚点治理) ===
+  // === Управление защищённой точкой отката на месте и восстановление на месте (Issue #7) ===
 
   /**
-   * 获取当前容器层受保护的就地回滚点状态
+   * Получить состояние защищённой точки отката на месте в контейнерном слое
    * @returns {{ exists: boolean, version: string|null, sizeBytes: number, sizeFormatted: string, createdAt: string|null, nodeAbi: string|null, abiMatches: boolean, path: string, canRestore: boolean }}
    */
   getRollbackPoint() {
@@ -1879,16 +1896,16 @@ class DshManager {
   }
 
   /**
-   * 手动清理受保护的回滚点以释放磁盘空间
+   * Вручную удалить защищённую точку отката, чтобы освободить место на диске
    * @returns {{ ok: boolean, freedBytes?: number, error?: string, path?: string }}
    */
   deleteRollbackPoint() {
     if (this.installing) {
-      return { ok: false, error: '版本切换或还原进行中，已拒绝并发删除' };
+      return { ok: false, error: 'Идёт переключение или восстановление версии, параллельное удаление отклонено' };
     }
     const p = ROLLBACK_PRESERVED_DIR;
     if (!fs.existsSync(p)) {
-      return { ok: false, error: '回滚点不存在或已被清理' };
+      return { ok: false, error: 'Точка отката не существует или уже была удалена' };
     }
     const point = this.getRollbackPoint();
     const freedBytes = point.sizeBytes || dirSizeBytes(p);
@@ -1896,12 +1913,12 @@ class DshManager {
       fs.rmSync(p, { recursive: true, force: true });
       return { ok: true, freedBytes, path: p };
     } catch (err) {
-      return { ok: false, error: `清理回滚点失败: ${err.message}` };
+      return { ok: false, error: `Не удалось удалить точку отката: ${err.message}` };
     }
   }
 
   /**
-   * 将活动核心就地还原至受保护的回滚点备件 (Issue #7 还原语义)
+   * Восстановить активное ядро на месте из защищённого резервного экземпляра точки отката (семантика восстановления Issue #7)
    * @param {function} onProgress
    * @param {function} onLog
    * @returns {Promise<{ ok: boolean, version?: string, error?: string, rolledBack?: boolean }>}
@@ -1925,8 +1942,8 @@ class DshManager {
     };
 
     if (this.installing) {
-      log('❌ 已有版本切换或还原任务正在进行中，已拒绝并发操作');
-      return { ok: false, error: '已有任务正在进行中，请稍候' };
+      log('❌ Уже выполняется другая задача смены версии или восстановления, параллельная операция отклонена');
+      return { ok: false, error: 'Другая задача уже выполняется, подождите' };
     }
 
     this.installing = true;
@@ -1935,92 +1952,92 @@ class DshManager {
     const previousVersion = this.getCurrentVersion();
 
     try {
-      emitProgress({ step: 1, total: 5, percent: 10, label: '环境检查与回滚点备件校验', mode: 'install' });
-      log(`=== [阶段 1/5] 回滚点备件完整性与 ABI 预检 ===`);
+      emitProgress({ step: 1, total: 5, percent: 10, label: 'Проверка окружения и целостности резервного экземпляра точки отката', mode: 'install' });
+      log(`=== [Этап 1/5] Предварительная проверка целостности резервного экземпляра точки отката и Node ABI ===`);
 
       const rbPoint = this.getRollbackPoint();
       if (!rbPoint.exists) {
-        throw new Error('回滚点备件不存在，无法就地还原');
+        throw new Error('Резервный экземпляр точки отката не существует, восстановление на месте невозможно');
       }
       if (!rbPoint.abiMatches) {
-        throw new Error(`回滚点 Node ABI (${rbPoint.nodeAbi}) 与当前运行环境 (${process.versions.modules}) 不匹配，无法安全还原`);
+        throw new Error(`Node ABI точки отката (${rbPoint.nodeAbi}) не совпадает с текущей средой выполнения (${process.versions.modules}), безопасное восстановление невозможно`);
       }
       if (!fs.existsSync(path.join(ROLLBACK_PRESERVED_DIR, 'package.json'))) {
-        throw new Error('回滚点目录缺失 package.json，已被损坏');
+        throw new Error('В каталоге точки отката отсутствует package.json, данные повреждены');
       }
 
       const targetVersion = rbPoint.version || 'unknown';
-      log(`✔ 回滚点校验通过: 目标版本 v${targetVersion}，体积 ${rbPoint.sizeFormatted}，Node ABI 匹配`);
+      log(`✔ Проверка точки отката пройдена: целевая версия v${targetVersion}, размер ${rbPoint.sizeFormatted}, Node ABI совпадает`);
 
-      // 预检容器层磁盘空间
+      // Предварительная проверка места на диске в контейнерном слое
       this._assertDiskSpace([LIVE_CORE_PARENT], MIN_FREE_BYTES, log);
 
-      emitProgress({ step: 2, total: 5, percent: 25, label: '停止服务并复制备件至 staging', mode: 'install' });
-      log(`=== [阶段 2/5] 停止现网服务并将备件复制至 staging ===`);
-      log(`正在停止 DSH 进程...`);
+      emitProgress({ step: 2, total: 5, percent: 25, label: 'Остановка сервиса и копирование резервного экземпляра в staging', mode: 'install' });
+      log(`=== [Этап 2/5] Остановка работающего сервиса и копирование резервного экземпляра в staging ===`);
+      log(`Останавливаем процесс DSH...`);
       await this.stop();
 
-      // 复制备件到容器层 staging 目录（绝不能用 rename 或硬链接，确保失败时备件原封不动且补丁不会污染备件）
+      // Копируем резервный экземпляр в staging-каталог контейнерного слоя (нельзя использовать rename или жёсткие ссылки — при сбое резервный экземпляр должен остаться нетронутым, а патчи не должны его загрязнить)
       staging = path.join(LIVE_CORE_PARENT, `.dsh-staging-restore-${process.pid}-${Date.now()}`);
       fs.mkdirSync(staging, { recursive: true });
-      log(`> 正在复制备件至隔离 staging 目录: ${staging}`);
+      log(`> Копируем резервный экземпляр в изолированный staging-каталог: ${staging}`);
       runSyncSafe('cp', ['-a', ROLLBACK_PRESERVED_DIR + '/.', staging + '/']);
-      log(`✔ 备件副本已在隔离 staging 目录就绪`);
+      log(`✔ Копия резервного экземпляра готова в изолированном staging-каталоге`);
 
-      emitProgress({ step: 3, total: 5, percent: 50, label: '原子置换核心目录', mode: 'install' });
-      log(`=== [阶段 3/5] 执行核心目录原子置换 (staging → live) ===`);
+      emitProgress({ step: 3, total: 5, percent: 50, label: 'Атомарная подмена каталога ядра', mode: 'install' });
+      log(`=== [Этап 3/5] Выполняем атомарную подмену каталога ядра (staging → live) ===`);
       newRb = this._atomicSwapCore(staging);
-      staging = null; // 置换成功后 staging 目录已重命名为 live
-      log(`✔ 核心目录置换完成（原核心已暂存为临时回滚点 ${path.basename(newRb || '')}）`);
+      staging = null; // после успешной подмены staging-каталог переименован в live
+      log(`✔ Подмена каталога ядра завершена (прежнее ядро сохранено как временная точка отката ${path.basename(newRb || '')})`);
 
-      emitProgress({ step: 4, total: 5, percent: 75, label: '插件装配与补丁自愈', mode: 'install' });
-      log(`=== [阶段 4/5] 插件环境装配与客户端补丁自愈 ===`);
+      emitProgress({ step: 4, total: 5, percent: 75, label: 'Сборка плагинов и самовосстановление патчей', mode: 'install' });
+      log(`=== [Этап 4/5] Сборка окружения плагинов и внедрение клиентских патчей ===`);
       if (fs.existsSync('/app/scripts/install-plugin.mjs')) {
-        log(`> 正在同步并链接插件依赖至新核心 (schemastery & dsh-browser-desktop)...`);
+        log(`> Синхронизируем и связываем зависимости плагинов с новым ядром (schemastery и dsh-browser-desktop)...`);
         const res = spawnSync('node', ['/app/scripts/install-plugin.mjs'], { encoding: 'utf8' });
         if (res.stdout) log(res.stdout.trim());
       }
       if (fs.existsSync('/app/scripts/patch-dsh-client.mjs')) {
-        log(`> 正在注入客户端回环宿主持久化补丁...`);
+        log(`> Внедряем персистентный патч клиентского loopback-хоста...`);
         const res = spawnSync('node', ['/app/scripts/patch-dsh-client.mjs'], { encoding: 'utf8' });
         if (res.stdout) log(res.stdout.trim());
       }
-      log(`✔ 插件与补丁适配完成`);
+      log(`✔ Адаптация плагинов и патчей завершена`);
 
-      emitProgress({ step: 5, total: 5, percent: 85, label: '拉起服务并健康探活', mode: 'install' });
-      log(`=== [阶段 5/5] 拉起还原核心并执行健康探活 ===`);
+      emitProgress({ step: 5, total: 5, percent: 85, label: 'Подъём сервиса и проверка готовности', mode: 'install' });
+      log(`=== [Этап 5/5] Поднимаем восстанавливаемое ядро и выполняем проверку готовности ===`);
       this.lastExitInfo = null;
       this.recentLogs = [];
 
       const bootRes = await this.restart((probe) => {
         const dynamicPercent = Math.min(97, 85 + Math.floor(probe.attempts * 0.8));
-        log(`🔍 [健康探活] 正在探测端口 ${DSH_PORT} 就绪响应 (第 ${probe.attempts} 次, 已等待 ${probe.elapsedSec}s)...`);
+        log(`🔍 [Проверка готовности] Опрашиваем порт ${DSH_PORT} на отклик о готовности (попытка ${probe.attempts}, ждём ${probe.elapsedSec} с)...`);
         emitProgress({
           step: 5,
           total: 5,
           percent: dynamicPercent,
-          label: `端口健康就绪探活中 (${probe.attempts}/30)...`,
+          label: `Проверка готовности порта (${probe.attempts}/30)...`,
           mode: 'install'
         });
       });
 
       if (!bootRes.ok) {
-        let failDetail = `还原版本 ${targetVersion} 启动后未能通过端口健康就绪探测`;
+        let failDetail = `Восстанавливаемая версия ${targetVersion} не прошла проверку готовности порта после запуска`;
         if (this.lastExitInfo) {
-          failDetail = `还原版本进程启动异常退出 (Exit Code: ${this.lastExitInfo.code}, Signal: ${this.lastExitInfo.sig || 'none'})`;
+          failDetail = `Процесс восстанавливаемой версии аварийно завершился при запуске (Exit Code: ${this.lastExitInfo.code}, Signal: ${this.lastExitInfo.sig || 'none'})`;
         }
         throw new Error(failDetail);
       }
 
-      // 探活成功：把本次置换下的旧核心 (newRb) 提升为 .dsh-rollback-preserved（旧槽位在此轮替），
-      // 于是槽位里变成刚离开的版本，天然支持撤销还原
+      // Проверка готовности успешна: старое ядро, снятое этой подменой (newRb), продвигаем в .dsh-rollback-preserved (прежний слот при этом ротируется),
+      // и в слоте оказывается только что покинутая версия — что естественным образом поддерживает отмену восстановления
       if (newRb && fs.existsSync(newRb)) {
         try {
           this._promoteToPreservedRollback(newRb, previousVersion);
           newRb = null;
-          log(`✔ 原活动版本 (v${previousVersion}) 已轮替存入就地回滚点（天然支持再次撤销还原）`);
+          log(`✔ Прежняя активная версия (v${previousVersion}) ротирована в точку отката на месте (отмена восстановления возможна повторно)`);
         } catch (promoteErr) {
-          log(`⚠️ 回滚点轮替提升非致命警告: ${promoteErr.message}`);
+          log(`⚠️ Ротация точки отката в защищённый слот завершилась с некритичным предупреждением: ${promoteErr.message}`);
         }
       }
 
@@ -2031,29 +2048,29 @@ class DshManager {
         step: 5,
         total: 5,
         percent: 100,
-        label: `还原完成！当前核心已恢复至 v${currentVer}`,
+        label: `Восстановление завершено! Активное ядро возвращено на v${currentVer}`,
         mode: 'install'
       });
 
       log(`======================================================================`);
-      log(`🎉 [SUCCESS] DSH 核心就地还原成功！`);
-      log(`🚀 当前运行版本: v${currentVer} (服务已健康就绪)`);
+      log(`🎉 [SUCCESS] Восстановление ядра DSH на месте успешно завершено!`);
+      log(`🚀 Текущая работающая версия: v${currentVer} (сервис здоров и готов)`);
       log(`======================================================================`);
 
       return { ok: true, version: currentVer };
 
     } catch (err) {
       log(`======================================================================`);
-      log(`❌ 还原失败: ${err.message}`);
+      log(`❌ Восстановление не удалось: ${err.message}`);
 
-      // 若已发生核心目录置换（newRb 存在），触发安全回退
+      // Если подмена каталога ядра уже произошла (newRb существует) — запускаем безопасную отмену
       if (newRb && fs.existsSync(newRb)) {
-        log(`⚠️ 触发安全撤销保护：正在恢复还原前的原活动核心 (v${previousVersion})...`);
+        log(`⚠️ Срабатывает защитная отмена: восстанавливаем прежнее активное ядро (v${previousVersion}) до восстановления...`);
         emitProgress({
           step: 1,
           total: 3,
           percent: 40,
-          label: `🛡️ 正在撤销置换并恢复原活动核心 v${previousVersion}...`,
+          label: `🛡️ Отменяем подмену и восстанавливаем прежнее активное ядро v${previousVersion}...`,
           mode: 'rollback'
         });
 
@@ -2061,7 +2078,7 @@ class DshManager {
           await this.stop();
           this._restoreFromRollbackDir(newRb);
           newRb = null;
-          log(`✔ 原活动核心已从临时备份恢复`);
+          log(`✔ Прежнее активное ядро восстановлено из временной резервной копии`);
 
           if (fs.existsSync('/app/scripts/install-plugin.mjs')) {
             spawnSync('node', ['/app/scripts/install-plugin.mjs'], { encoding: 'utf8' });
@@ -2074,18 +2091,18 @@ class DshManager {
             step: 2,
             total: 3,
             percent: 75,
-            label: `🛡️ 重新拉起原核心并健康探活...`,
+            label: `🛡️ Повторный подъём прежнего ядра и проверка готовности...`,
             mode: 'rollback'
           });
 
           await this.restart();
-          log(`✔ 原活动核心已重新就绪，原有回滚点备件完整未受污染`);
+          log(`✔ Прежнее активное ядро снова готово, прежний резервный экземпляр точки отката цел и не загрязнён`);
 
           emitProgress({
             step: 3,
             total: 3,
             percent: 100,
-            label: `🛡️ 已安全回退至原活动版本 v${previousVersion}`,
+            label: `🛡️ Безопасный возврат к прежней активной версии v${previousVersion} выполнен`,
             mode: 'rollback'
           });
 
@@ -2096,11 +2113,11 @@ class DshManager {
             version: previousVersion
           };
         } catch (revErr) {
-          log(`💥 [严重警报] 撤销还原遇到异常: ${revErr.message}`);
+          log(`💥 [КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ] Отмена восстановления завершилась с исключением: ${revErr.message}`);
           return {
             ok: false,
             rolledBack: false,
-            error: `还原失败且撤销异常: ${revErr.message}`,
+            error: `Восстановление не удалось, отмена завершилась с ошибкой: ${revErr.message}`,
             version: previousVersion
           };
         }
@@ -2114,7 +2131,7 @@ class DshManager {
       };
 
     } finally {
-      // 全程清理 staging 残留与未被消费的临时回滚点，保证 installing 复位
+      // На всём протяжении убираем остатки staging и неиспользованные временные точки отката, гарантируя сброс installing
       if (staging && fs.existsSync(staging)) {
         try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
       }
@@ -2126,7 +2143,7 @@ class DshManager {
     }
   }
 
-  // === 配置文件快照与备份管理 (委托给异步非阻塞 backupService) ===
+  // === Снимки и резервное копирование конфигурационных файлов (делегируется асинхронному неблокирующему backupService) ===
   ensureDefaultSnapshot() {
     const defaultMarker = path.join(SNAPSHOTS_DIR, '.default_snapshot_created');
     if (fs.existsSync(defaultMarker)) {
@@ -2140,14 +2157,14 @@ class DshManager {
       return { ok: true, alreadyExists: true };
     }
 
-    console.log('[dsh-manager] 首次启动：异步非阻塞创建初始默认配置快照...');
+    console.log('[dsh-manager] Первый запуск: асинхронно и неблокирующе создаём начальный снимок конфигурации по умолчанию...');
     backupService.createBackup('default-initial')
       .then(res => {
         try { fs.writeFileSync(defaultMarker, new Date().toISOString()); } catch {}
-        console.log(`[dsh-manager] 默认初始配置快照创建成功: ${res.snapshot.filename}`);
+        console.log(`[dsh-manager] Начальный снимок конфигурации по умолчанию успешно создан: ${res.snapshot.filename}`);
       })
       .catch(err => {
-        console.warn('[dsh-manager] 创建初始快照非致命跳过:', err.message);
+        console.warn('[dsh-manager] Создание начального снимка пропущено (не критично):', err.message);
       });
 
     return { ok: true, pending: true };

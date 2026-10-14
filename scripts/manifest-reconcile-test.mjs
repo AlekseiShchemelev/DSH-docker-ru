@@ -1,18 +1,23 @@
 /**
- * P6（语义面）回归测试：装配脚本必须尊重"外部写者"（DSH 原生插件管理器）的插件状态。
+ * P6 (семантический аспект) регрессионный тест: сборочный скрипт обязан уважать
+ * состояние плагинов от «внешних писателей» (нативный менеджер плагинов DSH).
  *
- * 背景：原生插件管理器启停插件时只改 bundles，不写我们的 plugins-state.json。
- * 旧行为下，容器重启时 install-plugin.mjs 会把"依赖仍在、但已从 bundles 移除"的插件
- * 当成"从未装配"而自动装回去 —— 静默回退用户的停用决定（已在远程实测复现）。
+ * Предыстория: нативный менеджер, включая/отключая плагин, меняет только bundles
+ * и не пишет наш plugins-state.json. При старом поведении при перезапуске контейнера
+ * install-plugin.mjs считал плагин с «зависимостью на месте, но вынутой из bundles»
+ * «ни разу не собранным» и возвращал его автоматически — молча откатывая решение
+ * пользователя об отключении (воспроизведено и на удалёнке).
  *
- * 覆盖（驱动真实 scripts/install-plugin.mjs，使用临时 DSH_HOME 与临时 market 根目录）：
- *   A. 全新数据卷：预装插件应被自动装配（开箱即用不被破坏）
- *   B. 外部停用（deps 有 + bundles 无）：不得复活，并写入 plugins-state.json
- *   C. 外部卸载（deps 无 + bundles 无 + known 有）：不得复活，并标记 uninstalled
- *   D. 外部重新启用（deps 有 + bundles 有）：清除我们的 disabled/uninstalled 标记
- *   E. 我们自己的停用（Admin 路径）：仍然保持停用
+ * Покрытие (гонит настоящий scripts/install-plugin.mjs, временный DSH_HOME и временный
+ * корень маркетплейса):
+ *   A. новый том данных: предустановленные плагины собираются автоматически
+ *      (работа «из коробки» не ломается)
+ *   B. внешнее отключение (deps есть + bundles нет): не «воскресает», пишется plugins-state.json
+ *   C. внешнее удаление (deps нет + bundles нет + есть в known): не «воскресает», ставится uninstalled
+ *   D. внешнее повторное включение (deps есть + bundles есть): наши флаги disabled/uninstalled снимаются
+ *   E. наше собственное отключение (путь Admin): остаётся отключённым
  *
- * 用法: node scripts/manifest-reconcile-test.mjs
+ * Запуск: node scripts/manifest-reconcile-test.mjs
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -35,7 +40,7 @@ for (const p of MARKET) {
   fs.mkdirSync(path.join(marketRoot, p), { recursive: true });
   fs.writeFileSync(path.join(marketRoot, p, 'package.json'), JSON.stringify({ name: p, version: '1.0.0' }, null, 2) + '\n');
 }
-// 内置插件源（与镜像内 /app/plugins/dsh-browser-desktop 对应）
+// Источник встроенного плагина (соответствует /app/plugins/dsh-browser-desktop в образе)
 const pluginSource = path.join(tmpRoot, 'app-plugins/dsh-browser-desktop');
 fs.mkdirSync(pluginSource, { recursive: true });
 fs.writeFileSync(path.join(pluginSource, 'package.json'), JSON.stringify({ name: BD, version: '0.1.1' }, null, 2) + '\n');
@@ -63,8 +68,9 @@ function runInstaller({ home, profileDir }) {
       DSH_HOME: home,
       DSH_PROFILE_DIR: profileDir,
       DSH_MARKET_PLUGIN_ROOT: marketRoot,
-      // 让内置插件也走临时源目录：脚本里 customPath 固定为 /app/plugins，
-      // 本地不存在时会跳过软链但依然按 bundles 逻辑处理，这里用软链目录兜底
+      // Заставляем встроенный плагин тоже ходить во временный исходный каталог:
+      // в скрипте customPath жёстко равен /app/plugins, и если здесь его нет, симлинк
+      // пропускается, но bundles-логика всё равно отрабатывает — закрываем это softlink-путь
     },
     encoding: 'utf8'
   });
@@ -77,37 +83,37 @@ const readState = (home) => {
   return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
 };
 
-// ── A. 全新数据卷：应自动装配预装插件 ──
-console.log('\n=== A. 全新数据卷 → 预装插件自动装配 ===');
+// ── A. Новый том данных: предустановленные плагины собираются автоматически ──
+console.log('\n=== A. Новый том данных → автоматическая сборка предустановленных плагинов ===');
 {
   const env = makeHome('fresh', { deps: [], bundles: [] });
   const r = runInstaller(env);
   const b = readBundles(env.profileDir);
-  ok(r.status === 0, '装配脚本退出码 0');
-  ok(MARKET.every((n) => b.includes(n)), `预装市场插件已装配（${b.filter((x) => MARKET.includes(x)).join(', ')}）`);
+  ok(r.status === 0, 'код выхода сборочного скрипта 0');
+  ok(MARKET.every((n) => b.includes(n)), `предустановленные маркет-плагины собраны (${b.filter((x) => MARKET.includes(x)).join(', ')})`);
   const st = readState(env.home);
-  ok(Boolean(st && Array.isArray(st.known) && MARKET.every((n) => st.known.includes(n))), 'plugins-state.json 记录 known 清单');
+  ok(Boolean(st && Array.isArray(st.known) && MARKET.every((n) => st.known.includes(n))), 'plugins-state.json содержит список known');
 }
 
-// ── B. 外部停用：不得复活 ──
-console.log('\n=== B. 外部停用（deps 有 + bundles 无）→ 不得复活 ===');
+// ── B. Внешнее отключение: не «воскресать» ──
+console.log('\n=== B. Внешнее отключение (deps есть + bundles нет) → не «воскресать» ===');
 {
   const env = makeHome('extDisabled', {
     deps: ['dshmarket', ...MARKET.slice(1)],
-    bundles: [],                       // 已被原生 UI 移出 bundles
+    bundles: [],                       // уже вынут из bundles нативным UI
     state: { disabled: [], uninstalled: [], known: ['dshmarket', ...MARKET.slice(1)] }
   });
   const r = runInstaller(env);
   const b = readBundles(env.profileDir);
   const st = readState(env.home);
-  ok(r.status === 0, '装配脚本退出码 0');
-  ok(!b.includes('dshmarket'), 'dshmarket 未被重新装回 bundles（用户停用被尊重）');
-  ok(st.disabled.includes('dshmarket'), '已把外部停用同步进 plugins-state.json');
-  ok(r.out.includes('停用(外部)'), '日志明确说明识别到外部停用');
+  ok(r.status === 0, 'код выхода сборочного скрипта 0');
+  ok(!b.includes('dshmarket'), 'dshmarket не возвращён в bundles (отключение пользователя уважено)');
+  ok(st.disabled.includes('dshmarket'), 'внешнее отключение синхронизировано в plugins-state.json');
+  ok(r.out.includes('отключён (внешне)'), 'лог явно сообщает о распознанном внешнем отключении');
 }
 
-// ── C. 外部卸载：不得复活 ──
-console.log('\n=== C. 外部卸载（deps 无 + bundles 无 + known 有）→ 不得复活 ===');
+// ── C. Внешнее удаление: не «воскресать» ──
+console.log('\n=== C. Внешнее удаление (deps нет + bundles нет + есть в known) → не «воскресать» ===');
 {
   const env = makeHome('extUninstalled', {
     deps: [],
@@ -117,13 +123,13 @@ console.log('\n=== C. 外部卸载（deps 无 + bundles 无 + known 有）→ �
   const r = runInstaller(env);
   const b = readBundles(env.profileDir);
   const st = readState(env.home);
-  ok(r.status === 0, '装配脚本退出码 0');
-  ok(!b.includes('dshmarket'), 'dshmarket 未被重新装回 bundles（用户卸载被尊重）');
-  ok(st.uninstalled.includes('dshmarket'), '已把外部卸载同步进 plugins-state.json');
+  ok(r.status === 0, 'код выхода сборочного скрипта 0');
+  ok(!b.includes('dshmarket'), 'dshmarket не возвращён в bundles (удаление пользователя уважено)');
+  ok(st.uninstalled.includes('dshmarket'), 'внешнее удаление синхронизировано в plugins-state.json');
 }
 
-// ── D. 外部重新启用：清除我们的标记 ──
-console.log('\n=== D. 外部重新启用（deps 有 + bundles 有）→ 清除停用标记 ===');
+// ── D. Внешнее повторное включение: наши флаги снимаются ──
+console.log('\n=== D. Внешнее повторное включение (deps есть + bundles есть) → снятие флагов отключения ===');
 {
   const env = makeHome('extEnabled', {
     deps: ['dshmarket'],
@@ -132,13 +138,13 @@ console.log('\n=== D. 外部重新启用（deps 有 + bundles 有）→ 清除�
   });
   const r = runInstaller(env);
   const st = readState(env.home);
-  ok(r.status === 0, '装配脚本退出码 0');
-  ok(!st.disabled.includes('dshmarket'), 'disabled 标记已清除');
-  ok(!st.uninstalled.includes('dshmarket'), 'uninstalled 标记已清除');
+  ok(r.status === 0, 'код выхода сборочного скрипта 0');
+  ok(!st.disabled.includes('dshmarket'), 'флаг disabled снят');
+  ok(!st.uninstalled.includes('dshmarket'), 'флаг uninstalled снят');
 }
 
-// ── E. 我们自己的停用仍然保持 ──
-console.log('\n=== E. Admin 侧停用（deps 有 + bundles 无 + 我们标记 disabled）→ 保持停用 ===');
+// ── E. Наше собственное отключение остаётся ──
+console.log('\n=== E. отключение со стороны Admin (deps есть + bundles нет + наш флаг disabled) → остаётся отключённым ===');
 {
   const env = makeHome('oursDisabled', {
     deps: ['dshmarket'],
@@ -148,11 +154,11 @@ console.log('\n=== E. Admin 侧停用（deps 有 + bundles 无 + 我们标记 di
   const r = runInstaller(env);
   const b = readBundles(env.profileDir);
   const st = readState(env.home);
-  ok(r.status === 0, '装配脚本退出码 0');
-  ok(!b.includes('dshmarket'), 'dshmarket 未被装回');
-  ok(st.disabled.includes('dshmarket'), 'disabled 标记保持');
+  ok(r.status === 0, 'код выхода сборочного скрипта 0');
+  ok(!b.includes('dshmarket'), 'dshmarket не возвращён');
+  ok(st.disabled.includes('dshmarket'), 'флаг disabled сохранён');
 }
 
 fs.rmSync(tmpRoot, { recursive: true, force: true });
-console.log(`\n===== 汇总: 通过 ${pass} / 失败 ${fail} =====`);
+console.log(`\n===== Итог: пройдено ${pass} / провалено ${fail} =====`);
 process.exit(fail ? 1 : 0);

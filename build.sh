@@ -1,21 +1,23 @@
 #!/bin/bash
 set -e
 
-# deepseek-harness 镜像构建工具
-# 用法:
-#   ./build.sh          -> 构建默认纯净基础镜像 (deepseek-harness-docker:latest 及额外标签)
-#   ./build.sh --market -> 构建带预装插件清单的镜像 (deepseek-harness-docker:latest-market 及额外标签)
+# Инструмент сборки образа deepseek-harness
+# Использование:
+#   ./build.sh          -> собирает базовый чистый образ по умолчанию (deepseek-harness-docker:latest и доп. теги)
+#   ./build.sh --market -> собирает образ с предустановленным списком плагинов (deepseek-harness-docker:latest-market и доп. теги)
 
 IMAGE_NAME="deepseek-harness-docker"
 PROJ_VER="0.2.3"
 NODE_IMAGE="${NODE_IMAGE:-node:24-trixie}"
 NOVNC_ASSET_REVISION="${NOVNC_ASSET_REVISION:-1.6.0}"
-# 预装层缓存刷新键：默认用当前时间戳，保证每次构建都重新执行预装层，
-# 让 plugins.market.list 里的 @latest 插件（dshmarket）拉到最新版。
+# Ключ сброса кэша слоя предустановки: по умолчанию текущий таймстамп, каждая сборка заново
+# исполняет слой предустановки, и плагины из plugins.market.list на @latest (dshmarket)
+# подтягивают свежайшую версию.
 MARKET_REFRESH="${MARKET_REFRESH:-$(date +%s)}"
-# ── M10 供应链固定 ───────────────────────────────────────────────
-# 默认版本写死在 version.json#supply（不再每次构建都去 npm 拉"最新 alpha"，
-# 避免同一次发布构建出不同内容的镜像）；确需升级时显式改 version.json 或用环境变量覆盖。
+# ── M10 фиксация цепочки поставок ───────────────────────────────────────────────
+# Версии по умолчанию зашиты в version.json#supply (больше не дёргаем npm за «последней alpha»
+# при каждой сборке — иначе один и тот же релиз соберётся в различающиеся образы);
+# при необходимости апгрейда явно меняем version.json или переопределяем переменной окружения.
 read_supply() {
   node -e "const v=require('./version.json').supply||{};process.stdout.write(String(v['$1']||''))" 2>/dev/null \
     || grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" version.json | head -1 | sed 's/.*:\(.*\)/\1/' | tr -d '", '
@@ -24,28 +26,29 @@ PINNED_DSH="$(read_supply dshVersion)"
 PINNED_PNPM="$(read_supply pnpmVersion)"
 DSH_VERSION="${DSH_VERSION:-${PINNED_DSH:-0.2.1-alpha.2}}"
 PNPM_VERSION="${PNPM_VERSION:-${PINNED_PNPM:-12.5.1}}"
-echo " 供应链固定版本: DSH=${DSH_VERSION}  pnpm=${PNPM_VERSION}"
-if [ -z "${DSH_VERSION}" ]; then echo "错误: 未能确定 DSH 版本" >&2; exit 1; fi
+echo " Фиксированные версии цепочки поставок: DSH=${DSH_VERSION}  pnpm=${PNPM_VERSION}"
+if [ -z "${DSH_VERSION}" ]; then echo "Ошибка: не удалось определить версию DSH" >&2; exit 1; fi
 
-# ── 追加镜像标签（Issue #9）─────────────────────────────────────
-# 用途：为特定问题 / 特定用户单独构建测试镜像，不影响 :latest 与正式发布标签。
-# 用法：EXTRA_TAGS="issue9-fix" ./build.sh
-#       EXTRA_TAGS="issue9-fix-market" ./build.sh --market
-# 多个标签用空格分隔；每个标签同时打本地名与 ghcr.io 名。
+# ── Дополнительные теги образа (Issue #9) ──────────────────────────────────────
+# Назначение: отдельно собирать тестовый образ под конкретный issue / пользователя,
+# не затрагивая :latest и официальные релизные теги.
+# Использование: EXTRA_TAGS="issue9-fix" ./build.sh
+#                EXTRA_TAGS="issue9-fix-market" ./build.sh --market
+# Несколько тегов через пробел; каждый ставится и локально, и в ghcr.io.
 EXTRA_TAGS="${EXTRA_TAGS:-}"
 EXTRA_TAG_ARGS=""
 for _t in ${EXTRA_TAGS}; do
   EXTRA_TAG_ARGS="${EXTRA_TAG_ARGS} -t ${IMAGE_NAME}:${_t} -t ghcr.io/misaka-link/${IMAGE_NAME}:${_t}"
-  echo " 追加标签: ${IMAGE_NAME}:${_t}  /  ghcr.io/misaka-link/${IMAGE_NAME}:${_t}"
+  echo " Доп. тег: ${IMAGE_NAME}:${_t}  /  ghcr.io/misaka-link/${IMAGE_NAME}:${_t}"
 done
 
 if [ "$1" = "--market" ] || [ "$1" = "-m" ] || [ "$PREINSTALL_PLUGINS" = "1" ]; then
   echo "========================================================="
-  echo " 构建包含预装插件清单的 Market 镜像: ${IMAGE_NAME}:latest-market"
-  echo " 底座镜像 (Node/OS): ${NODE_IMAGE}"
-  echo " 关联额外标签一(DSH版本): ${IMAGE_NAME}:${DSH_VERSION}-market"
-  echo " 关联额外标签二(项目版本): ${IMAGE_NAME}:${PROJ_VER}-market"
-  echo " 预装清单参考: plugins.market.list"
+  echo " Сборка Market-образа с предустановленным списком плагинов: ${IMAGE_NAME}:latest-market"
+  echo " Базовый образ (Node/OS): ${NODE_IMAGE}"
+  echo " Доп. тег 1 (версия DSH): ${IMAGE_NAME}:${DSH_VERSION}-market"
+  echo " Доп. тег 2 (версия проекта): ${IMAGE_NAME}:${PROJ_VER}-market"
+  echo " Список предустановки: plugins.market.list"
   echo "========================================================="
   docker build \
     --build-arg NODE_IMAGE="${NODE_IMAGE}" \
@@ -63,15 +66,15 @@ if [ "$1" = "--market" ] || [ "$1" = "-m" ] || [ "$PREINSTALL_PLUGINS" = "1" ]; 
     -t "${IMAGE_NAME}:v${PROJ_VER}-market" \
     ${EXTRA_TAG_ARGS} \
     .
-  echo ">>> 成功产出镜像: ${IMAGE_NAME}:latest-market (附加 DSH:${DSH_VERSION}-market 与 项目:${PROJ_VER}-market)"
-  echo ">>> 可使用 'docker compose -f docker-compose.market.yml up -d' 启动测试"
+  echo ">>> Образ собран: ${IMAGE_NAME}:latest-market (доп. DSH:${DSH_VERSION}-market и проект:${PROJ_VER}-market)"
+  echo ">>> Запуск для проверки: 'docker compose -f docker-compose.market.yml up -d'"
 else
   echo "========================================================="
-  echo " 构建默认基础镜像: ${IMAGE_NAME}:latest (默认不预装插件)"
-  echo " 底座镜像 (Node/OS): ${NODE_IMAGE}"
-  echo " 关联额外标签一(DSH版本): ${IMAGE_NAME}:${DSH_VERSION}"
-  echo " 关联额外标签二(项目版本): ${IMAGE_NAME}:${PROJ_VER}"
-  echo " 若需预装市场插件，请执行: ./build.sh --market"
+  echo " Сборка базового образа по умолчанию: ${IMAGE_NAME}:latest (без предустановки плагинов)"
+  echo " Базовый образ (Node/OS): ${NODE_IMAGE}"
+  echo " Доп. тег 1 (версия DSH): ${IMAGE_NAME}:${DSH_VERSION}"
+  echo " Доп. тег 2 (версия проекта): ${IMAGE_NAME}:${PROJ_VER}"
+  echo " Если нужны предустановленные маркет-плагины, выполните: ./build.sh --market"
   echo "========================================================="
   docker build \
     --build-arg NODE_IMAGE="${NODE_IMAGE}" \
@@ -88,6 +91,6 @@ else
     -t "${IMAGE_NAME}:v${PROJ_VER}" \
     ${EXTRA_TAG_ARGS} \
     .
-  echo ">>> 成功产出镜像: ${IMAGE_NAME}:latest (附加 DSH:${DSH_VERSION} 与 项目:${PROJ_VER})"
-  echo ">>> 可使用 'docker compose up -d' 启动测试"
+  echo ">>> Образ собран: ${IMAGE_NAME}:latest (доп. DSH:${DSH_VERSION} и проект:${PROJ_VER})"
+  echo ">>> Запуск для проверки: 'docker compose up -d'"
 fi

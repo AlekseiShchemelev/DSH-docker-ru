@@ -7,7 +7,8 @@ let AUTH_TOKEN = (process.env.AUTH_TOKEN || process.env.ACCESS_CODE || '').trim(
 const COOKIE_NAME = 'dsh_auth_session';
 const COOKIE_MAX_AGE = Number(process.env.COOKIE_MAX_AGE) || 30 * 24 * 3600; // 30 days
 
-// 初始化签名密钥：优先环境变量 -> 其次持久化存储 -> 首次生成 256 位高强度安全随机数并持久化 (CWE-330)
+// Инициализация ключа подписи: сначала переменная окружения -> затем файл на диске -> впервые генерируем
+// 256-битный криптографически стойкий случайный ключ и сохраняем (CWE-330)
 function initSigningSecret() {
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim().length >= 16) {
     return process.env.SESSION_SECRET.trim();
@@ -22,10 +23,10 @@ function initSigningSecret() {
       }
     }
   } catch (e) {
-    console.warn('[auth] 读取持久化 session_secret 失败:', e.message);
+    console.warn('[auth] Ошибка чтения сохранённого session_secret:', e.message);
   }
 
-  // 生成密码学安全的 256 位真随机密钥，彻底解决 CWE-330 可预测密钥问题
+  // Генерируем криптографически стойкий 256-битный по-настоящему случайный ключ, решая проблему CWE-330 «предсказуемый ключ»
   const generated = crypto.randomBytes(32).toString('hex');
   try {
     const secretDir = path.dirname(secretFile);
@@ -33,9 +34,9 @@ function initSigningSecret() {
       fs.mkdirSync(secretDir, { recursive: true, mode: 0o700 });
     }
     fs.writeFileSync(secretFile, generated, { encoding: 'utf8', mode: 0o600 });
-    console.log('[auth] 已初始化并持久化安全 Session 签名密钥至:', secretFile);
+    console.log('[auth] Ключ подписи Session инициализирован и сохранён на диск:', secretFile);
   } catch (e) {
-    console.warn('[auth] 持久化 session_secret 失败，将临时保存在内存中:', e.message);
+    console.warn('[auth] Не удалось сохранить session_secret, хранение временно в памяти:', e.message);
   }
 
   return generated;
@@ -49,7 +50,7 @@ function getSigningSecret() {
 
 function updateAuthToken(newToken) {
   AUTH_TOKEN = (newToken !== undefined ? String(newToken) : '').trim();
-  console.log('[auth] 认证口令已更新, 状态:', isAuthEnabled() ? '已启用认证' : '已禁用认证 (无感直通)');
+  console.log('[auth] Код доступа обновлён, состояние:', isAuthEnabled() ? 'аутентификация включена' : 'аутентификация выключена (прозрачный проход без входа)');
 }
 
 function getAuthToken() {
@@ -60,11 +61,12 @@ function getAuthToken() {
 const failedAttempts = new Map(); // ip -> { count, firstAttempt, lockedUntil, lastSeen }
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_WINDOW_MS = 60 * 1000; // 1 minute
-const ATTEMPT_TTL_MS = 10 * 60 * 1000; // 10 minutes: 过期条目定期清理，避免 Map 无限增长
+const ATTEMPT_TTL_MS = 10 * 60 * 1000; // 10 минут: устаревшие записи периодически чистим, чтобы Map не рос бесконечно
 
-// 是否信任反向代理转发的 X-Forwarded-For。默认关闭：直接使用 socket 对端地址，
-// 否则任何人只要伪造 XFF 头就能为每次尝试"换一个 IP"，让限流形同虚设。
-// 仅当网关确实部署在可信反向代理（Nginx/Traefik…）之后时才应显式打开。
+// Доверять ли X-Forwarded-For с обратного прокси. По умолчанию выключено: используется адрес
+// сокета напрямую, иначе любой, подделывая заголовок XFF, сможет «менять IP» при каждой
+// попытке, и лимит частоты станет бесполезен.
+// Включать явно только когда шлюз действительно стоит за доверенным обратным прокси (Nginx/Traefik…).
 let TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
 
 function setTrustProxy(value) {
@@ -75,7 +77,7 @@ function getTrustProxy() {
   return TRUST_PROXY;
 }
 
-/** 规范化 IP 字符串：去掉 IPv4-mapped IPv6 前缀、端口、方括号，非 IP 一律归为 unknown */
+/** Нормализация строки IP: убираем префикс IPv4-mapped IPv6, порт, квадратные скобки; не-IP сводим к unknown */
 function normalizeIp(raw) {
   if (typeof raw !== 'string') return '';
   let ip = raw.trim();
@@ -91,10 +93,11 @@ function normalizeIp(raw) {
 }
 
 /**
- * 解析用于限流的客户端 IP。
- * 只有 TRUST_PROXY 打开时才采用 X-Forwarded-For；否则一律用 socket 对端地址。
- * 即使信任代理，也只取 XFF 中"最右侧"的可信链路之外的第一跳（这里简化为取最右一个合法 IP），
- * 避免客户端自带的伪造值排在前面被误当作真实来源。
+ * Разбор IP клиента для лимита частоты.
+ * Только при включённом TRUST_PROXY используется X-Forwarded-For; иначе всегда адрес сокета.
+ * Даже доверяя прокси, берём первый хоп за пределами доверенной цепочки (здесь упрощено:
+ * самый правый корректный IP), чтобы подделанное клиентом значение в начале строки
+ * не принималось за реальный источник.
  */
 function resolveClientIp(req) {
   const direct = normalizeIp(req && req.socket && req.socket.remoteAddress) || 'unknown';
@@ -105,7 +108,7 @@ function resolveClientIp(req) {
 
   const parts = header.split(',').map(s => normalizeIp(s)).filter(Boolean);
   if (parts.length === 0) return direct;
-  // 取最右（最接近本机、由可信代理写入）的一个
+  // Берём самый правый (ближайший к хосту, записанный доверенным прокси)
   return parts[parts.length - 1];
 }
 
@@ -113,19 +116,19 @@ function isAuthEnabled() {
   return AUTH_TOKEN.length > 0;
 }
 
-// 未设置访问口令 ⇒ 必须走初始化向导（不再提供"免密直通"模式）
+// Код доступа не задан ⇒ обязателен мастер инициализации (режима «проход без пароля» больше нет)
 function isSetupRequired() {
   return !isAuthEnabled();
 }
 
-// 常见弱口令黑名单（仅作最低限度拦截，配合前端提示）
+// Чёрный список распространённых слабых паролей (минимальное препятствие, в паре с подсказками на фронтенде)
 const WEAK_PASSWORDS = new Set([
   'admin', 'administrator', 'password', 'passw0rd', '123456', '12345678', '123456789',
   '1234567890', 'qwertyuiop', '111111', '11111111', '000000', '00000000', '888888', '88888888',
   '666666', 'deepseek', 'admin123', 'root', 'letmein', 'changeme'
 ]);
 
-/** 口令是否过弱（长度 < 6 或命中常见弱口令） */
+/** Слабый ли пароль (длина < 6 или входит в чёрный список) */
 function isWeakPassword(pwd) {
   if (typeof pwd !== 'string') return true;
   const p = pwd.trim();
@@ -133,8 +136,8 @@ function isWeakPassword(pwd) {
   return WEAK_PASSWORDS.has(p.toLowerCase());
 }
 
-// 常量时间比较：先各自 HMAC-SHA256 再比较固定长度摘要，
-// 避免"长度不同立即返回"从耗时上泄露口令长度（轻微项）。
+// Сравнение за константное время: сначала HMAC-SHA256, затем сравнение дайджестов фиксированной длины,
+// чтобы «неравенство длин → немедленный возврат» не выдавало длину пароля через время выполнения (незначительный момент).
 const COMPARE_KEY = crypto.randomBytes(32);
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -143,7 +146,7 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-/** 请求是否经由 HTTPS（直连 TLS 或可信代理声明 x-forwarded-proto=https） */
+/** Запрос идёт по HTTPS (прямой TLS или доверенный прокси заявил x-forwarded-proto=https) */
 function isSecureRequest(req) {
   if (!req) return false;
   try {
@@ -163,11 +166,11 @@ function checkRateLimit(clientIp) {
     const remainingSeconds = Math.ceil((record.lockedUntil - now) / 1000);
     return {
       allowed: false,
-      error: `登录尝试次数过多，请在 ${remainingSeconds} 秒后重试`
+      error: `Слишком много попыток входа, повторите через ${remainingSeconds} с`
     };
   }
 
-  // Reset if window has passed
+  // Reset if window has passed (сброс, если окно истекло)
   if (record.lockedUntil && now >= record.lockedUntil) {
     failedAttempts.delete(clientIp);
     return { allowed: true };
@@ -196,9 +199,10 @@ function recordAuthAttempt(clientIp, success) {
 }
 
 /**
- * 清理过期条目：锁定期已过且超过 TTL 未再出现的记录直接删除。
- * 每次记录失败尝试时顺带清理（O(n) 但仅在失败路径、且有阈值保护），
- * 保证限流表不会随攻击者伪造的海量 IP 无限膨胀（TTL 兜底）。
+ * Очистка устаревших записей: удаляются записи, у которых срок блокировки прошёл и дольше TTL
+ * не появлялись снова. Очистка выполняется попутно при каждой фиксации неуспешной попытки
+ * (O(n), но только на пути ошибки и под защитой порога), чтобы таблица лимита не разрасталась
+ * бесконечно из-за поддельных атак множеством IP (TTL как страховка).
  */
 function sweepExpiredAttempts(now) {
   if (failedAttempts.size < 1000) return;
@@ -209,7 +213,7 @@ function sweepExpiredAttempts(now) {
   }
 }
 
-/** 仅供诊断/测试：当前限流表条目数 */
+/** Только для диагностики/тестов: число записей в таблице лимита частоты */
 function getRateLimitTableSize() {
   return failedAttempts.size;
 }
@@ -290,8 +294,8 @@ function checkRequestAuth(req) {
 
 function setAuthCookie(res, req) {
   const sessionVal = signSession();
-  // SameSite=Strict completely prevents CSRF and Cross-Site WebSocket Hijacking (CSWSH)
-  // 轻微项：HTTPS 下追加 Secure，避免会话 Cookie 走明文信道
+  // SameSite=Strict полностью предотвращает CSRF и Cross-Site WebSocket Hijacking (CSWSH)
+  // Незначительно: по HTTPS добавляем Secure, чтобы сессионная cookie не ходила открытым каналом
   const secureFlag = isSecureRequest(req) ? '; Secure' : '';
   const cookieStr = `${COOKIE_NAME}=${encodeURIComponent(sessionVal)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${COOKIE_MAX_AGE}${secureFlag}`;
   res.setHeader('Set-Cookie', cookieStr);

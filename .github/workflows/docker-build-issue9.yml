@@ -1,18 +1,20 @@
 name: "Build Issue #9 Test Image"
 
-# 用途（Issue #9）：
-#   为「老快照里 pnpm `link:` 依赖生成的相对软链被归档校验误杀」单独构建一个**独立标签**的测试镜像，
-#   让反馈用户可以 `docker pull` 直接验证修复，**不影响** :latest / :latest-market 与正式发布流程。
+# Назначение (Issue #9):
+#   отдельно собирает тестовый образ **с независимым тегом** для случая, когда «относительные
+#   симлинки, порождённые зависимостью pnpm `link:` в старом снимке, убивались валидацией
+#   архива» — чтобы пользователь из фидбэка мог сделать `docker pull` и проверить фикс напрямую,
+#   **не затрагивая** :latest / :latest-market и официальный процесс релиза.
 #
-# 触发：
-#   1) 推送到 fix/issue-9-* 分支（本分支）自动构建；
-#   2) 手动 workflow_dispatch（可自定义标签名）。
+# Триггеры:
+#   1) push в ветки fix/issue-9-* (эта ветка) — автоматическая сборка;
+#   2) ручной workflow_dispatch (можно задать имя тега).
 #
-# 产出标签（ghcr.io/misaka-link/deepseek-harness-docker）：
-#   :issue9-fix          （纯净版）
-#   :issue9-fix-market   （预装插件商店版）
+# Теги на выходе (ghcr.io/misaka-link/deepseek-harness-docker):
+#   :issue9-fix          (чистая версия)
+#   :issue9-fix-market   (версия с предустановленным маркетплейсом)
 #
-# 本地等价构建（无需 CI）：
+# Эквивалентная локальная сборка (без CI):
 #   EXTRA_TAGS="issue9-fix" ./build.sh
 #   EXTRA_TAGS="issue9-fix-market" ./build.sh --market
 
@@ -20,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '额外镜像标签基础名（默认 issue9-fix，会派生 :<tag> 与 :<tag>-market）'
+        description: 'База имени дополнительного тега образа (по умолчанию issue9-fix; производные :<tag> и :<tag>-market)'
         required: false
         default: 'issue9-fix'
   push:
@@ -48,7 +50,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        # 供应链安全：固定到 commit SHA（tag 可被移动）
+        # Безопасность цепочки поставок: фиксация на commit SHA (тег можно переносить)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
@@ -70,12 +72,12 @@ jobs:
           IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/deepseek-harness-docker"
           DSH_VERSION=$(node -e "process.stdout.write(require('./version.json').supply.dshVersion||'')")
           if [ -z "${DSH_VERSION}" ]; then
-            echo "错误: version.json#supply.dshVersion 未设置" >&2
+            echo "Ошибка: version.json#supply.dshVersion не задан" >&2
             exit 1
           fi
           echo "dsh_version=${DSH_VERSION}" >> $GITHUB_OUTPUT
           echo "tag=${IMAGE_NAME}:${BASE_TAG}${{ matrix.suffix }}" >> $GITHUB_OUTPUT
-          echo ">>> 本次构建标签: ${IMAGE_NAME}:${BASE_TAG}${{ matrix.suffix }}（内置 DSH ${DSH_VERSION}）"
+          echo ">>> Тег текущей сборки: ${IMAGE_NAME}:${BASE_TAG}${{ matrix.suffix }} (встроенный DSH ${DSH_VERSION})"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -84,10 +86,11 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
-          # 生成 SLSA provenance 与 SBOM（供应链可追溯）
+          # Генерация SLSA provenance и SBOM (прослеживаемость цепочки поставок)
           provenance: mode=max
           sbom: true
-          # 每次构建唯一，强制 Dockerfile 预装层缓存失效（与正式发布流程保持一致）
+          # Уникально для каждой сборки — принудительная инвалидация кэша слоя предустановки
+          # (как в официальном процессе релиза)
           build-args: |
             NODE_IMAGE=node:24-trixie
             NOVNC_ASSET_REVISION=1.6.0

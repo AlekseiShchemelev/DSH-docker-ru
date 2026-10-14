@@ -28,18 +28,18 @@ const versionService = require('./version-service');
 const { getInternalToken, verifyInternalToken } = require('./internal-token');
 const wsOrigin = require('./ws-origin');
 
-// ── 配置文件持久化与动态读取 ──────────────────────────────────
+// ── Сохранение файла конфигурации и чтение на лету ─────────────
 const CONFIG_FILE = process.env.GATEWAY_CONFIG_FILE || '/root/.dsh/gateway.config.json';
 
 function loadPersistedConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
       const data = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-      console.log('[gateway] 成功加载持久化网关配置文件:', CONFIG_FILE);
+      console.log('[gateway] Загружен сохранённый файл конфигурации шлюза:', CONFIG_FILE);
       return data;
     }
   } catch (err) {
-    console.warn('[gateway] 读取持久化配置失败:', err.message);
+    console.warn('[gateway] Не удалось прочитать сохранённую конфигурацию:', err.message);
   }
   return {};
 }
@@ -47,21 +47,24 @@ function loadPersistedConfig() {
 function savePersistedConfig(cfg) {
   try {
     fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
-    // 该文件包含 authToken 等敏感字段：写入即收紧为 0600（仅属主可读写）
+    // Файл содержит чувствительные поля вроде authToken: при записи права сразу
+    // сжимаются до 0600 (читает и пишет только владелец)
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
     try { fs.chmodSync(CONFIG_FILE, 0o600); } catch {}
     return true;
   } catch (err) {
-    console.error('[gateway] 保存持久化配置失败:', err.message);
+    console.error('[gateway] Не удалось сохранить конфигурацию:', err.message);
     return false;
   }
 }
 
-// ── 幽灵 bundle 自动清理策略（0.1.7）─────────────────────────────
-// 持久化于本配置文件，由容器启动装配脚本 scripts/install-plugin.mjs 在 entrypoint 阶段读取执行。
-// 可选值：known(保守，默认) / all(激进) / off(关闭)。
-// ⚠️ 装配脚本仅在【容器启动】时执行一次，故该策略修改后需重启容器（docker restart / compose up -d）
-//    才会生效；管理后台保存触发的“网关热重启”不会重跑装配脚本。
+// ── Политика автоматической очистки «призрачных» bundle (0.1.7) ────
+// Сохраняется в этом файле конфигурации; читает и выполняет её скрипт сборки
+// scripts/install-plugin.mjs на этапе entrypoint при старте контейнера.
+// Допустимые значения: known (консервативно, по умолчанию) / all (агрессивно) / off (выкл.).
+// ⚠️ Скрипт сборки выполняется только при СТАРТЕ контейнера, поэтому после изменения политики
+//    контейнер нужно перезапустить (docker restart / compose up -d); «горячий перезапуск шлюза»
+//    из админки скрипт сборки заново не запускает.
 function normalizePruneMode(value) {
   const v = String(value ?? '').trim().toLowerCase();
   if (v === '0' || v === 'false' || v === 'off' || v === 'no') return 'off';
@@ -77,31 +80,35 @@ function normalizePruneExtra(value) {
 }
 
 /**
- * 回给管理后台的错误文案（N1）：抹掉宿主绝对路径等内部细节，完整错误只写服务端日志。
- * 管理 API 本身在鉴权之后，这里防的是"错误串里带出宿主目录/内部路径"这类信息外溢。
+ * Текст ошибки для админки (N1): скрывает абсолютные пути хоста и прочие внутренние детали,
+ * полная ошибка пишется только в журнал на сервере.
+ * Сам API админки уже защищён аутентификацией, здесь предотвращается утечка служебной
+ * информации (каталоги хоста / внутренние пути) через текст ошибки.
  */
 function safeErrMsg(err) {
-  const raw = err && err.message ? String(err.message) : String(err ?? '未知错误');
-  console.error('[gateway] API 错误:', raw);
+  const raw = err && err.message ? String(err.message) : String(err ?? 'неизвестная ошибка');
+  console.error('[gateway] Ошибка API:', raw);
   return raw.replace(/(?:\/[\w.@%+-]+){2,}/g, '<path>').slice(0, 300);
 }
 
-// 局部合并写入持久化配置的 desktop 段（供「彻底开关」等运行时开关使用，不影响其它字段）
+// Точечное слияние и запись секции desktop в сохранённую конфигурацию
+// (для «полного выключателя» и других runtime-переключателей; остальные поля не затрагиваются)
 function persistDesktopConfig(patch = {}) {
   try {
     const cfg = loadPersistedConfig();
     cfg.desktop = { ...(cfg.desktop || {}), ...patch };
     cfg.savedAt = new Date().toISOString();
     if (!savePersistedConfig(cfg)) return null;
-    console.log('[gateway] 已持久化桌面配置:', JSON.stringify(patch));
+    console.log('[gateway] Сохранена конфигурация рабочего стола:', JSON.stringify(patch));
     return cfg;
   } catch (err) {
-    console.error('[gateway] 持久化桌面配置异常:', err.message);
+    console.error('[gateway] Ошибка при сохранении конфигурации рабочего стола:', err.message);
     return null;
   }
 }
 
-// 桌面运行参数补丁的规范化（enabled 除外，总开关走专用接口）
+// Нормализация патча параметров рабочего стола (кроме enabled: общий переключатель
+// обслуживается отдельным интерфейсом)
 function normalizeDesktopConfigPatch(input = {}) {
   const patch = {};
   const w = Number(input.width), h = Number(input.height);
@@ -119,25 +126,27 @@ function normalizeDesktopConfigPatch(input = {}) {
   return patch;
 }
 
-// 桌面运行参数的唯一写入路径：持久化 + 应用（Admin 页与内部插件共用）
+// Единственная точка записи параметров рабочего стола: сохранение + применение
+// (общая для страницы Admin и внутренних плагинов)
 function applyDesktopConfigPatch(input = {}) {
   const patch = normalizeDesktopConfigPatch(input);
-  if (!Object.keys(patch).length) return { ok: false, error: '没有可应用的配置项' };
-  if (!persistDesktopConfig(patch)) return { ok: false, error: '桌面配置持久化失败，操作已取消' };
+  if (!Object.keys(patch).length) return { ok: false, error: 'Нет параметров для применения' };
+  if (!persistDesktopConfig(patch)) return { ok: false, error: 'Не удалось сохранить конфигурацию рабочего стола, операция отменена' };
   const changed = desktopManager.applyConfig(patch);
   return { ok: true, changed, desktop: desktopManager.getStatus() };
 }
 
-// 浏览器总开关的唯一写入路径：持久化 + 立即启停
+// Единственная точка записи общего переключателя браузера: сохранение + немедленный запуск/остановка
 async function applyDesktopMaster(enabled, opts = {}) {
   const next = enabled !== false;
-  const startNow = opts.startNow !== false; // 启用时默认立即拉起桌面；镜像调用可传 false 只改状态
-  // 约定：插件停用 → 浏览器也不能用。插件被禁用时不允许再把浏览器开关打开。
+  const startNow = opts.startNow !== false; // при включении рабочий стол поднимается сразу;
+  // вызов из образа может передать false, чтобы изменить только состояние
+  // Соглашение: плагин отключён → браузер тоже недоступен. При отключённом плагине браузер включить нельзя.
   if (next && isBrowserPluginDisabled()) {
-    return { ok: false, error: '浏览器插件已被停用：请先在「拓展与插件管理」页启用插件，再启用浏览器' };
+    return { ok: false, error: 'Плагин браузера отключён: сначала включите плагин на странице «Расширения и плагины», затем включайте браузер' };
   }
   if (!persistDesktopConfig({ enabled: next })) {
-    return { ok: false, error: '浏览器总开关持久化失败，操作已取消' };
+    return { ok: false, error: 'Не удалось сохранить общий переключатель браузера, операция отменена' };
   }
   desktopManager.setEnabled(next);
   let r = { ok: true, skipped: true };
@@ -146,11 +155,12 @@ async function applyDesktopMaster(enabled, opts = {}) {
   return { ok: true, enabled: next, result: r, desktop: desktopManager.getStatus() };
 }
 
-// 本插件：浏览器能力与 AI 工具的唯一来源
+// Наш плагин: единственный источник функций браузера и ИИ-инструментов
 const BROWSER_DESKTOP_PLUGIN = '@dsh-custom/dsh-browser-desktop';
 
-// 插件是否被「显式禁用」（安装着但不在 bundles 中）。
-// 注意：插件从未安装（不存在）时返回 false，不影响无插件部署的桌面自举。
+// Отключён ли плагин «явно» (установлен, но отсутствует в bundles).
+// Примечание: если плагин никогда не устанавливался (его нет), возвращается false —
+// это не мешает автозапуску рабочего стола в установке без плагинов.
 function isBrowserPluginDisabled() {
   try {
     const list = pluginManager.getPlugins().plugins || [];
@@ -161,13 +171,14 @@ function isBrowserPluginDisabled() {
   }
 }
 
-// 浏览器被「彻底停用」后访问 VNC 的提示页（避免只看到黑屏 / 连接失败而无解释）
+// Страница-пояснение при обращении к VNC, когда браузер «полностью отключён»
+// (чтобы вместо чёрного экрана / неудачного подключения пользователь увидел объяснение)
 function serveDesktopDisabledPage(res) {
   const adminPath = ADMIN_PATH || '/admin';
   const html = `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>容器浏览器已停用</title>
+<title>Контейнерный браузер отключён</title>
 <style>
   body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0f1115;color:#e5e7eb;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
   .box{max-width:560px;padding:32px 36px;border:1px solid #2c2c2e;border-radius:14px;background:#1b1b1c;text-align:center}
@@ -176,22 +187,24 @@ function serveDesktopDisabledPage(res) {
   a{display:inline-block;padding:9px 18px;border-radius:8px;background:#4176e6;color:#fff;text-decoration:none;font-size:13px}
 </style></head>
 <body><div class="box">
-  <h1>🖥️ 容器浏览器当前不可用</h1>
-  <p>原因：浏览器已在管理后台被「彻底停用」，或浏览器插件已被停用。<br>当前容器不会启动 Xvfb / Chromium 桌面，因此 VNC 无法连接。<br>如需继续使用，请在管理后台「浏览器与桌面控制」页点击「启用浏览器」。</p>
-  <a href="${adminPath}/">前往管理后台启用</a>
+  <h1>🖥️ Контейнерный браузер сейчас недоступен</h1>
+  <p>Причина: браузер был «полностью отключён» в админке либо отключён его плагин.<br>Этот контейнер не запускает рабочий стол Xvfb / Chromium, поэтому подключиться по VNC невозможно.<br>Чтобы продолжить использование, нажмите «Включить браузер» на странице «Браузер и управление рабочим столом» в админке.</p>
+  <a href="${adminPath}/">Перейти в админку и включить</a>
 </div></body></html>`;
   res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache' });
   res.end(html);
 }
 
-// 是否为「浏览器直接导航」（HTML 页面请求）。用于在桌面尚未就绪时返回可自动刷新的页面，
-// 而不是把 HTML 塞进资源请求、或让用户看到裸 JSON / 502。
+// Прямая навигация браузера (запрос HTML-страницы). Пока рабочий стол не готов,
+// возвращаем страницу с автоперезагрузкой вместо HTML внутри запроса к ресурсу
+// или голого JSON / 502.
 function isHtmlNavigation(req) {
   return !!req && req.method === 'GET' && String(req.headers.accept || '').includes('text/html');
 }
 
-// 桌面/浏览器「启动中」独立页面：默认 3 秒后自动刷新，桌面就绪后无感进入 noVNC。
-// 页面文件：gateway/public/desktop-starting.html（零外部依赖，可单独打开预览）。
+// Отдельная страница «рабочий стол запускается»: по умолчанию автоперезагрузка через 3 секунды,
+// после готовности рабочего стола пользователь незаметно попадает в noVNC.
+// Файл страницы: gateway/public/desktop-starting.html (без внешних зависимостей, открывается и отдельно).
 function serveDesktopStartingPage(res, { retrySeconds = 3 } = {}) {
   const seconds = Number(retrySeconds) > 0 ? Number(retrySeconds) : 3;
   let html;
@@ -200,14 +213,14 @@ function serveDesktopStartingPage(res, { retrySeconds = 3 } = {}) {
       .replace(/__DSH_ADMIN_PATH__/g, ADMIN_PATH)
       .replace('__DSH_RETRY_SECONDS__', String(seconds));
   } catch (err) {
-    // 兜底：页面文件缺失也绝不回退到裸 JSON / 502
+    // Запасной вариант: даже если файла страницы нет — никогда не отвечаем голым JSON / 502
     html = `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="ru"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="${seconds}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>容器桌面正在启动</title></head>
+<title>Рабочий стол контейнера запускается</title></head>
 <body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#f8fafc;color:#0f172a;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif">
-<div style="text-align:center;font-size:14px">🖥️ 容器桌面正在启动，${seconds} 秒后自动刷新…</div>
+<div style="text-align:center;font-size:14px">🖥️ Рабочий стол контейнера запускается, страница обновится через ${seconds} с…</div>
 </body></html>`;
   }
   res.writeHead(200, {
@@ -221,14 +234,16 @@ function serveDesktopStartingPage(res, { retrySeconds = 3 } = {}) {
 
 const persisted = loadPersistedConfig();
 
-// 是否信任反向代理（决定限流 IP 取 XFF 还是 socket 对端）：配置显式值优先于环境变量
+// Доверять ли обратному прокси (определяет, брать ли IP для ограничения частоты из XFF,
+// или адрес пира сокета): явное значение конфигурации имеет приоритет над переменной окружения
 if (persisted.trustProxy !== undefined) {
   setTrustProxy(persisted.trustProxy === true || persisted.trustProxy === '1' || persisted.trustProxy === 'true');
 }
 
-// 应用持久化认证码与桌面设置
-// M13：显式环境变量 AUTH_TOKEN 优先于持久化口令 —— 否则在 .env 里轮换口令不生效
-// （容器里会继续用数据卷中的旧口令，运维会以为已经换掉了）。
+// Применяем сохранённый код доступа и настройки рабочего стола
+// M13: явная переменная окружения AUTH_TOKEN имеет приоритет над сохранённым паролем —
+// иначе ротация пароля в .env не вступает в силу (в контейнере продолжает действовать
+// старый пароль из тома данных, и администратор решает, что он уже обновлён).
 const AUTH_TOKEN_SOURCE = (process.env.AUTH_TOKEN || process.env.ACCESS_CODE || '').trim()
   ? 'env'
   : (persisted.authToken !== undefined ? 'persisted' : 'default');
@@ -236,13 +251,14 @@ if (AUTH_TOKEN_SOURCE !== 'env' && persisted.authToken !== undefined) {
   updateAuthToken(persisted.authToken);
 }
 if (AUTH_TOKEN_SOURCE === 'env') {
-  console.log('[gateway] 认证口令来源: 环境变量 AUTH_TOKEN（优先于持久化配置）');
+  console.log('[gateway] Источник пароля доступа: переменная окружения AUTH_TOKEN (в приоритете над сохранённой конфигурацией)');
 }
-// M13：环境变量与持久化配置不一致时给出显式告警，避免"面板改了没生效"的静默困惑
+// M13: при расхождении переменной окружения и сохранённой конфигурации выводим явное
+// предупреждение, чтобы избежать тихой путаницы «изменил в панели, но не применилось»
 function warnConfigConflict(label, envValue, persistedValue) {
   if (envValue === undefined || envValue === '' || persistedValue === undefined) return;
   if (String(envValue) !== String(persistedValue)) {
-    console.warn(`[gateway] 配置冲突: ${label} 环境变量(${envValue}) 与持久化配置(${persistedValue}) 不一致，按 M13 规则以环境变量为准`);
+    console.warn(`[gateway] Конфликт конфигурации: переменная окружения ${label}(${envValue}) не совпадает с сохранённой конфигурацией(${persistedValue}); по правилу M13 приоритет у переменной окружения`);
   }
 }
 warnConfigConflict('PROXY_PORT', process.env.PROXY_PORT, persisted.proxyPort);
@@ -251,18 +267,21 @@ warnConfigConflict('VNC_PATH', process.env.VNC_PATH, persisted.vncPath);
 if (persisted.desktop) {
   desktopManager.updateConfig(persisted.desktop);
 }
-// 启动崩溃自愈与故障插件自动隔离（默认开启，单次启动周期上限默认 5 个，允许用户自定义）
+// Автовосстановление после сбоев при запуске и автоматическая изоляция проблемных плагинов
+// (по умолчанию включено; предел за один цикл запуска по умолчанию 5, значение настраивается)
 const autoHealEnabled = persisted.autoHealPlugins !== false;
 const autoHealMaxPerBoot = Math.max(1, Math.min(50, Number(persisted.autoHealMaxPerBoot) || 5));
 dshManager.setAutoHeal(autoHealEnabled, autoHealMaxPerBoot);
 
-// 幽灵 bundle 清理策略（由 install-plugin.mjs 在容器启动阶段执行；此处仅读取用于展示/持久化）
+// Политика очистки «призрачных» bundle (выполняет install-plugin.mjs на этапе старта контейнера;
+// здесь только читается для отображения/сохранения)
 const pruneStaleBundles = normalizePruneMode(persisted.pruneStaleBundles);
 const pruneBundlesExtra = normalizePruneExtra(persisted.pruneBundlesExtra);
 
-// ── 端口与动态路径配置 ───────────────────────────────────────
-// M13：显式环境变量优先于持久化配置（否则 .env 里的 PROXY_PORT 成了"死配置"，
-// 面板改过端口后 compose 的 3080:3080 会静默失配）。
+// ── Порты и динамические пути ──────────────────────────────────
+// M13: явная переменная окружения имеет приоритет над сохранённой конфигурацией
+// (иначе PROXY_PORT в .env превращается в «мёртвую настройку»: после смены порта в панели
+// маппинг 3080:3080 в compose молча расходится с реальностью).
 const PROXY_PORT_SOURCE = process.env.PROXY_PORT ? 'env' : (persisted.proxyPort ? 'persisted' : 'default');
 const PROXY_PORT = Number(process.env.PROXY_PORT || persisted.proxyPort) || 3080;
 process.env.PROXY_PORT = String(PROXY_PORT);
@@ -280,15 +299,18 @@ const ADMIN_PATH_SOURCE = process.env.ADMIN_PATH ? 'env' : (persisted.adminPath 
 const VNC_PATH_SOURCE = process.env.VNC_PATH ? 'env' : (persisted.vncPath ? 'persisted' : 'default');
 const ADMIN_PATH = normalizeRoutePath(process.env.ADMIN_PATH || persisted.adminPath, '/admin');
 const VNC_PATH = normalizeRoutePath(process.env.VNC_PATH || persisted.vncPath, '/vnc');
-// 对外下发的 VNC 基地址统一带尾斜杠：任何消费者（侧边栏 iframe、跳转链接、第三方集成）
-// 直接把它当 href / 拼相对路径，都不会因缺尾斜杠而把基准路径解析错（无需依赖 302 兜底）。
+// Базовый адрес VNC, отдаваемый наружу, всегда с завершающим слэшем: любой потребитель
+// (iframe в боковой панели, ссылки перехода, сторонние интеграции) использует его как href /
+// конкатенирует относительные пути и не ошибётся в определении базового пути из-за
+// отсутствия завершающего слэша (не приходится полагаться на запасной 302).
 const VNC_PATH_HREF = VNC_PATH + '/';
 
 const DSH_TARGET = 'http://127.0.0.1:' + DSH_PORT;
 const VNC_TARGET = 'http://127.0.0.1:' + VNC_PORT;
 
-// 对外主机名白名单（WebSocket 同源校验用）：配置 / 环境变量里的显式值，逗号分隔。
-// 例如部署在域名 https://dsh.example.com 后，可设 PUBLIC_HOST=dsh.example.com。
+// Белый список внешних имён хостов (для проверки совпадения источника WebSocket):
+// явные значения из конфигурации / переменных окружения через запятую.
+// Например, при развёртывании за доменом https://dsh.example.com можно задать PUBLIC_HOST=dsh.example.com.
 const PUBLIC_HOSTS = String(persisted.publicHost || process.env.PUBLIC_HOST || '')
   .split(',')
   .map(s => s.trim())
@@ -301,7 +323,7 @@ const PUBLIC_PATHS = new Set([
   '/manifest.webmanifest'
 ]);
 
-// ── 反向代理实例与容错处理 ─────────────────────────────────
+// ── Экземпляры обратного прокси и обработка сбоев ──────────────
 const dshProxy = httpProxy.createProxyServer({
   target: DSH_TARGET,
   ws: true,
@@ -315,13 +337,13 @@ const vncProxy = httpProxy.createProxyServer({
 });
 
 dshProxy.on('error', (err, req, res) => {
-  console.warn('[dsh-proxy] 上游连接等待中 (DSH 启动/停止阶段):', err.message);
+  console.warn('[dsh-proxy] Ожидание подключения к апстриму (этап запуска/остановки DSH):', err.message);
   if (res && typeof res.writeHead === 'function' && !res.headersSent) {
-    let errorMsg = 'DeepSeek Harness 正在启动就绪中，请稍候数秒后刷新';
+    let errorMsg = 'DeepSeek Harness запускается и готовится к работе, подождите несколько секунд и обновите страницу';
     if (dshManager.manualStopped) {
-      errorMsg = 'DeepSeek Harness 服务当前处于手动停止状态。如需使用，请前往管理面板手动点击【启动 DSH】。';
+      errorMsg = 'Служба DeepSeek Harness сейчас остановлена вручную. Для работы нажмите [Запустить DSH] в админ-панели.';
     } else if (dshManager.lastExitInfo && !dshManager.proc) {
-      errorMsg = `DeepSeek Harness 启动异常退出 (代码: ${dshManager.lastExitInfo.code || -1})。请前往 /admin/ 查看详细日志排查。`;
+      errorMsg = `Запуск DeepSeek Harness неожиданно завершился (код: ${dshManager.lastExitInfo.code || -1}). Подробные журналы — на /admin/.`;
     }
 
     const isHtml = (req.headers.accept || '').includes('text/html');
@@ -333,7 +355,7 @@ dshProxy.on('error', (err, req, res) => {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta http-equiv="refresh" content="5" />
-  <title>DeepSeek Harness - 启动就绪中</title>
+  <title>DeepSeek Harness — запускается</title>
   <style>
     body { font-family: -apple-system, sans-serif; background: #f8fafc; color: #0f172a; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
     .box { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 32px; max-width: 480px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.08); text-align: center; }
@@ -344,9 +366,9 @@ dshProxy.on('error', (err, req, res) => {
 </head>
 <body>
   <div class="box">
-    <h2>⚡ DeepSeek Harness 启动就绪中</h2>
-    <p>${errorMsg}<br/>页面将在 5 秒后自动刷新检测...</p>
-    <a href="/admin/" class="btn">前往管理控制台查看实时日志 ↗</a>
+    <h2>⚡ DeepSeek Harness запускается</h2>
+    <p>${errorMsg}<br/>Страница автоматически обновится через 5 секунд…</p>
+    <a href="/admin/" class="btn">Открыть консоль администратора и посмотреть журналы ↗</a>
   </div>
 </body>
 </html>`);
@@ -358,21 +380,23 @@ dshProxy.on('error', (err, req, res) => {
 });
 
 vncProxy.on('error', (err, req, res) => {
-  console.warn('[vnc-proxy] 上游连接等待中 (VNC 启动阶段):', err.message);
+  console.warn('[vnc-proxy] Ожидание подключения к апстриму (этап запуска VNC):', err.message);
   if (res && typeof res.writeHead === 'function' && !res.headersSent) {
-    // 浏览器直接导航（noVNC 页面本身）时返回独立的「启动中」页（3s 自动刷新），
-    // 避免用户看到原始 JSON 502 而误以为“桌面连不上”。
+    // При прямой навигации браузера (сама страница noVNC) возвращаем отдельную страницу
+    // «запускается» (автообновление через 3 с), чтобы пользователь не увидел сырой
+    // JSON 502 и не решил, что «рабочий стол недоступен».
     if (isHtmlNavigation(req)) {
       return serveDesktopStartingPage(res);
     }
     res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: false, error: 'VNC 图形桌面正在就绪中，请稍候数秒后刷新' }));
+    res.end(JSON.stringify({ ok: false, error: 'Графический рабочий стол VNC готовится, подождите несколько секунд и обновите страницу' }));
   }
 });
 
 vncProxy.on('proxyRes', (proxyRes, req, res) => {
   const ct = String(proxyRes.headers['content-type'] || '').toLowerCase();
-  // 针对 noVNC 的 html 页面严禁客户端持久强缓存，保证镜像或版本更新后即刻拉取最新版本化入口
+  // HTML-страницам noVNC запрещаем долгое кэширование на клиенте, чтобы после обновления
+  // образа или версии сразу загружалась актуальная версионированная точка входа
   if (ct.includes('text/html')) {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
@@ -380,13 +404,13 @@ vncProxy.on('proxyRes', (proxyRes, req, res) => {
   }
 });
 
-// Polyfill 与回环补丁
+// Polyfill и патчи петли обратной связи
 const LOOPBACK_NEEDLE_1 = 'isLoopbackHostname(pageLocation.hostname)';
 const LOOPBACK_NEEDLE_2 = 'connection.isLoopback ? "host" : "memory"';
 const LOOPBACK_NEEDLE_3 = 'connection.isLoopback?"host":"memory"';
 
 dshProxy.on('proxyRes', (proxyRes, req, res) => {
-  // 若上游遇到临时 401，自动重新触发握手重试
+  // Если апстрим временно отвечает 401 — автоматически повторяем обмен сеансовой кукой
   if (proxyRes.statusCode === 401) {
     dshManager.exchangeSessionCookie().catch(() => {});
   }
@@ -396,13 +420,14 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
   const encType = getEncodingType(origCe);
 
   if (ct.includes('text/html')) {
-    // 严禁浏览器缓存 HTML 主入口，确保每次加载均获取最新组合包版本 (彻底消除 rev 过期 404)
+    // HTML-точку входа запрещено кэшировать браузеру, чтобы при каждой загрузке
+    // получалась актуальная сборка (полностью устраняет 404 по устаревшему rev)
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
     if (!encType) {
-      // 无压缩时保持现有「首块注入」流式逻辑（零回归）
+      // Без сжатия сохраняем существующую потоковую логику «инъекции в первый блок» (без регрессий)
       delete proxyRes.headers['content-length'];
       res.removeHeader('content-length');
 
@@ -421,11 +446,12 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
     }
 
     if (encType === 'unknown') {
-      console.warn(`[gateway] 检测到未知的内容编码 (${origCe})，跳过 HTML 注入以防损坏响应`);
+      console.warn(`[gateway] Обнаружен неизвестный код сжатия (${origCe}), вставка в HTML пропущена, чтобы не повредить ответ`);
       return;
     }
 
-    // 上游有 gzip/deflate/br 压缩：缓冲全部 chunk，在 res.end 时解压并注入，删除 content-encoding
+    // Апстрим сжимает ответ gzip/deflate/br: буферизуем все чанки, на res.end распаковываем,
+    // выполняем вставку и удаляем content-encoding
     delete proxyRes.headers['content-length'];
     res.removeHeader('content-length');
     delete proxyRes.headers['content-encoding'];
@@ -454,14 +480,15 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
       try {
         decompressed = decompressBuffer(rawBuffer, encType);
       } catch (err) {
-        // 安全兜底：content-encoding 已在 writeHead 之前删除，而此处 res.headersSent 已为 true，
-        // 无法再用 setHeader 恢复响应头（会抛 ERR_HTTP_HEADERS_SENT，进而触发 uncaughtException）。
-        // 故只原样透传未改写的字节并告警；整个 res.end 钩子必须永不抛异常。
-        console.warn(`[gateway] 解压上游 HTML 失败 (${encType}):`, err && err.message, '，回退原样透传');
+        // Запасной вариант: content-encoding удалён до writeHead, а здесь res.headersSent уже true,
+        // поэтому setHeader для восстановления заголовков невозможен (выбросит ERR_HTTP_HEADERS_SENT
+        // и далее uncaughtException). Поэтому просто прозрачно передаём неизменённые байты
+        // с предупреждением; весь хук res.end никогда не должен бросать исключение.
+        console.warn(`[gateway] Не удалось распаковать HTML апстрима (${encType}):`, err && err.message, '— передаём исходные байты без изменений');
         try {
           return origEnd(rawBuffer, ...rest);
         } catch (e2) {
-          console.warn('[gateway] HTML 兜底写出失败:', e2 && e2.message);
+          console.warn('[gateway] Не удалось записать запасной HTML:', e2 && e2.message);
           try { res.destroy(); } catch {}
           return;
         }
@@ -476,7 +503,7 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
 
   if (ct.includes('javascript')) {
     if (encType === 'unknown') {
-      console.warn(`[gateway] 检测到未知的内容编码 (${origCe})，跳过 JS 替换以防损坏响应`);
+      console.warn(`[gateway] Обнаружен неизвестный код сжатия (${origCe}), замена в JS пропущена, чтобы не повредить ответ`);
       return;
     }
 
@@ -513,12 +540,13 @@ dshProxy.on('proxyRes', (proxyRes, req, res) => {
         try {
           body = decompressBuffer(rawBuffer, encType).toString('utf8');
         } catch (err) {
-          // 同上：headersSent 已为 true，不能 setHeader 恢复 content-encoding；只做不抛异常的兜底透传。
-          console.warn(`[gateway] 解压上游 JS 失败 (${encType}):`, err && err.message, '，回退原样透传');
+          // Как и выше: headersSent уже true, setHeader для content-encoding невозможен;
+          // выполняем только безопасную передачу без исключений.
+          console.warn(`[gateway] Не удалось распаковать JS апстрима (${encType}):`, err && err.message, '— передаём исходные байты без изменений');
           try {
             return origEnd(rawBuffer, ...rest);
           } catch (e2) {
-            console.warn('[gateway] JS 兜底写出失败:', e2 && e2.message);
+            console.warn('[gateway] Не удалось записать запасной JS:', e2 && e2.message);
             try { res.destroy(); } catch {}
             return;
           }
@@ -546,7 +574,8 @@ async function alignHeadersForDsh(req) {
     req.headers['accept-encoding'] = 'identity';
   }
 
-  // 网关将动态捕获并换取的合法官方 dsh-auth-... 签名 Cookie 注入请求标头
+  // Инъекция в заголовки легитимной подписанной официальной куки dsh-auth-...,
+  // которую шлюз динамически получает и обменивает
   const upstreamCookie = (await dshManager.ensureValidUpstreamCookie()) || (await ensureUpstreamCookie(DSH_TARGET));
   if (upstreamCookie) {
     const existing = req.headers['cookie'] || '';
@@ -565,13 +594,14 @@ function serveStaticHtml(res, filename) {
     res.end(html);
   } catch (err) {
     res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('无法加载页面: ' + filename);
+    res.end('Не удалось загрузить страницу: ' + filename);
   }
 }
 
 function getClientIp(req) {
-  // 限流用 IP 的解析策略见 auth.resolveClientIp：默认只用 socket 对端地址，
-  // 仅当显式信任代理（TRUST_PROXY / gateway.config.json trustProxy）时才采用 XFF。
+  // Стратегия выбора IP для ограничения частоты описана в auth.resolveClientIp: по умолчанию
+  // используется только адрес пира сокета, XFF учитывается лишь при явном доверии прокси
+  // (TRUST_PROXY / trustProxy в gateway.config.json).
   return resolveClientIp(req);
 }
 
@@ -582,14 +612,14 @@ function readJsonBody(req) {
       body += chunk;
       if (body.length > 1024 * 512) {
         req.destroy(new Error('Payload too large'));
-        reject(new Error('请求体过大 (超过 512KB)'));
+        reject(new Error('Тело запроса слишком велико (более 512 КБ)'));
       }
     });
     req.on('end', () => {
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (err) {
-        reject(new Error('JSON 格式错误'));
+        reject(new Error('Некорректный формат JSON'));
       }
     });
     req.on('error', reject);
@@ -604,12 +634,12 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-// ── Admin API 处理器 ─────────────────────────────────────────
+// ── Обработчики API администратора ─────────────────────────────
 async function handleAdminApi(req, res, pathname, query) {
   const subPath = pathname.slice(ADMIN_PATH.length);
 
   try {
-    // 1. 全局状态
+    // 1. Общее состояние
     if (subPath === '/api/status' && req.method === 'GET') {
       return sendJson(res, 200, {
         project: {
@@ -633,7 +663,7 @@ async function handleAdminApi(req, res, pathname, query) {
       });
     }
 
-    // 1.1 版本与多级安全预警检测 (支持多通道 CDN / GitHub / 本地兜底)
+    // 1.1 Проверка версии и многоуровневые предупреждения о безопасности (мультиканальный CDN / GitHub / локальный запасной вариант)
     if (subPath === '/api/version/check' && req.method === 'GET') {
       const force = query.get('refresh') === '1';
       const checkRes = await versionService.check(force, dshManager);
@@ -641,7 +671,7 @@ async function handleAdminApi(req, res, pathname, query) {
       return sendJson(res, 200, checkRes);
     }
 
-    // 2. DSH 版本列表
+    // 2. Список версий DSH
     if (subPath === '/api/dsh/versions' && req.method === 'GET') {
       const force = query.get('refresh') === '1';
       const meta = await versionService.fetchRemoteMeta(force);
@@ -657,7 +687,7 @@ async function handleAdminApi(req, res, pathname, query) {
       return sendJson(res, 200, data);
     }
 
-    // 2.0 持久化版本库统计 / 清理 / 删除 (Issue #7)
+    // 2.0 Статистика / очистка / удаление в сохранённом хранилище версий (Issue #7)
     if (subPath === '/api/dsh/versions/stats' && req.method === 'GET') {
       return sendJson(res, 200, dshManager.getVersionsStoreStats());
     }
@@ -671,12 +701,12 @@ async function handleAdminApi(req, res, pathname, query) {
 
     if (subPath.startsWith('/api/dsh/versions/') && req.method === 'DELETE') {
       const ver = decodeURIComponent(subPath.slice('/api/dsh/versions/'.length));
-      if (!ver || ver.includes('/')) return sendJson(res, 400, { ok: false, error: '版本号不合法' });
+      if (!ver || ver.includes('/')) return sendJson(res, 400, { ok: false, error: 'Недопустимый номер версии' });
       const r = dshManager.deleteCachedVersion(ver);
       return sendJson(res, r.ok ? 200 : 400, r);
     }
 
-    // 2.05 就地回滚点管理与就地还原 (Issue #7 引擎回滚点治理)
+    // 2.05 Управление точками отката на месте и восстановление из них (Issue #7)
     if (subPath === '/api/dsh/rollback' && req.method === 'GET') {
       const rb = dshManager.getRollbackPoint();
       return sendJson(res, 200, { ok: true, exists: rb.exists, rollback: rb.exists ? rb : null, ...rb });
@@ -684,16 +714,16 @@ async function handleAdminApi(req, res, pathname, query) {
 
     if (subPath === '/api/dsh/rollback' && req.method === 'DELETE') {
       if (dshManager.installing) {
-        return sendJson(res, 409, { ok: false, error: '版本切换或还原进行中，禁止删除回滚点' });
+        return sendJson(res, 409, { ok: false, error: 'Идёт смена версии или восстановление: удалять точку отката запрещено' });
       }
       const current = dshManager.getRollbackPoint();
       if (!current.exists) {
-        return sendJson(res, 404, { ok: false, error: '回滚点不存在或已被清理' });
+        return sendJson(res, 404, { ok: false, error: 'Точка отката не существует или уже очищена' });
       }
       const r = dshManager.deleteRollbackPoint();
       if (!r.ok) {
-        if (r.error && r.error.includes('进行中')) return sendJson(res, 409, r);
-        if (r.error && r.error.includes('不存在')) return sendJson(res, 404, r);
+        if (r.error && r.error.includes('Идёт переключение')) return sendJson(res, 409, r);
+        if (r.error && r.error.includes('не существует')) return sendJson(res, 404, r);
         return sendJson(res, 500, r);
       }
       return sendJson(res, 200, r);
@@ -701,21 +731,22 @@ async function handleAdminApi(req, res, pathname, query) {
 
     if (subPath === '/api/dsh/rollback/restore' && req.method === 'POST') {
       if (dshManager.installing) {
-        return sendJson(res, 409, { ok: false, error: '已有版本切换或还原任务正在进行中' });
+        return sendJson(res, 409, { ok: false, error: 'Уже выполняется задача смены версии или восстановления' });
       }
       const current = dshManager.getRollbackPoint();
       if (!current.exists) {
-        return sendJson(res, 404, { ok: false, error: '回滚点备件不存在，无法还原' });
+        return sendJson(res, 404, { ok: false, error: 'Резервная копия точки отката отсутствует, восстановление невозможно' });
       }
       if (!current.abiMatches) {
-        return sendJson(res, 400, { ok: false, error: `回滚点 Node ABI (${current.nodeAbi}) 与当前运行环境不匹配，无法还原` });
+        return sendJson(res, 400, { ok: false, error: `Node ABI (${current.nodeAbi}) точки отката не совпадает с текущим окружением, восстановление невозможно` });
       }
 
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
-        // P2（Issue #9）：禁止反向代理缓冲，保证进度/日志实时逐条下发（Nginx 等）
+        // P2 (Issue #9): запрет буферизации обратным прокси, чтобы прогресс/журнал уходили
+        // в реальном времени построчно (Nginx и т.п.)
         'X-Accel-Buffering': 'no'
       });
 
@@ -723,7 +754,7 @@ async function handleAdminApi(req, res, pathname, query) {
         try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
       };
 
-      sendEvt({ type: 'log', message: `[就地还原] 开始还原核心引擎回滚点备件 (v${current.version || 'unknown'})...` });
+      sendEvt({ type: 'log', message: `[Восстановление на месте] Начато восстановление резервной копии точки отката ядра (v${current.version || 'unknown'})...` });
 
       const r = await dshManager.restoreRollbackPoint(
         (prog) => {
@@ -739,7 +770,7 @@ async function handleAdminApi(req, res, pathname, query) {
       return;
     }
 
-    // 2.1 DSH 实时日志与崩溃信息获取
+    // 2.1 Получение журналов DSH в реальном времени и сведений о сбоях
     if (subPath === '/api/dsh/logs' && req.method === 'GET') {
       const count = Math.min(Number(query.get('lines')) || 100, 300);
       return sendJson(res, 200, {
@@ -753,22 +784,24 @@ async function handleAdminApi(req, res, pathname, query) {
       });
     }
 
-    // 3. 安装/切换 DSH 版本 (支持实时 SSE 流式推送详细日志)
+    // 3. Установка / смена версии DSH (с подробными логами в реальном времени через SSE)
     if (subPath === '/api/dsh/install' && req.method === 'POST') {
       const body = await readJsonBody(req);
       const version = (body.version || '').trim();
-      if (!version) return sendJson(res, 400, { ok: false, error: '版本号不能为空' });
-      // 强校验：版本号必须是合法 semver（阻断 `../` 目录穿越与 npm 说明符注入）
+      if (!version) return sendJson(res, 400, { ok: false, error: 'Номер версии не может быть пустым' });
+      // Строгая проверка: номер версии должен быть корректным semver
+      // (блокирует directory traversal через `../` и инъекцию npm-спецификаторов)
       if (!dshManager.isValidVersion(version)) {
-        return sendJson(res, 400, { ok: false, error: '版本号格式不合法（仅允许形如 0.1.6-alpha.2 的版本号）' });
+        return sendJson(res, 400, { ok: false, error: 'Некорректный формат версии (допустимы только версии вида 0.1.6-alpha.2)' });
       }
 
-      // 安全闸门：拒绝在线热切换破坏性架构重构版本（danger 级别，如 >=0.2.0 底层重构）
+      // Предохранитель: отказываемся от онлайн-горячей смены на разрушительно рефакторинговые
+      // версии (уровень danger, например переработка нижнего уровня >=0.2.0)
       const evalRes = versionService.evaluateTargetVersion(version);
       if (evalRes && evalRes.level === 'danger') {
         return sendJson(res, 400, {
           ok: false,
-          error: evalRes.message || '该版本存在重大破坏性架构重构，禁止在线热切换，必须重新拉取最新 Docker 镜像。'
+          error: evalRes.message || 'В этой версии крупная разрушительная переработка архитектуры: онлайн-горячая смена запрещена, необходимо заново скачать свежий Docker-образ.'
         });
       }
 
@@ -776,7 +809,8 @@ async function handleAdminApi(req, res, pathname, query) {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
-        // P2（Issue #9）：禁止反向代理缓冲，保证进度/日志实时逐条下发（Nginx 等）
+        // P2 (Issue #9): запрет буферизации обратным прокси, чтобы прогресс/журнал уходили
+        // в реальном времени построчно (Nginx и т.п.)
         'X-Accel-Buffering': 'no'
       });
 
@@ -784,9 +818,10 @@ async function handleAdminApi(req, res, pathname, query) {
         try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
       };
 
-      // 切换前弹窗的勾选结果：是否归档当前引擎版本（默认勾选，用户可取消）
+      // Результат галочки в диалоге перед переключением: архивировать ли текущую версию
+      // движка (по умолчанию отмечено, пользователь может снять отметку)
       const archiveCurrent = body.archiveCurrent === true;
-      sendEvt({ type: 'log', message: `[切换选项] 归档当前引擎版本: ${archiveCurrent ? '是' : '否'}` });
+      sendEvt({ type: 'log', message: `[Параметры переключения] Архивировать текущую версию движка: ${archiveCurrent ? 'да' : 'нет'}` });
 
       const r = await dshManager.installVersion(
         version,
@@ -804,7 +839,7 @@ async function handleAdminApi(req, res, pathname, query) {
       return;
     }
 
-    // 4. DSH 服务启停与重启控制
+    // 4. Управление запуском, остановкой и перезапуском службы DSH
     if (subPath === '/api/dsh/start' && req.method === 'POST') {
       dshManager.manualStopped = false;
       const r = await dshManager.boot();
@@ -828,28 +863,31 @@ async function handleAdminApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok: true });
     }
 
-    // 5. 桌面启停控制
-    // 5.1 「彻底开关」总开关：持久化，停用后连网关/容器重启也不再自动启动
+    // 5. Управление запуском и остановкой рабочего стола
+    // 5.1 «Полный выключатель»: сохраняется в конфигурации; после отключения рабочий стол
+    //     больше не запускается автоматически даже после перезапуска шлюза/контейнера
     if (subPath === '/api/desktop/master' && req.method === 'POST') {
       const body = await readJsonBody(req);
       const r = await applyDesktopMaster(body?.enabled !== false);
       if (!r.ok) return sendJson(res, 500, r);
-      // AI 工具与提示词菜单的增/删由插件在【服务重启】时确定：restart=true 时立即重启 DSH
+      // Добавление/удаление ИИ-инструментов и меню подсказок плагин определяет при
+      // ПЕРЕЗАПУСКЕ СЛУЖБЫ: при restart=true DSH перезапускается немедленно
       if (body?.restart === true) {
-        console.log('[gateway] 浏览器总开关已切换，正在重启 DSH 以同步 AI 工具菜单...');
+        console.log('[gateway] Общий переключатель браузера переключён, перезапускаем DSH для обновления меню ИИ-инструментов...');
         const rr = await dshManager.restart().catch(err => ({ ok: false, error: safeErrMsg(err) }));
         r.dshRestarted = !!rr.ok;
-        if (!r.dshRestarted) r.warning = '状态已保存且桌面已停用，但 DSH 重启失败：' + (rr.error || '未知错误');
+        if (!r.dshRestarted) r.warning = 'Состояние сохранено и рабочий стол остановлен, но перезапуск DSH не удался: ' + (rr.error || 'неизвестная ошибка');
       }
       return sendJson(res, 200, r);
     }
 
-    // 5.2 桌面运行参数（分辨率/休眠/CDP/截图默认值/侧边栏Tab）：
-    //     Admin「浏览器与桌面控制」页是唯一权威写入点，直接持久化到 gateway.config.json
+    // 5.2 Параметры рабочего стола (разрешение/простой/CDP/скриншоты/вкладка боковой панели):
+    //     страница Admin «Браузер и управление рабочим столом» — единственная авторитетная
+    //     точка записи, данные сразу сохраняются в gateway.config.json
     if (subPath === '/api/desktop/config' && req.method === 'POST') {
       const body = await readJsonBody(req);
       const r = applyDesktopConfigPatch(body);
-      return sendJson(res, r.ok ? 200 : (r.error?.includes('没有可应用') ? 400 : 500), r);
+      return sendJson(res, r.ok ? 200 : (r.error?.includes('Нет параметров') ? 400 : 500), r);
     }
 
     if (subPath === '/api/desktop/start' && req.method === 'POST') {
@@ -876,7 +914,8 @@ async function handleAdminApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok: true, status: desktopManager.getStatus() });
     }
 
-    // 6. 配置快照备份、恢复与导入 (完全与 Web 服务解耦，异步非阻塞执行)
+    // 6. Резервное копирование, восстановление и импорт конфигурационных снимков
+    //    (полностью развязано с веб-службой, выполняется асинхронно и неблокирующе)
     if (subPath === '/api/snapshots' && req.method === 'GET') {
       return sendJson(res, 200, backupService.listBackups());
     }
@@ -894,7 +933,7 @@ async function handleAdminApi(req, res, pathname, query) {
     if (subPath === '/api/snapshots/inspect' && req.method === 'GET') {
       const file = query.get('file') || '';
       if (!file) {
-        return sendJson(res, 400, { ok: false, error: '缺少 file 参数' });
+        return sendJson(res, 400, { ok: false, error: 'Отсутствует параметр file' });
       }
       try {
         const r = await backupService.inspectSnapshot(file);
@@ -908,11 +947,12 @@ async function handleAdminApi(req, res, pathname, query) {
       const body = await readJsonBody(req);
       const mode = (body && body.mode) || 'full';
       if (mode !== 'full' && mode !== 'config-only') {
-        return sendJson(res, 400, { ok: false, error: `非法还原模式: ${mode} (仅支持 'full' 或 'config-only')` });
+        return sendJson(res, 400, { ok: false, error: `Недопустимый режим восстановления: ${mode} (поддерживаются только 'full' и 'config-only')` });
       }
       try {
-        // Issue #9：支持 mode: 'full' | 'config-only' 恢复范围选择，不传默认 'full'；
-        // 还原会自动兼容老快照里"逃出归档根"的相对软链
+        // Issue #9: поддерживается выбор объёма восстановления mode: 'full' | 'config-only'
+        // (по умолчанию 'full'); при восстановлении автоматически совместимы относительные
+        // симлинки из старых снимков, «выползающие за корень архива»
         const r = await backupService.restoreBackup(body.filename, dshManager, { mode });
         return sendJson(res, 200, r);
       } catch (err) {
@@ -939,7 +979,7 @@ async function handleAdminApi(req, res, pathname, query) {
     if (subPath === '/api/snapshots/download' && req.method === 'GET') {
       const file = query.get('file') || '';
       const filePath = backupService.getBackupPath(file);
-      if (!filePath) return sendJson(res, 404, { ok: false, error: '快照文件未找到' });
+      if (!filePath) return sendJson(res, 404, { ok: false, error: 'Файл снимка не найден' });
 
       res.writeHead(200, {
         'Content-Type': 'application/gzip',
@@ -948,7 +988,7 @@ async function handleAdminApi(req, res, pathname, query) {
       return fs.createReadStream(filePath).pipe(res);
     }
 
-    // 6.5 DSH 拓展插件识别、启用/禁用与清理卸载
+    // 6.5 Распознавание расширяющих плагинов DSH, их включение/выключение, очистка и удаление
     if (subPath === '/api/plugins' && req.method === 'GET') {
       try {
         const r = pluginManager.getPlugins();
@@ -961,25 +1001,28 @@ async function handleAdminApi(req, res, pathname, query) {
     if (subPath === '/api/plugins/toggle' && req.method === 'POST') {
       const body = await readJsonBody(req);
       try {
-        if (!body || !body.name) throw new Error('缺少插件名称');
+        if (!body || !body.name) throw new Error('Не указано имя плагина');
         const enabled = body.enabled !== false;
         const r = await pluginManager.togglePlugin(body.name, enabled);
-        // 与浏览器总开关保持一致（"插件停用 → 浏览器也用不了"）：
-        // 禁用本插件时顺带彻底停用浏览器；启用时恢复总开关（不强行拉起桌面，按需启动）。
+        // В согласовании с общим переключателем браузера («плагин отключён → браузер недоступен»):
+        // при отключении нашего плагина браузер тоже полностью выключается; при включении
+        // общий переключатель возвращается (рабочий стол принудительно не поднимается — по мере надобности).
         let desktopMirrored = null;
         if (body.name === BROWSER_DESKTOP_PLUGIN) {
           const m = await applyDesktopMaster(enabled, { startNow: false });
           desktopMirrored = m.ok === true;
         }
-        // restart=true 时立即重启 DSH，使 bundle 启停真正生效（否则需用户手动重启）
+        // При restart=true DSH перезапускается немедленно, чтобы старт/остановка bundle
+        // реально вступила в силу (иначе нужен ручной перезапуск пользователем)
         let restarted = false;
         if (body.restart === true) {
-          console.log(`[gateway] 插件 ${body.name} 已${enabled ? '启用' : '禁用'}，正在重启 DSH 以生效...`);
+          console.log(`[gateway] Плагин ${body.name} ${enabled ? 'включён' : 'отключён'}, перезапускаем DSH для применения...`);
           const rr = await dshManager.restart().catch(err => ({ ok: false, error: safeErrMsg(err) }));
           restarted = !!rr.ok;
           if (!restarted) {
-            // 状态已持久化，仅本次自动重启失败：如实返回，避免用户误以为已生效
-            return sendJson(res, 500, { ...r, restarted: false, error: '插件状态已保存，但 DSH 自动重启失败: ' + (rr.error || '未知错误') });
+            // Состояние уже сохранено, не удался только автоматический перезапуск:
+            // сообщаем честно, чтобы пользователь не решил, что изменения применены
+            return sendJson(res, 500, { ...r, restarted: false, error: 'Состояние плагина сохранено, но автоматический перезапуск DSH не удался: ' + (rr.error || 'неизвестная ошибка') });
           }
         }
         return sendJson(res, 200, { ...r, restarted, desktopMirrored });
@@ -991,7 +1034,7 @@ async function handleAdminApi(req, res, pathname, query) {
     if (subPath === '/api/plugins/uninstall' && req.method === 'POST') {
       const body = await readJsonBody(req);
       try {
-        if (!body || !body.name) throw new Error('缺少插件名称');
+        if (!body || !body.name) throw new Error('Не указано имя плагина');
         const r = await pluginManager.uninstallPlugin(body.name);
         return sendJson(res, 200, r);
       } catch (err) {
@@ -1002,7 +1045,7 @@ async function handleAdminApi(req, res, pathname, query) {
     if (subPath === '/api/plugins/install' && req.method === 'POST') {
       const body = await readJsonBody(req);
       try {
-        if (!body || !body.name) throw new Error('缺少插件名称');
+        if (!body || !body.name) throw new Error('Не указано имя плагина');
         const r = await pluginManager.installPlugin(body.name);
         return sendJson(res, 200, r);
       } catch (err) {
@@ -1010,19 +1053,19 @@ async function handleAdminApi(req, res, pathname, query) {
       }
     }
 
-    // 7. 保存网关与系统配置并立即重启
+    // 7. Сохранение конфигурации шлюза и системы с немедленным перезапуском
     if (subPath === '/api/config/save' && req.method === 'POST') {
       const body = await readJsonBody(req);
 
       const newPort = Number(body.proxyPort) || PROXY_PORT;
       if (newPort < 1 || newPort > 65535) {
-        return sendJson(res, 400, { ok: false, error: '端口号必须在 1 ~ 65535 范围内' });
+        return sendJson(res, 400, { ok: false, error: 'Номер порта должен быть в диапазоне 1 ~ 65535' });
       }
 
       const newAdmin = normalizeRoutePath(body.adminPath, '/admin');
       const newVnc = normalizeRoutePath(body.vncPath, '/vnc');
       if (newAdmin === newVnc) {
-        return sendJson(res, 400, { ok: false, error: '管理后台路径与 VNC 路径不能相同' });
+        return sendJson(res, 400, { ok: false, error: 'Путь админки и путь VNC не должны совпадать' });
       }
 
       const newCdpPort = Number(body.cdpPort) || 9222;
@@ -1039,20 +1082,22 @@ async function handleAdminApi(req, res, pathname, query) {
       } else if (body.authToken !== undefined && body.authToken !== '' && body.authToken !== '******') {
         updatedToken = String(body.authToken).trim();
       }
-      // 口令强度校验：拒绝弱口令（与初始化向导同一套规则）
+      // Проверка стойкости пароля: слабые пароли отклоняются (те же правила, что в мастере настройки)
       if (updatedToken && updatedToken !== getAuthToken() && isWeakPassword(updatedToken)) {
-        return sendJson(res, 400, { ok: false, error: '访问口令过弱：长度至少 6 位，且不要使用 admin / password 等常见弱口令' });
+        return sendJson(res, 400, { ok: false, error: 'Пароль доступа слишком простой: минимум 6 символов и не используйте распространённые пароли вроде admin / password' });
       }
 
       const autoHealPlugins = body.autoHealPlugins !== false;
       const autoHealMaxPerBoot = Math.max(1, Math.min(50, Number(body.autoHealMaxPerBoot) || 5));
       dshManager.setAutoHeal(autoHealPlugins, autoHealMaxPerBoot);
 
-      // 幽灵 bundle 清理策略：持久化后由下次【容器启动】的装配脚本读取执行
+      // Политика очистки «призрачных» bundle: после сохранения её прочитает и выполнит
+      // скрипт сборки при СЛЕДУЮЩЕМ СТАРТЕ КОНТЕЙНЕРА
       const newPruneMode = normalizePruneMode(body.pruneStaleBundles);
       const newPruneExtra = normalizePruneExtra(body.pruneBundlesExtra);
 
-      // 桌面运行参数以 DesktopManager 当前值为准（权威在「浏览器与桌面控制」页）
+      // Параметры рабочего стола берутся из текущих значений DesktopManager
+      // (источник истины — страница «Браузер и управление рабочим столом»)
       const ds = desktopManager.getStatus();
 
       const newCfg = {
@@ -1065,8 +1110,10 @@ async function handleAdminApi(req, res, pathname, query) {
         pruneStaleBundles: newPruneMode,
         pruneBundlesExtra: newPruneExtra,
         desktop: {
-          // 桌面运行参数一律以 DesktopManager 当前值为准（权威在 Admin「浏览器与桌面控制」页），
-          // 此页保存网关/系统配置时不得覆盖，避免形成第二个写入点。
+          // Параметры рабочего стола всегда берутся из текущих значений DesktopManager
+          // (источник истины — страница Admin «Браузер и управление рабочим столом»);
+          // при сохранении шлюз/системной конфигурации они не перезаписываются,
+          // чтобы не появилась вторая точка записи.
           enabled: desktopManager.isEnabled(),
           width: ds.width,
           height: ds.height,
@@ -1082,28 +1129,29 @@ async function handleAdminApi(req, res, pathname, query) {
 
       const saved = savePersistedConfig(newCfg);
       if (!saved) {
-        return sendJson(res, 500, { ok: false, error: '持久化配置文件写入失败' });
+        return sendJson(res, 500, { ok: false, error: 'Не удалось записать файл сохранённой конфигурации' });
       }
 
       const logSafeCfg = {
         ...newCfg,
         authToken: newCfg.authToken ? '******' : ''
       };
-      console.log('[gateway] 管理后台提交新配置:', logSafeCfg);
+      console.log('[gateway] Новая конфигурация из админки:', logSafeCfg);
 
-      // 返回跳转新 URL 信息
+      // Отправляем сведения о переходе на новый URL
       sendJson(res, 200, {
         ok: true,
-        message: '配置已持久化保存，网关服务将在 1 秒后重启生效...',
+        message: 'Конфигурация сохранена, служба шлюза перезапустится через 1 секунду и применит изменения...',
         newPort,
         newAdminPath: newAdmin,
         newVncPath: newVnc
       });
 
-      // 延迟触发重启
+      // Отложенный перезапуск
       setTimeout(async () => {
-        console.log('[gateway] 执行重启以应用新网关配置...');
-        // 先优雅停止桌面并等待进程真正退出，避免新网关启动时撞上未退场的旧进程
+        console.log('[gateway] Выполняется перезапуск для применения новой конфигурации шлюза...');
+        // Сначала корректно останавливаем рабочий стол и ждём реального завершения процессов,
+        // чтобы новый шлюз не наткнулся на ещё не завершённые старые процессы
         await desktopManager.stop();
         await dshManager.stop();
         process.exit(0);
@@ -1112,21 +1160,23 @@ async function handleAdminApi(req, res, pathname, query) {
       return;
     }
 
-    return sendJson(res, 404, { ok: false, error: '接口不存在' });
+    return sendJson(res, 404, { ok: false, error: 'Такого интерфейса не существует' });
   } catch (err) {
     return sendJson(res, 500, { ok: false, error: safeErrMsg(err) });
   }
 }
 
-// ── 内部桌面控制 API (供本地插件调用) ─────────────────────────
+// ── Внутренний API управления рабочим столом (для локальных плагинов) ─────────
 async function handleInternalDesktopApi(req, res, pathname) {
   try {
     const action = pathname.replace('/__internal/desktop/', '').trim();
-    // 附带网关权威的 VNC 路径，供插件生成正确的 vncUrl（避免沿用过期的本地/补丁配置）
+    // Авторитетный путь VNC от шлюза, чтобы плагин построил корректный vncUrl
+    // (не использует устаревшую локальную/патченую конфигурацию)
     if (action === 'status') return sendJson(res, 200, { ...desktopManager.getStatus(), vncPath: VNC_PATH_HREF });
 
     const body = await readJsonBody(req);
-    // 内部（loopback）权威写入路径：供插件做一次性迁移 / 与 Admin 保持同一权威
+    // Внутренняя (loopback) авторитетная точка записи: для разовой миграции плагином
+    // и для поддержания того же источника истины, что и в Admin
     if (action === 'config') {
       const r = applyDesktopConfigPatch(body);
       return sendJson(res, r.ok ? 200 : 400, r);
@@ -1152,7 +1202,7 @@ async function handleInternalDesktopApi(req, res, pathname) {
       desktopManager.touchActivity(body.durationMinutes);
       return sendJson(res, 200, { ok: true, status: desktopManager.getStatus() });
     }
-    return sendJson(res, 404, { ok: false, error: '未知操作' });
+    return sendJson(res, 404, { ok: false, error: 'Неизвестное действие' });
   } catch (err) {
     return sendJson(res, 500, { ok: false, error: safeErrMsg(err) });
   }
@@ -1183,19 +1233,19 @@ function handleAuthVerify(req, res) {
       } else {
         recordAuthAttempt(clientIp, false);
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: '认证码错误，请重新输入' }));
+        res.end(JSON.stringify({ ok: false, error: 'Неверный код доступа, введите заново' }));
       }
     } catch {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: '请求数据格式错误' }));
+      res.end(JSON.stringify({ ok: false, error: 'Некорректный формат данных запроса' }));
     }
   });
 }
 
-// 初始化向导提交：设置访问口令（仅在"尚未设置"时可用）
+// Отправка мастера настройки: задание пароля доступа (только пока он «не задан»)
 function handleSetupSubmit(req, res) {
   if (!isSetupRequired()) {
-    return sendJson(res, 409, { ok: false, error: '访问口令已设置；如需修改请前往管理后台' });
+    return sendJson(res, 409, { ok: false, error: 'Пароль доступа уже задан; изменить его можно в админке' });
   }
   const clientIp = getClientIp(req);
   const rateLimit = checkRateLimit(clientIp);
@@ -1211,39 +1261,40 @@ function handleSetupSubmit(req, res) {
       const data = JSON.parse(body);
       const pwd = typeof data.password === 'string' ? data.password : '';
       const confirm = typeof data.confirm === 'string' ? data.confirm : '';
-      if (!pwd || !confirm) return sendJson(res, 400, { ok: false, error: '请填写口令并二次确认' });
-      if (pwd !== confirm) return sendJson(res, 400, { ok: false, error: '两次输入的口令不一致' });
-      if (isWeakPassword(pwd)) return sendJson(res, 400, { ok: false, error: '口令过弱：长度至少 6 位，且不要使用常见弱口令' });
+      if (!pwd || !confirm) return sendJson(res, 400, { ok: false, error: 'Введите пароль и подтвердите его' });
+      if (pwd !== confirm) return sendJson(res, 400, { ok: false, error: 'Введённые пароли не совпадают' });
+      if (isWeakPassword(pwd)) return sendJson(res, 400, { ok: false, error: 'Пароль слишком простой: минимум 6 символов и не используйте распространённые простые пароли' });
 
-      // 合并写回，避免覆盖 desktop/paths 等其它持久化字段
+      // Сливаем изменения, чтобы не затереть другие сохранённые поля (desktop, paths и т.д.)
       const cfg = loadPersistedConfig();
       cfg.authToken = pwd;
       cfg.savedAt = new Date().toISOString();
       if (!savePersistedConfig(cfg)) {
-        return sendJson(res, 500, { ok: false, error: '口令持久化失败，请检查数据卷权限后重试' });
+        return sendJson(res, 500, { ok: false, error: 'Не удалось сохранить пароль, проверьте права доступа к полу данных и повторите' });
       }
       updateAuthToken(pwd);
       recordAuthAttempt(clientIp, true);
       setAuthCookie(res);
-      console.log('[gateway] 已通过初始化向导设置访问口令');
+      console.log('[gateway] Пароль доступа задан через мастер настройки');
       return sendJson(res, 200, { ok: true });
     } catch {
-      return sendJson(res, 400, { ok: false, error: '请求数据格式错误' });
+      return sendJson(res, 400, { ok: false, error: 'Некорректный формат данных запроса' });
     }
   });
 }
 
 /**
- * WebSocket 同源校验（防 CSWSH）：实现见 ws-origin.js。
- * 关键点：**绝不采用 `x-forwarded-host`** —— 该头可被客户端伪造（或经代理原样透传），
- * 攻击者只要把它设成自己页面的域名，Origin 校验就会被绕过。
- * 现在只认「真实 `host` 头」+「显式配置的对外主机名」。
+ * Проверка совпадения источника WebSocket (защита от CSWSH): реализация в ws-origin.js.
+ * Ключевой момент: заголовок `x-forwarded-host` НИКОГДА не используется — клиент может
+ * подделать его (или прокси пропустит его без изменений); достаточно выставить в нём
+ * домен своей страницы, чтобы обойти проверку Origin.
+ * Сейчас принимаются только «настоящий заголовок `host`» и явно настроенные внешние имена хостов.
  */
 function isAllowedWsOrigin(req) {
   return wsOrigin.isAllowedWsOrigin(req, PUBLIC_HOSTS);
 }
 
-// ── 主 HTTP 路由调度 ─────────────────────────────────────────
+// ── Основной маршрутизатор HTTP-запросов ──────────────────────
 async function handleHttpRequest(req, res) {
   const rawUrl = req.url || '/';
   const safePath = '/' + rawUrl.replace(/^\/+/, '');
@@ -1251,8 +1302,9 @@ async function handleHttpRequest(req, res) {
   const pathname = parsedUrl.pathname;
   req.url = pathname + parsedUrl.search;
 
-  // 1. 公开路径白名单
-  //    未设置访问口令时，登录页改为"初始化向导"，其余请求一律被引导到 /setup
+  // 1. Белый список общедоступных путей
+  //    Пока пароль не задан, страница входа превращается в «мастер настройки»,
+  //    а остальные запросы перенаправляются на /setup
   if (pathname === '/login') {
     if (isSetupRequired()) { res.writeHead(302, { Location: '/setup' }); return res.end(); }
     return serveStaticHtml(res, 'login.html');
@@ -1264,13 +1316,15 @@ async function handleHttpRequest(req, res) {
     return res.end();
   }
   if (pathname === '/setup' && req.method === 'GET') {
-    // 口令已设置后不再展示初始化向导：否则会留下一个"看着能用、提交必然失败"的僵尸表单
+    // После задания пароля мастер настройки больше не показывается: иначе осталась бы
+    // «зомби-форма», которая выглядит рабочей, но при отправке всегда падает
     if (!isSetupRequired()) { res.writeHead(302, { Location: '/login' }); return res.end(); }
     return serveStaticHtml(res, 'setup.html');
   }
   if (pathname === '/__auth/setup' && req.method === 'POST') return handleSetupSubmit(req, res);
 
-  // 免鉴权健康检查：供 Docker HEALTHCHECK / 负载均衡探活使用（不泄漏任何敏感信息）
+  // Проверка состояния без аутентификации: для Docker HEALTHCHECK / балансировки нагрузки
+  // (не раскрывает никаких чувствительных данных)
   if (pathname === '/healthz') {
     const ds = desktopManager.getStatus();
     const dsh = dshManager.getStatus();
@@ -1281,7 +1335,8 @@ async function handleHttpRequest(req, res) {
       port: PROXY_PORT,
       authEnabled: isAuthEnabled(),
       setupRequired: isSetupRequired(),
-      // M13：回显"实际生效值 + 来源"，便于排查 .env / 持久化配置 / 默认值之间的漂移
+      // M13: возвращаем «фактически действующее значение + источник», чтобы удобно искать
+      // расхождения между .env / сохранённой конфигурацией / значением по умолчанию
       configSource: {
         port: PROXY_PORT_SOURCE,
         adminPath: ADMIN_PATH_SOURCE,
@@ -1306,29 +1361,32 @@ async function handleHttpRequest(req, res) {
     }
   }
 
-  // 2. 本地回环 + 内部共享密钥的内部接口 (供容器内插件工具通信)
-  //    仅凭"来源是回环"不够：网关若位于反向代理之后，外部请求的对端地址也会是 127.0.0.1。
-  //    因此追加共享密钥校验（插件读 /root/.dsh/.internal-api-token，见 internal-token.js）。
+  // 2. Внутренние интерфейсы по локальному петлевому адресу с общим секретом
+  //    (для обмена между плагинами внутри контейнера)
+  //    Одного факта «источник — петля» недостаточно: если шлюз стоит за обратным прокси,
+  //    адрес пира внешнего запроса тоже будет 127.0.0.1.
+  //    Поэтому дополнительно проверяется общий секрет (плагин читает
+  //    /root/.dsh/.internal-api-token, см. internal-token.js).
   if (pathname.startsWith('/__internal/desktop/')) {
     const peer = wsOrigin.normalizeIp(req.socket && req.socket.remoteAddress);
     const isLoopbackReq = peer === '127.0.0.1' || peer === '::1';
     if (isLoopbackReq && verifyInternalToken(req)) {
       return handleInternalDesktopApi(req, res, pathname);
     }
-    return sendJson(res, 403, { ok: false, error: '内部接口拒绝访问（需要回环来源 + 内部密钥）' });
+    return sendJson(res, 403, { ok: false, error: 'Во внутренний интерфейс доступ запрещён (нужен петлевой источник + внутренний ключ)' });
   }
 
-  // 3. 初始化闸门：未设置访问口令前，除上面的公开路径外一律不放行
+  // 3. Предохранитель настройки: пока пароль не задан, пропускаются только пути выше
   if (isSetupRequired()) {
     if (pathname.startsWith(ADMIN_PATH + '/api/') || pathname.startsWith('/__api/')) {
-      return sendJson(res, 401, { ok: false, error: '尚未设置访问口令，请先访问 /setup 完成初始化', setupRequired: true });
+      return sendJson(res, 401, { ok: false, error: 'Пароль доступа ещё не задан: сначала откройте /setup и завершите настройку', setupRequired: true });
     }
     const wantsHtml = req.method === 'GET' && (req.headers.accept || '').includes('text/html');
     if (wantsHtml) {
       res.writeHead(302, { Location: '/setup' });
       return res.end();
     }
-    return sendJson(res, 401, { ok: false, error: '尚未设置访问口令，请先访问 /setup 完成初始化', setupRequired: true });
+    return sendJson(res, 401, { ok: false, error: 'Пароль доступа ещё не задан: сначала откройте /setup и завершите настройку', setupRequired: true });
   }
 
   if (PUBLIC_PATHS.has(pathname)) {
@@ -1336,7 +1394,7 @@ async function handleHttpRequest(req, res) {
     return dshProxy.web(req, res);
   }
 
-  // 3. 统一身份鉴权校验 (未通过则统一拦截)
+  // 3. Единая проверка аутентификации (при неудаче запрос перехватывается)
   if (!checkRequestAuth(req)) {
     const isHtmlNav = (req.headers.accept || '').includes('text/html') && req.method === 'GET';
     if (isHtmlNav) {
@@ -1345,11 +1403,12 @@ async function handleHttpRequest(req, res) {
       return res.end();
     } else {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-      return res.end(JSON.stringify({ ok: false, error: '未授权，请先登录' }));
+      return res.end(JSON.stringify({ ok: false, error: 'Доступ не авторизован, выполните вход' }));
     }
   }
 
-  // 3.5 稳定桌面插件接口 (经鉴权后可用，提供与 ADMIN_PATH 解耦的稳定基准路径)
+  // 3.5 Стабильный интерфейс плагина рабочего стола (доступен после аутентификации,
+  //     даёт базовый путь, не зависящий от ADMIN_PATH)
   if (pathname === '/__api/desktop/status' && req.method === 'GET') {
     return sendJson(res, 200, {
       desktop: desktopManager.getStatus(),
@@ -1362,7 +1421,7 @@ async function handleHttpRequest(req, res) {
     return sendJson(res, r.ok ? 200 : 500, r);
   }
 
-  // 4. 自定义 Admin 路由 (ADMIN_PATH)
+  // 4. Пользовательские маршруты админки (ADMIN_PATH)
   if (pathname === ADMIN_PATH || pathname === ADMIN_PATH + '/') {
     return serveStaticHtml(res, 'admin.html');
   }
@@ -1370,20 +1429,23 @@ async function handleHttpRequest(req, res) {
     return handleAdminApi(req, res, pathname, parsedUrl.searchParams);
   }
 
-  // 5. 自定义 VNC 路由 (VNC_PATH)
+  // 5. Пользовательские маршруты VNC (VNC_PATH)
   if (pathname === VNC_PATH || pathname.startsWith(VNC_PATH + '/')) {
-    // 浏览器被管理后台「彻底停用」、或浏览器插件被停用时，给出明确提示页而不是让 noVNC 黑屏
+    // Если браузер «полностью отключён» в админке либо отключён его плагин —
+    // показываем понятную страницу вместо чёрного экрана noVNC
     if (!desktopManager.isEnabled() || isBrowserPluginDisabled()) {
       return serveDesktopDisabledPage(res);
     }
-    // 自动唤醒桌面：
-    //   用「健康感知」的 getStatus().running 判断，而不是原始 this.running 标志。
-    //   这样即使 Xvfb/Chromium 等关键进程已退出（例如用户把浏览器最后一个标签页/窗口关掉
-    //   导致 Chromium 退出），打开 /vnc 也能自愈重启，而不是停在"空桌面"上。
+    // Автоподъём рабочего стола:
+    //   используем «здоровье-ориентированный» getStatus().running, а не сыромой флаг this.running.
+    //   Тогда даже если ключевые процессы вроде Xvfb/Chromium уже завершились (например,
+    //   пользователь закрыл последнюю вкладку/окно браузера), открытие /vnc вместо «пустого
+    //     рабочего стола» приведёт к самовосстановлению и перезапуску.
     if (!desktopManager.getStatus().running) {
       desktopManager.start().catch(() => {});
-      // 桌面尚未就绪：HTML 导航直接返回「启动中」独立页（3s 自动刷新），
-      // 不再转发给还没监听的 websockify —— 从根上消除 502 / 裸 JSON / 黑屏。
+      // Рабочий стол ещё не готов: HTML-навигация сразу получает отдельную страницу
+      // «запускается» (автообновление через 3 с), а не проброс на ещё не слушающий
+      // websockify — это полностью устраняет 502 / голый JSON / чёрный экран.
       if (isHtmlNavigation(req)) {
         return serveDesktopStartingPage(res);
       }
@@ -1393,13 +1455,15 @@ async function handleHttpRequest(req, res) {
 
     const novncRevision = process.env.NOVNC_ASSET_REVISION || '1.6.0';
     const versionedVncPath = `/novnc-${novncRevision}/vnc.html`;
-    // websockify 端点必须下发【绝对路径】。noVNC 在浏览器侧用 `new URL(path, location.href)`
-    // 解析 path 参数；由于 vnc.html 位于版本化子目录 (/vnc/novnc-<rev>/vnc.html)，
-    // 相对路径 "vnc/websockify" 会被解析成 /vnc/novnc-<rev>/vnc/websockify（网关不认），
-    // 导致 WebSocket 握手被拒 (1006)，页面显示 "Failed to connect"。
+    // Точка websockify должна отдаваться как АБСОЛЮТНЫЙ путь. noVNC в браузере разбирает
+    // параметр path через `new URL(path, location.href)`; поскольку vnc.html лежит в
+    // версионированном подкаталоге (/vnc/novnc-<rev>/vnc.html), относительный путь
+    // "vnc/websockify" превратится в /vnc/novnc-<rev>/vnc/websockify (шлюз его не знает),
+    // и WebSocket-хендшейк будет отклонён (1006) с сообщением "Failed to connect".
     const websockifyPath = `${VNC_PATH}/websockify`;
 
-    // 5.1 访问桌面根入口 (如 /vnc 或 /vnc/) -> 302 自动重定向至带版本隔离的 vnc.html (附带防缓存头)
+    // 5.1 Открытие корневого адреса рабочего стола (например /vnc или /vnc/) -> 302
+    //     на версионированный vnc.html (с заголовками антикэша)
     if (pathname === VNC_PATH || pathname === VNC_PATH + '/') {
       res.writeHead(302, {
         Location: `${VNC_PATH}${versionedVncPath}?autoconnect=1&resize=scale&view_only=0&reconnect=1&path=${websockifyPath}`,
@@ -1410,7 +1474,8 @@ async function handleHttpRequest(req, res) {
       return res.end();
     }
 
-    // 5.2 兼容直接访问旧版未版本化路径 /vnc/vnc.html -> 自动无感重定向至最新版本化路径
+    // 5.2 Совместимость при прямом заходе на старый неверсионированный путь /vnc/vnc.html
+    //     -> незаметный автоматический переход на актуальный версионированный путь
     if (pathname === `${VNC_PATH}/vnc.html`) {
       const search = parsedUrl.search || `?autoconnect=1&resize=scale&view_only=0&reconnect=1&path=${websockifyPath}`;
       res.writeHead(302, {
@@ -1422,23 +1487,24 @@ async function handleHttpRequest(req, res) {
       return res.end();
     }
 
-    // 重写前缀发给 noVNC 静态服务
+    // Переписываем префикс и отдаём в статический сервер noVNC
     req.url = req.url.slice(VNC_PATH.length) || '/';
     return vncProxy.web(req, res);
   }
 
-  // 6. DSH 主服务转发 (/*)
+  // 6. Проброс в основную службу DSH (/*)
   await alignHeadersForDsh(req);
   dshProxy.web(req, res);
 }
 
-// 请求级异常兜底：单个请求出错只影响该请求，绝不拖垮整个网关进程
+// Страховка на уровне запроса: ошибка одного запроса влияет только на него
+// и никогда не роняет весь процесс шлюза
 function handleRequestCrash(err, req, res) {
-  console.error('[gateway] HTTP 请求处理异常:', (err && err.stack) || err);
+  console.error('[gateway] Ошибка обработки HTTP-запроса:', (err && err.stack) || err);
   try {
     if (res && !res.headersSent) {
       res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: false, error: '网关内部错误' }));
+      res.end(JSON.stringify({ ok: false, error: 'Внутренняя ошибка шлюза' }));
     } else if (res && typeof res.end === 'function') {
       res.end();
     }
@@ -1449,15 +1515,19 @@ const server = http.createServer((req, res) => {
   handleHttpRequest(req, res).catch((err) => handleRequestCrash(err, req, res));
 });
 
-// M15 请求级超时：防慢速请求长期占用连接（SSE / WebSocket 不受影响）
+// M15: таймаут на уровне запроса — не даём медленным запросам долго держать соединение
+// (SSE / WebSocket на это не распространяется)
 server.headersTimeout = 20000;
 server.keepAliveTimeout = 15000;
-server.requestTimeout = 600000; // 允许大快照上传，但仍有上界
-// headersTimeout 的生效依赖周期性检查，默认间隔 30s 会导致"最坏要等 ~50s 才断开"；
-// 收紧到 5s，让慢速请求在 ~20s 内被及时断开。
+server.requestTimeout = 600000; // допускает загрузку больших снимков, но остаётся конечным
+// headersTimeout срабатывает при периодической проверке; интервал по умолчанию 30 с даёт
+// «в худшем случае ждём ~50 с перед обрывом»; сжимаем до 5 с, чтобы медленные запросы
+// обрывались вовремя (~20 с).
 server.connectionsCheckingInterval = 5000;
-// 补充：Node 的 headersTimeout 对"连上但一个字节都没发"的连接不生效（实测 40s 仍未断），
-// 这里显式加连接级守卫——建立后 20s 内没有任何数据即断开；一旦开始发送数据就交给正常超时体系。
+// Дополнительно: headersTimeout в Node не действует на соединения, которые «подключились,
+// но не отправили ни байта» (на практике 40 с — так и не оборвались), поэтому здесь
+// явный сторож на уровне соединения: если за 20 с после установки не пришло данных —
+// обрываем; как только данные начали идти, включается обычная система таймаутов.
 server.on('connection', (socket) => {
   try {
     socket.setTimeout(20000, () => { try { socket.destroy(); } catch {} });
@@ -1465,7 +1535,7 @@ server.on('connection', (socket) => {
   } catch {}
 });
 
-// ── WebSocket 升级握手调度 ───────────────────────────────────
+// ── Обработка WebSocket-хендшейка ──────────────────────────────
 async function handleUpgrade(req, socket, head) {
   const rawUrl = req.url || '/';
   const safePath = '/' + rawUrl.replace(/^\/+/, '');
@@ -1473,73 +1543,78 @@ async function handleUpgrade(req, socket, head) {
   const pathname = parsedUrl.pathname;
   req.url = pathname + parsedUrl.search;
 
-  // 1. 跨站 CSWSH 校验
+  // 1. Проверка на межсайтовый CSWSH
   if (!isAllowedWsOrigin(req)) {
     socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     return;
   }
 
-  // 2. 身份认证检查
+  // 2. Проверка аутентификации
   if (!checkRequestAuth(req)) {
     socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
     return;
   }
 
-  // 3. VNC WebSocket 握手 (兼容版本化路径、相对路径与自定义前缀)
+  // 3. WebSocket-хендшейк VNC (совместимость с версионированными путями, относительными
+  //    путями и пользовательским префиксом)
   const vncWsPath = VNC_PATH + '/websockify';
-  // 轻微项：只精确匹配已知的 websockify 端点（原来 endsWith('/websockify') 过宽，
-  // 任何以 /websockify 结尾的路径都会被当作桌面 WS 代理）
+  // Мелочь: совпадаем строго с известной точкой websockify (раньше проверка endsWith('/websockify')
+  // была излишне широкой: любой путь, заканчивающийся на /websockify, считался WS-прокси рабочего стола)
   if (pathname === vncWsPath || pathname === '/websockify') {
-    // 浏览器被彻底停用（或插件被停用）时不再转发 VNC WebSocket（与 /vnc 提示页保持一致）
+    // При полностью отключённом браузере (или отключённом плагине) WebSocket VNC
+    // больше не проксируется (в согласовании со страницей-пояснением на /vnc)
     if (!desktopManager.isEnabled() || isBrowserPluginDisabled()) {
       socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       return;
     }
     desktopManager.touchActivity();
-    // 与 /vnc 一致：若关键进程已退出（例如最后一个标签页被关掉导致 Chromium 退出），
-    // 借着这次 WS 连接自愈重启，避免用户停在"空桌面"上。
+    // Как и на /vnc: если ключевые процессы уже завершились (например, закрыли последнюю
+    // вкладку, из-за чего остановился Chromium) — пользуемся этим WS-подключением для
+    // самовосстановления, чтобы пользователь не завис на «пустом рабочем столе».
     if (!desktopManager.getStatus().running) desktopManager.start().catch(() => {});
     req.url = '/websockify' + (parsedUrl.search || '');
     return vncProxy.ws(req, socket, head);
   }
 
-  // 4. DSH WebSocket 握手 (/events/mux, /events/host, etc.)
+  // 4. WebSocket-хендшейк DSH (/events/mux, /events/host и т.д.)
   await alignHeadersForDsh(req);
   dshProxy.ws(req, socket, head);
 }
 
 server.on('upgrade', (req, socket, head) => {
   handleUpgrade(req, socket, head).catch((err) => {
-    console.error('[gateway] WebSocket 升级处理异常:', (err && err.stack) || err);
+    console.error('[gateway] Ошибка обработки WebSocket-апгрейда:', (err && err.stack) || err);
     try { socket.end('HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n'); } catch {}
   });
 });
 
-// ── 服务自举与平滑关闭 ───────────────────────────────────────
+// ── Самозапуск службы и корректное завершение ──────────────────
 async function bootstrap() {
-  // 内部接口共享密钥：启动即生成并落盘（0600），保证插件在任何一次工具调用前都能读到
+  // Общий секрет внутренних интерфейсов: создаётся при запуске и сразу сохраняется на диск
+  // (0600), чтобы плагин успел прочитать его до любого вызова инструмента
   try {
     const tokenPath = require('./internal-token').tokenFilePath();
     getInternalToken();
-    console.log('[gateway] 内部接口密钥已就绪:', tokenPath);
+    console.log('[gateway] Ключ внутренних интерфейсов готов:', tokenPath);
   } catch (err) {
-    console.warn('[gateway] 内部接口密钥初始化失败:', err.message);
+    console.warn('[gateway] Не удалось инициализировать ключ внутренних интерфейсов:', err.message);
   }
 
   server.listen(PROXY_PORT, '0.0.0.0', () => {
     console.log('==================================================');
-    console.log('  网关已启动');
-    console.log('  监听端口: 0.0.0.0:' + PROXY_PORT + ' (来源: ' + PROXY_PORT_SOURCE + ')');
-    console.log('  管理路径: ' + ADMIN_PATH + ' (来源: ' + ADMIN_PATH_SOURCE + ')  桌面路径: ' + VNC_PATH + ' (来源: ' + VNC_PATH_SOURCE + ')');
-    console.log('  认证口令来源: ' + AUTH_TOKEN_SOURCE);
-    console.log('  认证状态: ' + (isAuthEnabled() ? '已启用认证码保护 (AUTH_TOKEN)' : '未启用认证 (无感直通)'));
+    console.log('  Шлюз запущен');
+    console.log('  Порт прослушивания: 0.0.0.0:' + PROXY_PORT + ' (источник: ' + PROXY_PORT_SOURCE + ')');
+    console.log('  Путь админки: ' + ADMIN_PATH + ' (источник: ' + ADMIN_PATH_SOURCE + ')  Путь рабочего стола: ' + VNC_PATH + ' (источник: ' + VNC_PATH_SOURCE + ')');
+    console.log('  Источник пароля доступа: ' + AUTH_TOKEN_SOURCE);
+    console.log('  Состояние аутентификации: ' + (isAuthEnabled() ? 'защита кодом доступа включена (AUTH_TOKEN)' : 'аутентификация выключена (прямой доступ)'));
     console.log('  DSH Web:  http://127.0.0.1:' + PROXY_PORT + '/');
-    console.log('  管理面板: http://127.0.0.1:' + PROXY_PORT + ADMIN_PATH + '/');
-    console.log('  noVNC 桌面: http://127.0.0.1:' + PROXY_PORT + VNC_PATH + '/');
+    console.log('  Админ-панель: http://127.0.0.1:' + PROXY_PORT + ADMIN_PATH + '/');
+    console.log('  Рабочий стол noVNC: http://127.0.0.1:' + PROXY_PORT + VNC_PATH + '/');
     console.log('==================================================');
   });
 
-  // 首次启动即落盘配置文件：保证「gateway.config.json = 单一权威」始终存在（插件启动时读它）
+  // Файл конфигурации создаётся уже при первом запуске: «gateway.config.json = единственный
+  // источник истины» должен существовать всегда (его читают плагины при старте)
   if (!fs.existsSync(CONFIG_FILE)) {
     const ds0 = desktopManager.getStatus();
     savePersistedConfig({
@@ -1559,46 +1634,51 @@ async function bootstrap() {
       },
       savedAt: new Date().toISOString()
     });
-    console.log('[gateway] 已生成初始配置文件:', CONFIG_FILE);
+    console.log('[gateway] Создан начальный файл конфигурации:', CONFIG_FILE);
   }
 
-  // 启动虚拟桌面 (尊重管理后台「彻底开关」与环境变量；任一处显式关闭则不启动)
+  // Запуск виртуального рабочего стола (с учётом «полного выключателя» админки и переменных
+  // окружения; если где-то явно выключено — не запускаем)
   if (!desktopManager.isEnabled()) {
-    console.log('[desktop-manager] 容器浏览器已被管理后台彻底停用，跳过开机自动启动');
+    console.log('[desktop-manager] Контейнерный браузер полностью отключён в админке, автозапуск при старте пропущен');
   } else if (isBrowserPluginDisabled()) {
-    // 插件已被显式禁用：按"插件停用 → 浏览器也用不了"的约定，不自动启动桌面
-    console.log('[desktop-manager] 浏览器插件已被停用，跳过开机自动启动桌面');
+    // Плагин явно отключён: по соглашению «плагин отключён → браузер недоступен»
+    // рабочий стол автоматически не запускаем
+    console.log('[desktop-manager] Плагин браузера отключён, автозапуск рабочего стола при старте пропущен');
   } else {
-    await desktopManager.start().catch(err => console.error('[desktop-manager] 启动失败:', err.message));
+    await desktopManager.start().catch(err => console.error('[desktop-manager] Ошибка запуска:', err.message));
   }
 
-  // 启动 DSH 核心服务
-  await dshManager.boot().catch(err => console.error('[dsh-manager] 启动失败:', err.message));
+  // Запуск ядра службы DSH
+  await dshManager.boot().catch(err => console.error('[dsh-manager] Ошибка запуска:', err.message));
 
-  // 默认首次启动自动创建初始配置快照 (自动防重复创建)
+  // При самом первом запуске автоматически создаётся начальный снимок конфигурации
+  // (повторное создание исключено)
   dshManager.ensureDefaultSnapshot();
 }
 
 async function shutdown(exitCode = 0) {
   const code = typeof exitCode === 'number' ? exitCode : 0;
-  console.log('\n[gateway] 正在退出，关闭桌面与 DSH 进程...');
-  // 兜底：无论如何 8 秒内必须退出，避免关机流程自身卡死
-  const hardTimer = setTimeout(() => { console.error('[gateway] 退出超时，强制结束'); process.exit(code); }, 8000);
+  console.log('\n[gateway] Выходим, останавливаем рабочий стол и процессы DSH...');
+  // Страховка: в любом случае завершаемся за 8 секунд, чтобы сам процесс остановки не завис
+  const hardTimer = setTimeout(() => { console.error('[gateway] Превышено время завершения, завершаем принудительно'); process.exit(code); }, 8000);
   if (hardTimer.unref) hardTimer.unref();
-  try { await desktopManager.stop(); } catch (e) { console.warn('[gateway] 关闭桌面异常(忽略):', e && e.message); }
-  try { await dshManager.stop(); } catch (e) { console.warn('[gateway] 关闭 DSH 异常(忽略):', e && e.message); }
+  try { await desktopManager.stop(); } catch (e) { console.warn('[gateway] Ошибка при остановке рабочего стола (игнорируем):', e && e.message); }
+  try { await dshManager.stop(); } catch (e) { console.warn('[gateway] Ошибка при остановке DSH (игнорируем):', e && e.message); }
   process.exit(code);
 }
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-// 未处理的 Promise 拒绝：记录但【不退出】，避免单个后台任务异常拖垮唯一入口
+// Необработанные отказы Promise: записываем в журнал, но НЕ завершаемся, чтобы сбой одной
+// фоновой задачи не ронял единственный входной процесс
 process.on('unhandledRejection', (reason) => {
-  console.error('[gateway] 未处理的 Promise 拒绝（已忽略，进程继续运行）:', (reason && reason.stack) || reason);
+  console.error('[gateway] Необработанный отказ Promise (процесс продолжает работу):', (reason && reason.stack) || reason);
 });
-// 未捕获同步异常：记录后优雅退出，交由 entrypoint 守护循环重启
+// Нехваченные синхронные исключения: логируем и корректно выходим, передавая перезапуск
+// демонизирующей петле entrypoint
 process.on('uncaughtException', (err) => {
-  console.error('[gateway] 未捕获异常，优雅退出以交由守护进程重启:', (err && err.stack) || err);
+  console.error('[gateway] Нехваченное исключение, корректно завершаемся, чтобы перезапуск выполнил демон:', (err && err.stack) || err);
   shutdown(1).catch(() => process.exit(1));
 });
 

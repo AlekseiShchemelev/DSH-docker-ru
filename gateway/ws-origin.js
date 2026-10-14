@@ -1,20 +1,22 @@
 'use strict';
 
 /**
- * WebSocket 同源校验（防 Cross-Site WebSocket Hijacking / CSWSH）。
+ * Проверка Same-Origin для WebSocket (защита от Cross-Site WebSocket Hijacking / CSWSH).
  *
- * 设计要点（M2）：
- *  - **绝不采用 `x-forwarded-host`**：该头可由客户端伪造、或经反向代理原样透传，
- *    一旦用它参与比较，攻击者只要把它设成自己页面的域名就能绕过 Origin 校验。
- *  - 只认「真实 `host` 头」+「显式配置的对外主机名（PUBLIC_HOST / config.publicHost）」。
- *  - 回环来源（127.0.0.1 / ::1）额外允许 localhost 变体，便于本机调试。
- *  - 浏览器发起的握手必然携带 Origin；无 Origin 的是非浏览器客户端（Node/ws、CLI），
- *    拿不到受害者 Cookie，不构成 CSWSH，放行。
+ * Ключевые решения (M2):
+ *  - **никогда не использовать `x-forwarded-host`**: этот заголовок клиент может подделать
+ *    или обратный прокси прокинуть как есть; как только он участвует в сравнении, атакующий
+ *    достаточно подставляет домен своей страницы и Origin-проверка обходится.
+ *  - учитываются только «настоящий `host`-заголовок» + «явно настроенное внешнее имя хоста
+ *    (PUBLIC_HOST / config.publicHost)».
+ *  - для loopback-источников (127.0.0.1 / ::1) дополнительно допускаются варианты localhost — удобно для локальной отладки.
+ *  - рукопожатие из браузера всегда несёт Origin; без Origin идут не-браузерные клиенты
+ *    (Node/ws, CLI) — cookie жертвы им недоступны, угрозы CSWSH нет, пропускаем.
  */
 
 const net = require('net');
 
-/** 规范化 IP：剥离 IPv4-mapped IPv6 前缀 / 端口 / 方括号；非 IP 返回 '' */
+/** Нормализация IP: снимает префикс IPv4-mapped IPv6 / порт / квадратные скобки; не-IP возвращает '' */
 function normalizeIp(raw) {
   if (typeof raw !== 'string') return '';
   let ip = raw.trim();
@@ -36,7 +38,7 @@ function isLoopbackPeer(req) {
 
 /**
  * @param {import('http').IncomingMessage} req
- * @param {string[]} publicHosts 显式允许的对外主机名（不含协议）
+ * @param {string[]} publicHosts явно разрешённые внешние имена хостов (без протокола)
  * @returns {boolean}
  */
 function isAllowedWsOrigin(req, publicHosts = []) {

@@ -83,13 +83,13 @@ async function ensureUpstreamCookie(dshOrigin = 'http://127.0.0.1:3079') {
       if (sc && sc.includes('dsh-auth-')) {
         const cookiePair = sc.split(';')[0].trim();
         state.upstreamCookie = cookiePair;
-        // 轻微项：日志只记录 Cookie 名与长度，绝不回显其内容片段
-        console.log(`[token-crawler] 成功换取 DSH 上游会话 Cookie: ${cookiePair.split('=')[0]} (len=${cookiePair.length})`);
+        // Незначительно: в журнал пишется только имя Cookie и её длина, ни в коем случае не содержимое
+        console.log(`[token-crawler] Успешно получена сессионная Cookie апстрима DSH: ${cookiePair.split('=')[0]} (len=${cookiePair.length})`);
         return cookiePair;
       }
     }
   } catch (err) {
-    console.error('[token-crawler] 换取上游会话 Cookie 失败:', err.message);
+    console.error('[token-crawler] Ошибка получения сессионной Cookie апстрима:', err.message);
   } finally {
     state.fetchingCookie = false;
   }
@@ -100,7 +100,7 @@ function getCachedUpstreamCookie() {
   return state.upstreamCookie;
 }
 
-// 3. WebSocket wss:// 安全升级 shim（HTTPS 反向代理下防止 Mixed Content 拦截）
+// 3. Shim безопасного апгрейда WebSocket wss:// (защита от Mixed Content за HTTPS-обратным прокси)
 const WS_UPGRADE_SHIM = `(function() {
   try {
     var loc = typeof window !== "undefined" && window.location ? window.location : (typeof location !== "undefined" ? location : null);
@@ -152,7 +152,8 @@ const WS_UPGRADE_SHIM = `(function() {
 
 // Polyfill for non-secure contexts (LAN IP / plain HTTP) and native __DSH_TRANSPORT__
 const RANDOM_UUID_POLYFILL = `<script>
-// 1. DSH 官方预留扩展锚点：显式声明拥有宿主回环控制权 (零侵入启用 host 模式，彻底免去源码修补)
+// 1. Официальный расширяемый якорь DSH: явно заявляем права на управление loopback хоста
+// (включение host-режима без вторжения в исходники)
 globalThis.__DSH_TRANSPORT__ = { ownsHost: true };
 
 // 2. crypto.randomUUID Polyfill for HTTP/LAN non-secure context
@@ -173,7 +174,7 @@ globalThis.__DSH_TRANSPORT__ = { ownsHost: true };
   } catch (e) {}
 })();
 
-// 3. WebSocket wss:// 安全升级 shim
+// 3. WebSocket wss://-шим безопасного апгрейда
 ${WS_UPGRADE_SHIM}
 </script>`;
 

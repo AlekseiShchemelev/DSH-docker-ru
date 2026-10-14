@@ -1,16 +1,18 @@
 /**
- * P6 回归测试：patch-yaml.cjs（外科手术式条目删除 + 安全闸）。
+ * P6 регрессионный тест: patch-yaml.cjs (хирургическое удаление записей + предохранитель).
  *
- * 覆盖：
- *   A. 只删命中条目，其余字节**逐字保留**（含注释、空行、CRLF、`!!js` 表达式）
- *   B. 无命中时返回内容与原文字节完全一致
- *   C. 真实场景：删除历史遗留的 dsh-browser-desktop 条目后，llm-pi-ai / ui-theme /
- *      agent-default-model（DSH 设置与模型 provider 配置）必须原样保留
- *   D. 安全闸拦下"会丢失非目标条目"的改写
- *   E. 安全闸拦下"受保护条目（llm-pi-ai）被删"
- *   F. 安全闸拦下"结果不是合法 YAML 序列"
+ * Покрытие:
+ *   A. удаляются только попавшие под критерий записи, остальные байты **сохраняются дословно**
+ *      (комментарии, пустые строки, CRLF, `!!js`-выражения)
+ *   B. без совпадений результат байт-в-байт совпадает с исходником
+ *   C. реальный сценарий: после удаления исторической записи dsh-browser-desktop записи
+ *      llm-pi-ai / ui-theme / agent-default-model (настройки DSH и конфиг model-provider)
+ *      обязаны остаться как есть
+ *   D. предохранитель блокирует перезапись, «теряющую нецелевые записи»
+ *   E. предохранитель блокирует удаление «защищённой записи (llm-pi-ai)»
+ *   F. предохранитель блокирует «результат не является корректной YAML-последовательностью»
  *
- * 用法: node scripts/patch-protect-test.mjs
+ * Запуск: node scripts/patch-protect-test.mjs
  */
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -59,59 +61,59 @@ const REAL_PATCH = [
   ''
 ].join('\n');
 
-console.log('\n=== A. 外科手术式删除：其余字节逐字保留 ===');
+console.log('\n=== A. Хирургическое удаление: остальные байты сохраняются дословно ===');
 const rA = removePatchEntries(REAL_PATCH, (b) => b.includes('dsh-browser-desktop'));
-ok(rA.removed === 1, `删除了 1 个条目（实际 ${rA.removed}）`);
-ok(!rA.text.includes('dsh-browser-desktop'), '目标条目已移除');
-ok(rA.text.includes('llm-pi-ai') && rA.text.includes('hy4-preview'), 'llm-pi-ai / hy4-preview 完整保留');
-ok(rA.text.includes('agent-default-model'), '后续条目保留');
-ok(rA.text.startsWith('# Your patch layer'), '文件头注释保留');
-// 期望结果 = 原文精确减去那 4 行条目
+ok(rA.removed === 1, `удалена 1 запись (факт ${rA.removed})`);
+ok(!rA.text.includes('dsh-browser-desktop'), 'целевая запись удалена');
+ok(rA.text.includes('llm-pi-ai') && rA.text.includes('hy4-preview'), 'llm-pi-ai / hy4-preview полностью сохранены');
+ok(rA.text.includes('agent-default-model'), 'последующие записи сохранены');
+ok(rA.text.startsWith('# Your patch layer'), 'комментарий в начале файла сохранён');
+// Ожидаемый результат = исходный текст минус ровно эти 4 строки записи
 const expectedA = REAL_PATCH.replace(
   '- id: dsh-browser-desktop\n  name: "@dsh-custom/dsh-browser-desktop"\n  config:\n    enabled: true\n',
   ''
 );
-ok(rA.text === expectedA, '结果与"原文减去该条目"逐字节一致');
+ok(rA.text === expectedA, 'результат байт-в-байт равен «исходник минус эта запись»');
 
-console.log('\n=== B. 无命中时字节完全不变 ===');
+console.log('\n=== B. Без совпадений байты полностью не меняются ===');
 const rB = removePatchEntries(REAL_PATCH, () => false);
-ok(rB.removed === 0 && rB.text === REAL_PATCH, '无命中 ⇒ 原文不变（字节级）');
+ok(rB.removed === 0 && rB.text === REAL_PATCH, 'без совпадений ⇒ исходник не меняется (беительно)');
 const rB2 = removePatchEntries('', () => true);
-ok(rB2.removed === 0 && rB2.text === '', '空内容不报错且不变');
+ok(rB2.removed === 0 && rB2.text === '', 'пустой контент не вызывает ошибки и не меняется');
 
-console.log('\n=== B2. CRLF 与嵌套 insert 结构 ===');
+console.log('\n=== B2. CRLF и вложенная структура insert ===');
 const crlf = '# c\r\n- id: keep\r\n  disabled: true\r\n- insert:\r\n    - id: drop-me\r\n      name: drop-me\r\n- id: tail\r\n';
 const rCrlf = removePatchEntries(crlf, (b) => b.includes('drop-me'));
-ok(rCrlf.removed === 1 && rCrlf.text.includes('keep') && rCrlf.text.includes('tail'), 'CRLF 下正确删除嵌套 insert 条目');
-ok(rCrlf.text.includes('\r\n'), 'CRLF 行尾被保留');
-ok(!rCrlf.text.includes('drop-me'), '目标嵌套条目已移除');
+ok(rCrlf.removed === 1 && rCrlf.text.includes('keep') && rCrlf.text.includes('tail'), 'при CRLF корректно удаляется вложенная запись insert');
+ok(rCrlf.text.includes('\r\n'), 'окончания строк CRLF сохранены');
+ok(!rCrlf.text.includes('drop-me'), 'целевая вложенная запись удалена');
 
-console.log('\n=== C. 真实场景：保留 DSH 设置与模型配置 ===');
+console.log('\n=== C. Реальный сценарий: сохраняются настройки DSH и конфиг моделей ===');
 const rC = removePatchEntries(REAL_PATCH, (b) => b.includes('dsh-browser-desktop'));
 const idsAfter = topLevelEntryIds(rC.text);
 ok(JSON.stringify(idsAfter) === JSON.stringify(['ui-settings-general', 'ui-theme', 'llm-pi-ai', 'agent-default-model']),
-  `顶层条目 id 完整（${idsAfter.join(', ')}）`);
-ok(!assertPatchSafeGuarded(rC.text), '安全闸对正常结果放行');
+  `id верхнеуровневых записей полны (${idsAfter.join(', ')})`);
+ok(!assertPatchSafeGuarded(rC.text), 'предохранитель пропускает корректный результат');
 
 function assertPatchSafeGuarded(after) {
   try { assertPatchSafe({ before: REAL_PATCH, after, removedIds: ['dsh-browser-desktop'] }); return null; } catch (e) { return e.message; }
 }
 
-console.log('\n=== D. 安全闸：丢失非目标条目必须拦下 ===');
+console.log('\n=== D. Предохранитель: потерю нецелевой записи обязан блокировать ===');
 const brokenD = REAL_PATCH.replace(/- id: ui-theme[\s\S]*?preference: light\n/, '');
 const msgD = throws(() => assertPatchSafe({ before: REAL_PATCH, after: brokenD, removedIds: ['dsh-browser-desktop'] }));
-ok(Boolean(msgD) && /ui-theme/.test(msgD), `拦下并点名丢失条目（${String(msgD).slice(0, 60)}…）`);
+ok(Boolean(msgD) && /ui-theme/.test(msgD), `блокировка с указанием потерянной записи (${String(msgD).slice(0, 60)}…)`);
 
-console.log('\n=== E. 安全闸：受保护条目 llm-pi-ai 被删必须拦下 ===');
+console.log('\n=== E. Предохранитель: удаление защищённой llm-pi-ai должно блокироваться ===');
 const brokenE = REAL_PATCH.replace(/- id: llm-pi-ai[\s\S]*?hy4-preview\n/, '');
 const msgE = throws(() => assertPatchSafe({ before: REAL_PATCH, after: brokenE, removedIds: ['dsh-browser-desktop'] }));
-ok(Boolean(msgE) && /llm-pi-ai/.test(msgE), '拦下 llm-pi-ai 丢失');
-ok(protectedPatchIds().includes('llm-pi-ai'), '默认保护清单包含 llm-pi-ai');
+ok(Boolean(msgE) && /llm-pi-ai/.test(msgE), 'блокировка потери llm-pi-ai');
+ok(protectedPatchIds().includes('llm-pi-ai'), 'список защиты по умолчанию содержит llm-pi-ai');
 
-console.log('\n=== F. 安全闸：非法文档形态必须拦下 ===');
+console.log('\n=== F. Предохранитель: недопустимый вид документа должен блокироваться ===');
 const msgF = throws(() => assertPatchSafe({ before: REAL_PATCH, after: 'this: is a mapping\n', removedIds: [] }));
-ok(Boolean(msgF), '拦下"结果不是顶层序列"');
-ok(looksLikePatchDocument('[]') && looksLikePatchDocument('- id: a\n') && !looksLikePatchDocument('a: b\n'), 'looksLikePatchDocument 判定正确');
+ok(Boolean(msgF), 'блокировка «результат не является верхнеуровневой последовательностью»');
+ok(looksLikePatchDocument('[]') && looksLikePatchDocument('- id: a\n') && !looksLikePatchDocument('a: b\n'), 'looksLikePatchDocument определяет корректно');
 
-console.log(`\n===== 汇总: 通过 ${pass} / 失败 ${fail} =====`);
+console.log(`\n===== Итог: пройдено ${pass} / провалено ${fail} =====`);
 process.exit(fail ? 1 : 0);

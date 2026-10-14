@@ -1,12 +1,13 @@
 /**
- * 回归测试：DSH 版本适配矩阵的「单一数据源」一致性。
+ * Регрессионный тест: согласованность «единого источника данных» матрицы адаптации версий DSH.
  *
- * 背景：adaptedVersions 曾在 version.json / version-service.js / dsh-manager.js 三处各写一份，
- * 升级到 0.1.7-alpha.1/alpha.2 时漏改 dsh-manager.js，导致管理后台把当前运行版本误判为
- * 「未经特殊适配」；同时 admin.html 里 `hubCompatRecommended` 只被 getElementById 引用、
- * 却没有对应 id，导致「推荐核心」永远停在硬编码旧值。
+ * Предыстория: adaptedVersions раньше писался в трёх местах — version.json / version-service.js /
+ * dsh-manager.js; при апгрейде до 0.1.7-alpha.1/alpha.2 про dsh-manager.js забыли, из-за чего
+ * панель управления ошибочно считала текущую версию «без специальной адаптации»; при этом
+ * в admin.html `hubCompatRecommended` упоминался лишь в getElementById, а соответствующего id
+ * не было — «рекомендуемое ядро» навсегда висело на жёстко пробитом старом значении.
  *
- * 用法: node scripts/version-matrix-sync-test.mjs
+ * Запуск: node scripts/version-matrix-sync-test.mjs
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,70 +31,72 @@ const adminSrc = fs.readFileSync(path.join(root, 'gateway/public/admin.html'), '
 
 const uniq = (a) => [...new Set(a)];
 
-console.log('\n=== A. version.json 自身一致性 ===');
-ok(typeof recommended === 'string' && recommended.length > 0, `recommendedDsh 已定义 (${recommended})`);
-ok(adapted.includes(recommended), `adaptedVersions 包含 recommendedDsh (${recommended})`);
-ok(adapted[0] === recommended, `adaptedVersions 置顶项为 recommendedDsh (${adapted[0]})`);
-ok(adapted.includes('0.2.1-alpha.2'), 'adaptedVersions 包含 0.2.1-alpha.2');
-ok(adapted.includes('0.2.1-alpha.1'), 'adaptedVersions 保留上一版 0.2.1-alpha.1');
-ok(adapted.includes('0.2.0-rc.2'), 'adaptedVersions 保留上一版 0.2.0-rc.2');
-ok(adapted.includes('0.1.7-rc.2') && adapted.includes('0.1.7-rc.1') && adapted.includes('0.1.7-alpha.2') && adapted.includes('0.1.7-alpha.1'), 'adaptedVersions 包含 0.1.7-rc.2 / 0.1.7-rc.1 / 0.1.7-alpha.2 / 0.1.7-alpha.1');
-ok(meta?.supply?.dshVersion && adapted.includes(meta.supply.dshVersion), `supply.dshVersion 在已适配列表内 (${meta?.supply?.dshVersion})`);
+console.log('\n=== A. Внутренняя согласованность version.json ===');
+ok(typeof recommended === 'string' && recommended.length > 0, `recommendedDsh задан (${recommended})`);
+ok(adapted.includes(recommended), `adaptedVersions содержит recommendedDsh (${recommended})`);
+ok(adapted[0] === recommended, `первым в adaptedVersions стоит recommendedDsh (${adapted[0]})`);
+ok(adapted.includes('0.2.1-alpha.2'), 'adaptedVersions содержит 0.2.1-alpha.2');
+ok(adapted.includes('0.2.1-alpha.1'), 'adaptedVersions сохраняет предыдущую 0.2.1-alpha.1');
+ok(adapted.includes('0.2.0-rc.2'), 'adaptedVersions сохраняет предыдущую 0.2.0-rc.2');
+ok(adapted.includes('0.1.7-rc.2') && adapted.includes('0.1.7-rc.1') && adapted.includes('0.1.7-alpha.2') && adapted.includes('0.1.7-alpha.1'), 'adaptedVersions содержит 0.1.7-rc.2 / 0.1.7-rc.1 / 0.1.7-alpha.2 / 0.1.7-alpha.1');
+ok(meta?.supply?.dshVersion && adapted.includes(meta.supply.dshVersion), `supply.dshVersion входит в список адаптированных (${meta?.supply?.dshVersion})`);
 
-console.log('\n=== B. dsh-manager.js 兜底清单必须与 version.json 同步 ===');
+console.log('\n=== B. Фолбэк-список в dsh-manager.js обязан совпадать с version.json ===');
 const dmBlock = dshSrc.match(/const DEFAULT_ADAPTED_VERSIONS = \[([\s\S]*?)\];/);
-ok(Boolean(dmBlock), '找到 DEFAULT_ADAPTED_VERSIONS 定义');
+ok(Boolean(dmBlock), 'найдено определение DEFAULT_ADAPTED_VERSIONS');
 const dmList = dmBlock ? uniq([...dmBlock[1].matchAll(/'([^']+)'/g)].map(m => m[1])) : [];
-for (const v of adapted) ok(dmList.includes(v), `dsh-manager 兜底包含 ${v}`);
-ok(dmList.includes(recommended), `dsh-manager 兜底包含 recommendedDsh (${recommended})`);
-ok(JSON.stringify(dmList) === JSON.stringify(adapted), 'dsh-manager 兜底清单与 version.json 逐字节一致');
+for (const v of adapted) ok(dmList.includes(v), `фолбэк dsh-manager содержит ${v}`);
+ok(dmList.includes(recommended), `фолбэк dsh-manager содержит recommendedDsh (${recommended})`);
+ok(JSON.stringify(dmList) === JSON.stringify(adapted), 'фолбэк dsh-manager совпадает с version.json побайтово');
 
-console.log('\n=== C. version-service.js 兜底清单必须与 version.json 同步 ===');
+console.log('\n=== C. Фолбэк-список в version-service.js обязан совпадать с version.json ===');
 const vsBlock = vsSrc.match(/adaptedVersions:\s*\[([\s\S]*?)\]/);
 const vsList = vsBlock ? uniq([...vsBlock[1].matchAll(/'([^']+)'/g)].map(m => m[1])) : [];
-ok(vsList.includes(recommended), `version-service getLocalMeta 兜底包含 recommendedDsh (${recommended})`);
-ok(!vsList.length || vsList.every(v => adapted.includes(v)), 'version-service getLocalMeta 兜底无多余版本');
-ok(JSON.stringify(vsList) === JSON.stringify(adapted), 'version-service getLocalMeta 兜底清单与 version.json 逐字节一致');
+ok(vsList.includes(recommended), `фолбэк version-service getLocalMeta содержит recommendedDsh (${recommended})`);
+ok(!vsList.length || vsList.every(v => adapted.includes(v)), 'в фолбэке version-service getLocalMeta нет лишних версий');
+ok(JSON.stringify(vsList) === JSON.stringify(adapted), 'фолбэк version-service getLocalMeta совпадает с version.json побайтово');
 
 const vsEvalBlock = vsSrc.match(/const adapted = m\.compatibility\?\.adaptedVersions \|\| \[([\s\S]*?)\];/);
 const vsEvalList = vsEvalBlock ? uniq([...vsEvalBlock[1].matchAll(/'([^']+)'/g)].map(m => m[1])) : [];
-ok(vsEvalList.includes(recommended), `version-service evaluateTargetVersion 兜底包含 recommendedDsh (${recommended})`);
-ok(JSON.stringify(vsEvalList) === JSON.stringify(adapted), 'version-service evaluateTargetVersion 兜底清单与 version.json 逐字节一致');
+ok(vsEvalList.includes(recommended), `фолбэк version-service evaluateTargetVersion содержит recommendedDsh (${recommended})`);
+ok(JSON.stringify(vsEvalList) === JSON.stringify(adapted), 'фолбэк version-service evaluateTargetVersion совпадает с version.json побайтово');
 
-console.log('\n=== D. admin.html 前端兜底 / 静态默认值 ===');
+console.log('\n=== D. Фронтенд-фолбэки / статические значения по умолчанию в admin.html ===');
 const fbLists = [
   ...[...adminSrc.matchAll(/const adaptedList = compat\.adaptedVersions \|\| \[([^\]]*)\]/g)].map(m => m[1]),
   ...[...adminSrc.matchAll(/availableAdaptedVersions = data\.adaptedVersions \|\| \[([^\]]*)\]/g)].map(m => m[1]),
 ];
-ok(fbLists.length >= 3, `找到 ${fbLists.length} 处 adaptedVersions 兜底数组 (期望 ≥3)`);
+ok(fbLists.length >= 3, `найдено ${fbLists.length} массивов-фолбэков adaptedVersions (ожидается ≥3)`);
 for (const [i, raw] of fbLists.entries()) {
   const list = uniq([...raw.matchAll(/'([^']+)'/g)].map(m => m[1]));
-  ok(list.includes(recommended), `admin.html 兜底#${i + 1} 包含 recommendedDsh`);
-  ok(JSON.stringify(list) === JSON.stringify(adapted), `admin.html 兜底#${i + 1} 与 version.json 逐字节一致`);
+  ok(list.includes(recommended), `фолбэк admin.html #${i + 1} содержит recommendedDsh`);
+  ok(JSON.stringify(list) === JSON.stringify(adapted), `фолбэк admin.html #${i + 1} совпадает с version.json побайтово`);
 }
 for (const re of [/recommendedDsh \|\| '([^']+)'/, /supportedDshRange \|\| '([^']+)'/]) {
   const all = [...adminSrc.matchAll(new RegExp(re.source, 'g'))].map(m => m[1]);
-  ok(all.length > 0 && all.every(v => !v.includes('0.2.0-rc.2') && !v.includes('<=0.2.0-rc.2')), `前端兜底不含上一版推荐值或旧区间 (命中 ${all.length} 处)`);
+  ok(all.length > 0 && all.every(v => !v.includes('0.2.0-rc.2') && !v.includes('<=0.2.0-rc.2')), `в фронтенд-фолбэке нет предыдущего рекомендуемого значения или старого диапазона (найдено ${all.length})`);
 }
 const recPattern = new RegExp(`compat\\.recommendedDsh \\|\\| '(?!${recommended.replace(/\\./g, '\\.')})`);
-ok(!recPattern.test(adminSrc), `recommendedDsh 兜底为 ${recommended}`);
+ok(!recPattern.test(adminSrc), `фолбэк recommendedDsh равен ${recommended}`);
 const chipCount = (adminSrc.match(new RegExp(`>${recommended.replace(/\./g, '\\.')}</span>`, 'g')) || []).length;
-ok(chipCount >= 2, `静态适配 chips 含 ${recommended} (${chipCount} 处)`);
-// 回归：升级推荐核心时必须「置顶新增」而不是「替换掉」上一版推荐，
-// 否则冷启动静态页面（API 返回前）会漏展示上一版已深度适配的核心。
+ok(chipCount >= 2, `статически адаптированные чипы содержат ${recommended} (${chipCount} шт.)`);
+// Регрессия: при апгрейде рекомендуемого ядра новый добавляется «сверху», а НЕ заменяет
+// предыдущую рекомендацию, — иначе на статичной странице холодного старта (до прихода API)
+// не будет видно предыдущее глубоко адаптированное ядро.
 const prevRecommended = '0.2.0-rc.2';
 const prevChipCount = (adminSrc.match(new RegExp(`>${prevRecommended.replace(/\./g, '\\.')}</span>`, 'g')) || []).length;
-ok(prevChipCount >= 2, `静态适配 chips 保留上一推荐版本 ${prevRecommended} (${prevChipCount} 处)`);
+ok(prevChipCount >= 2, `статически адаптированные чипы сохраняют предыдущую рекомендацию ${prevRecommended} (${prevChipCount} шт.)`);
 
-console.log('\n=== E. admin.html 所有 getElementById 引用必须有对应 id ===');
+console.log('\n=== E. Каждый getElementById в admin.html обязан иметь соответствующий id ===');
 const ids = new Set([...adminSrc.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]));
 const refs = uniq([...adminSrc.matchAll(/getElementById\(['"]([^'"]+)['"]\)/g)].map(m => m[1]));
-// 允许清单：settingsTab 是 `getElementById('settingsTab') || getElementById('tab-settings')`
-// 的有意兜底写法，元素不存在属预期。
+// Разрешённый список: settingsTab — это осознанный фолбэк
+// `getElementById('settingsTab') || getElementById('tab-settings')`;
+// отсутствие элемента здесь ожидаемо.
 const OPTIONAL_IDS = new Set(['settingsTab']);
 const missing = refs.filter(r => !ids.has(r) && !OPTIONAL_IDS.has(r));
-ok(missing.length === 0, `无悬空引用${missing.length ? ' -> ' + missing.join(', ') : ''}`);
-ok(ids.has('hubCompatRecommended'), 'id="hubCompatRecommended" 存在（推荐核心可被更新）');
+ok(missing.length === 0, `нет «висячих» ссылок${missing.length ? ' -> ' + missing.join(', ') : ''}`);
+ok(ids.has('hubCompatRecommended'), 'id="hubCompatRecommended" существует (рекомендуемое ядро обновляемо)');
 
 console.log(`\n[version-matrix-sync] pass=${pass} fail=${fail}`);
 process.exit(fail === 0 ? 0 : 1);

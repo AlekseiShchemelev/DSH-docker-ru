@@ -1,28 +1,35 @@
 # ========================================================
-# deepseek-harness 预装插件清单 (plugins.market.list)
-# 每行一个 npm 包名或 Git 仓库。
-# 构建时若开启 PREINSTALL_PLUGINS=1 (或使用 ./build.sh --market)，
-# 将自动将本列表中的插件预装进镜像 (镜像名 deepseek-harness-docker:latest-market)。
+# Список предустанавливаемых плагинов deepseek-harness (plugins.market.list)
+# Одна строка = одно имя npm-пакета или Git-репозиторий.
+# При сборке с PREINSTALL_PLUGINS=1 (или через ./build.sh --market)
+# плагины из этого списка будут предустановлены в образ
+# (имя образа deepseek-harness-docker:latest-market).
 # ========================================================
 
-# 版本策略：
-#   - 写【精确版本】(如 foo@1.2.3)：可复现构建，升级时手动改版本号；
-#   - 写 @latest（或裸包名）：每次构建都拉取当时最新版。
-#     注意：Docker 层缓存会复用旧版本，写 @latest 时必须配合缓存刷新
-#     （Dockerfile 的 MARKET_REFRESH build-arg，CI 每次传唯一 run_id），
-#     否则 plugins.market.list 内容没变时这一层根本不会重新执行。
-# 本清单中的预装插件均有意跟随 @latest：更新频繁，预装版需始终最新。
-# 若某个插件改回精确版本，请同步更新 version.json#supply.marketPlugins。
+# Стратегия версий:
+#   - писать**точную версию** (например foo@1.2.3): воспроизводимая сборка, при апгрейде
+#     номер меняется руками;
+#   - писать @latest (или голое имя пакета): каждая сборка тянет актуальную версию.
+#     Внимание: кэш слоёв Docker переиспользует старые версии, поэтому при @latest обязателен
+#     сброс кэша (build-arg MARKET_REFRESH из Dockerfile, в CI каждый раз уникальный run_id),
+#     иначе при неизменном содержимом plugins.market.list этот слой вообще не пересоберётся.
+# Предустанавливаемые плагины здесь намеренно все на @latest: они часто обновляются,
+# и предустановленная версия всегда должна быть свежайшей.
+# Если какой-то плагин переводят на точную версию, синхронно обновите version.json#supply.marketPlugins.
 
-# 1. DSH 社区应用市场插件
-# 项目地址: https://github.com/dsh-market/dsh-market
-# 已知限制（0.1.7）：dshmarket@1.55.0 仍调用已移除的 settings.register/get/watch，
-# 其「市场设置」命名空间注册失败（宿主不崩、路由正常），一键重启按钮默认开启；
-# 由 Home 级补丁 $DSH_HOME/cordis.patch.yml 的 dsh-market.config.allowRestart:false 压制。
+# 1. Плагин прикладного маркетплейса DSH-сообщества
+# Адрес проекта: https://github.com/dsh-market/dsh-market
+# Известное ограничение (0.1.7): dshmarket@1.55.0 всё ещё вызывает снятые
+# settings.register/get/watch — регистрация его «настроек маркетплейса» падает
+# (хост не падает, маршруты нормальные), кнопка «перезапуск в один клик» включена по
+# умолчанию; подавляется через dsh-market.config.allowRestart:false в Home-патче
+# $DSH_HOME/cordis.patch.yml.
 dshmarket@latest
 
-# 2. 思考强度调节插件
-# 项目地址: https://github.com/hytime/dsh-thinking-effort#readme
-# 已知限制（0.1.7）：宿主半依赖 settings.get 能力探测，0.1.7 下判为不可用并优雅降级
-# （打印 settings capability unavailable），不崩但「自动补齐思考强度默认值」不生效。
+# 2. Плагин регулировки уровня «усилия размышления»
+# Адрес проекта: https://github.com/hytime/dsh-thinking-effort#readme
+# Известное ограничение (0.1.7): хост частично полагается на capability-зонд settings.get,
+# в 0.1.7 признаёт его недоступным и мягко деградирует
+# (печатает settings capability unavailable), не падает, но «автодополнение значения уровня
+# размышления по умолчанию» не действует.
 @hytime/dsh-thinking-effort@latest

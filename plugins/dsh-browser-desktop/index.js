@@ -5,15 +5,16 @@ import path from 'node:path';
 export const name = 'dsh-browser-desktop';
 export const inject = ['tools', 'systemPrompt', 'settings'];
 
-// 插件自身【不再向 DSH 设置中心声明任何可配置字段】：
-// 浏览器/桌面的全部配置权威 = 网关持久化文件 gateway.config.json
-// （Admin「浏览器与桌面控制」页是唯一配置入口）。
-// 保留一个空 Schema 是为了让 DSH 的插件配置渲染器没有任何字段可展示，
-// 从根源上杜绝「看着能改、其实改了没用」的幽灵配置表单。
+// Плагин **сам больше не объявляет ни одного настраиваемого поля** в центре настроек DSH:
+// весь авторитет конфигурации браузера/рабочего стола = файл gateway.config.json, сохраняемый шлюзом
+// (страница Admin «Браузер и рабочий стол» — единственная точка конфигурации).
+// Пустая Schema оставлена, чтобы у рендера конфигурации плагина в DSH не было ни одного поля —
+// с самого начала исключается «призрачная» форма: выглядит изменяемой, а изменение ни на что не влияет.
 export const Config = z.object({});
 
 export function apply(ctx, config = {}) {
-  // 实时配置状态，初始由系统注入，随设置中心热更新动态刷新
+  // Живое состояние конфигурации, изначально передаётся системой, динамически обновляется
+  // при горячем обновлении центра настроек
   let activeConfig = {
     enabled: true,
     resolution: '1920x1080',
@@ -27,7 +28,8 @@ export function apply(ctx, config = {}) {
     ...config
   };
 
-  // enabled 主开关的可注销注册句柄：工具 disposer 数组 / 提示词段 disposer
+  // Отзывные handle при отключении по главному переключателю enabled:
+  // массив disposer'ов инструментов / disposer секции промпта
   const registeredTools = [];
   let registeredPrompt = null;
   let enabledState = null;
@@ -36,11 +38,12 @@ export function apply(ctx, config = {}) {
   const cdpBase = () => `http://127.0.0.1:${cdpPort()}`;
   const vncPath = () => activeConfig.vncPath || '/vnc';
 
-  // 内部网关管理接口基地址 (动态读取 PROXY_PORT)
+  // Базовый адрес внутренних интерфейсов управления шлюзом (динамически читается PROXY_PORT)
   const gatewayControlUrl = () => `http://127.0.0.1:${process.env.PROXY_PORT || 3080}/__internal/desktop`;
 
-  // 内部接口共享密钥（M14）：网关启动时生成 0600 文件，插件每次调用前读取并带上。
-  // 只有容器内的插件能读到该文件，因此外部即使能连到网关也无法调用内部接口。
+  // Общий ключ внутренних интерфейсов (M14): шлюз при старте создаёт файл 0600, плагин
+  // читает и передаёт его перед каждым вызовом. Файл доступен только плагинам внутри
+  // контейнера, поэтому даже при внешнем доступе к шлюзу внутренние интерфейсы не вызвать.
   const INTERNAL_TOKEN_FILE = process.env.DSH_INTERNAL_TOKEN_FILE || '/root/.dsh/.internal-api-token';
   let cachedInternalToken = null;
   function readInternalToken() {
@@ -60,34 +63,38 @@ export function apply(ctx, config = {}) {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        // 超时兜底：防止桌面管理端异常挂起时工具调用永久阻塞
-        // (start 在极端情况下需等待陈旧显示/端口释放，故留 30s 余量)
+        // Страховка по тайм-ауту: не дать вызову инструмента повиснуть вечно, если менеджер
+        // рабочего стола аномально завис
+        // (start в крайних случаях ждёт освобождения старого дисплея/портов, поэтому запас в 30 с)
         signal: AbortSignal.timeout(30000)
       });
       let data = null;
       try { data = await res.json(); } catch {}
       if (!data) {
-        return { ok: false, error: `桌面管理接口返回空响应 (HTTP ${res.status})` };
+        return { ok: false, error: `Интерфейс управления рабочим столом вернул пустой ответ (HTTP ${res.status})` };
       }
       if (!res.ok && data.ok !== false) {
-        return { ok: false, error: `桌面管理接口返回 HTTP ${res.status}` };
+        return { ok: false, error: `Интерфейс управления рабочим столом вернул HTTP ${res.status}` };
       }
       return data;
     } catch (err) {
-      // R1-c：停用与在途调用的竞态——若本次调用期间浏览器被彻底停用，把底层网络/CDP
-      // 报错归一成明确的"已停用"提示，避免被误判成浏览器故障。
+      // R1-c: гонка между отключением и идущим вызовом — если браузер был полностью отключён
+      // за время вызова, приводим ошибку нижележащей сети/CDP к однозначному «отключён»
+      // и не даём её спутать с ошибкой браузера.
       refreshAuthoritativeConfig();
       if (activeConfig.enabled === false) {
-        return { ok: false, error: '容器图形浏览器桌面已在管理后台被彻底停用，本次操作已中止' };
+        return { ok: false, error: 'Контейнерный графический браузер полностью отключён в панели управления, операция прервана' };
       }
       return { ok: false, error: err.message };
     }
   }
 
-  // ── 权威配置：唯一来源是网关（Admin「浏览器与桌面控制」页） ─────────
-  // 本插件【不再注册】DSH 设置命名空间（此前会渲染出一个改了也没用的"幽灵配置"表单）。
-  // 旧版本 settings.yaml 里 browser-desktop 段的用户显式设置仅在首次启动时做一次性迁移，
-  // 迁移通过读取【原始 user section】(ctx.settings.section) 完成，无需注册命名空间。
+  // ── Авторитетная конфигурация: единственный источник — шлюз (страница Admin «Браузер и рабочий стол») ─────────
+  // Плагин **не регистрирует** пространство настроек DSH (раньше это рендерило «призрачную форму»,
+  // которую изменишь — а она ни на что не влияет).
+  // Явные настройки пользователя из секции browser-desktop старого settings.yaml мигрируются
+  // однократно при первом запуске: миграция читает **исходную user-section**
+  // (ctx.settings.section), без регистрации пространства имён.
   const LEGACY_MARKER = process.env.BROWSER_DESKTOP_LEGACY_MARKER || '/root/.dsh/.browser-desktop-authority-migrated';
   const LEGACY_MARKER_FALLBACK = process.env.BROWSER_DESKTOP_LEGACY_MARKER_FALLBACK || '/tmp/.browser-desktop-authority-migrated';
   const legacyMigrated = () => fs.existsSync(LEGACY_MARKER) || fs.existsSync(LEGACY_MARKER_FALLBACK);
@@ -97,8 +104,9 @@ export function apply(ctx, config = {}) {
     try { fs.writeFileSync(LEGACY_MARKER_FALLBACK, content, 'utf8'); } catch {}
   };
 
-  // 读取旧 DSH 设置文档里 browser-desktop 段的原始 user section（只读、不注册命名空间）。
-  // 返回 null 表示该段不存在（或当前 DSH 不提供 section API）。
+  // Чтение исходной user-section секции browser-desktop из старого документа настроек DSH
+  // (только чтение, пространство имён не регистрируется).
+  // null означает, что этой секции нет (или текущий DSH не даёт section API).
   function readLegacySection() {
     try {
       if (!ctx.settings || typeof ctx.settings.section !== 'function') return null;
@@ -109,34 +117,37 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // ── 权威配置：直接读网关持久化配置文件（同步、微秒级、零网络、零轮询） ──
-  // 停/启浏览器是管理动作，会伴随服务重启；插件在【启动时】与【每次工具调用前】读一次文件即可，
-  // 因此完全不需要轮询或文件监听。
+  // ── Авторитетная конфигурация: напрямую читаем файл конфигурации шлюза (синхронно, за микросекунды, ноль сети, ноль поллинга) ──
+  // Включение/отключение браузера — управляющее действие и сопровождается перезапуском сервиса;
+  // плагин читает файл при **запуске** и **перед каждым вызовом инструмента**,
+  // поэтому поллинг или file-watch вообще не нужны.
   const CONFIG_FILE = process.env.GATEWAY_CONFIG_FILE || '/root/.dsh/gateway.config.json';
 
-  // P17：区分「文件不存在」与「文件存在但解析失败」两种情形。
-  //   - 不存在（ENOENT）：全新容器首启、网关尚未落盘 → 保持当前状态，不算异常；
-  //   - 解析失败/读取失败：说明管理员已写好的配置被写坏（或磁盘异常），
-  //     **绝不能**因此回退成"启用"把 AI 工具重新挂上（管理员可能已明确停用），
-  //     这里记录 error 并保持上一次成功读取的快照。
+  // P17: различаем «файла нет» и «файл есть, но не разобрался».
+  //   - нет (ENOENT): первый старт свежего контейнера, шлюз ещё не записал → сохраняем текущее состояние, это не ошибка;
+  //   - ошибка разбора/чтения: готовую конфигурацию администратора кто-то сломал (или сбой диска),
+  //     **ни в коем случае** нельзя откатиться к «включено» и снова повесить инструменты ИИ
+  //     (администратор мог явно отключить); фиксируем error и держим последний успешно прочитанный снапшот.
   let lastGoodAuthoritative = null;
   let configParseErrorLogged = false;
 
-  // 跨进程的"上次成功快照"：进程重启后内存快照会丢，若此时配置文件恰好损坏，
-  // 单靠内存兜底会退回默认的"启用"。这里把最后一次成功读到的 enabled 落盘（0600），
-  // 解析失败时优先回退到它，从而在"管理员已停用 + 配置被写坏 + 重启"下也不会误启用。
+  // Межпроцессный «последний успешный снапшот»: после перезапуска процессы в памяти снапшот
+  // теряется, и если в этот момент файл конфигурации вдруг сломан, только память откатит к дефолту
+  // «включено». Здесь последний успешно прочитанный enabled пишется на диск (0600),
+  // и при ошибке разбора в приоритете откатываемся к нему — так при «админ отключил + конфиг сломан
+  // + перезапуск» тоже не произойдёт ошибочного включения.
   const STATE_FILE = process.env.BROWSER_DESKTOP_STATE_FILE || '/root/.dsh/.browser-desktop-last-state.json';
   function persistLastGood(snapshot) {
     try {
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
       fs.writeFileSync(STATE_FILE, JSON.stringify({ enabled: snapshot.enabled, savedAt: new Date().toISOString() }) + '\n', { mode: 0o600 });
-    } catch (e) { /* 状态文件写失败不影响主流程 */ }
+    } catch (e) { /* Сбой записи файла состояния не влияет на основной ход */ }
   }
   function loadPersistedLastGood() {
     try {
       const o = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
       if (typeof o.enabled === 'boolean') return { enabled: o.enabled };
-    } catch (e) { /* 无状态文件或已损坏 */ }
+    } catch (e) { /* Файла состояния нет или он сломан */ }
     return null;
   }
   function fallbackSnapshot() {
@@ -150,11 +161,11 @@ export function apply(ctx, config = {}) {
     } catch (e) {
       if (e && e.code !== 'ENOENT') {
         if (!configParseErrorLogged) {
-          console.error('[dsh-browser-desktop] 读取权威配置失败，保持上次成功快照:', e.message);
+          console.error('[dsh-browser-desktop] Ошибка чтения авторитетной конфигурации, держим последний успешный снапшот:', e.message);
           configParseErrorLogged = true;
         }
       }
-      return fallbackSnapshot(); // 不存在 → null（沿用当前状态）；读失败 → 上次成功快照
+      return fallbackSnapshot(); // файла нет → null (используем текущее состояние); ошибка чтения → последний успешный снапшот
     }
 
     let cfg;
@@ -162,7 +173,7 @@ export function apply(ctx, config = {}) {
       cfg = JSON.parse(raw);
     } catch (e) {
       if (!configParseErrorLogged) {
-        console.error('[dsh-browser-desktop] 权威配置解析失败（JSON 损坏），保持上次成功快照而非回退为启用:', e.message);
+        console.error('[dsh-browser-desktop] Ошибка разбора авторитетной конфигурации (JSON повреждён), держим последний успешный снапшот, а не откатываемся к «включено»:', e.message);
         configParseErrorLogged = true;
       }
       return fallbackSnapshot();
@@ -187,42 +198,46 @@ export function apply(ctx, config = {}) {
     return snapshot;
   }
 
-  // 刷新权威配置并据其同步工具/提示词的注册状态（同步执行，调用方无需 await）
+  // Обновляет авторитетную конфигурацию и синхронизирует с ней регистрацию инструментов/промпта
+  // (синхронно, вызывающей стороне не нужно await)
   function refreshAuthoritativeConfig() {
     const next = readAuthoritativeConfig();
     if (next) activeConfig = { ...activeConfig, ...next };
-    // 关键：即使读不到文件（全新容器首次启动、文件尚未生成）也要按当前状态应用，
-    // 否则会出现"插件什么都不注册、AI 永久没有浏览器工具"的严重故障。
+    // Ключевой момент: даже если файл не прочитался (первый старт свежего контейнера, файл ещё
+    // не создан) всё равно применяем текущее состояние — иначе плагин не зарегистрирует ничего
+    // и у ИИ никогда не будет инструментов браузера (тяжёлый сбой).
     applyEnabledState(activeConfig.enabled !== false);
     return activeConfig;
   }
 
-  // 一次性迁移：把旧 DSH 设置文档 browser-desktop 段里的【用户显式设置过】的值搬到网关权威配置
+  // Одноразовая миграция: явные пользовательские значения из секции browser-desktop старого
+  // документа настроек DSH переносятся в авторитетную конфигурацию шлюза
   async function migrateLegacySettingsOnce() {
     try {
       if (legacyMigrated()) return;
-      // 当前 DSH 不提供 section API（极老版本）→ 保留待下次，不做迁移也不打标记
+      // Текущий DSH не даёт section API (очень старая версия) → ждём до следующего раза,
+      // миграцию не делаем и маркер не ставим
       if (!ctx.settings || typeof ctx.settings.section !== 'function') return;
       const legacy = readLegacySection();
       if (!legacy) { markLegacyMigrated(); return; }
       const patch = {};
       let disableDesktop = false;
-      if (legacy.enabled === false) disableDesktop = true; // 默认值为 true，出现 false 即用户显式关闭
+      if (legacy.enabled === false) disableDesktop = true; // значение по умолчанию true, явный false — выключено пользователем
       if (legacy.screenshotQuality && legacy.screenshotQuality !== 'high') patch.screenshotQuality = legacy.screenshotQuality;
       if (typeof legacy.screenshotDir === 'string' && legacy.screenshotDir.trim()) patch.screenshotDir = legacy.screenshotDir.trim();
       if (legacy.enableSidebarTab === true) patch.enableSidebarTab = true;
 
       if (Object.keys(patch).length) {
         const r = await callDesktopManager('config', patch);
-        console.log('[dsh-browser-desktop] 旧设置已迁移到管理后台权威配置:', JSON.stringify(patch), JSON.stringify(r));
+        console.log('[dsh-browser-desktop] Старые настройки перенесены в авторитетную конфигурацию панели управления:', JSON.stringify(patch), JSON.stringify(r));
       }
       if (disableDesktop) {
         const r = await callDesktopManager('master', { enabled: false });
-        console.log('[dsh-browser-desktop] 旧设置的「已停用」已迁移到管理后台总开关:', JSON.stringify(r));
+        console.log('[dsh-browser-desktop] «Отключено» из старых настроек перенесено в главный переключатель панели управления:', JSON.stringify(r));
       }
       markLegacyMigrated();
     } catch (e) {
-      console.warn('[dsh-browser-desktop] 旧设置迁移失败(已忽略):', e.message);
+      console.warn('[dsh-browser-desktop] Сбой миграции старых настроек (игнорируется):', e.message);
     }
   }
 
@@ -230,7 +245,7 @@ export function apply(ctx, config = {}) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         try { ws.close(); } catch {}
-        reject(new Error('CDP Page.navigate 超时'));
+        reject(new Error('Тайм-аут CDP Page.navigate'));
       }, 4000);
 
       const ws = new WebSocket(webSocketDebuggerUrl);
@@ -242,8 +257,9 @@ export function apply(ctx, config = {}) {
         }));
       };
       ws.onmessage = (event) => {
-        // P6：只有收到【本次请求 id 的响应】才清超时并结算；
-        // 其它 CDP 事件（如 Page.* 通知）不清超时，否则响应一旦丢失 Promise 会永久挂起。
+        // P6: считаем завершённым и снимаем тайм-аут, только получив ответ **с id текущего запроса**;
+        // прочие события CDP (например, уведомления Page.*) тайм-аут не снимают — иначе при потере
+        // ответа Promise зависнет навсегда.
         let msg;
         try { msg = JSON.parse(event.data); } catch (e) {
           clearTimeout(timer);
@@ -264,35 +280,37 @@ export function apply(ctx, config = {}) {
     });
   }
 
-  // 目标 URL 归一化 + 协议白名单：仅允许 http/https，
-  // 阻断 file://（读宿主敏感文件）、data:、javascript:、chrome:// 等协议。
+  // Нормализация целевого URL + whitelist протоколов: только http/https,
+  // блокируются file:// (чтение чувствительных файлов хоста), data:, javascript:, chrome:// и прочие.
   function normalizeTargetUrl(raw) {
     const s = String(raw == null ? '' : raw).trim();
-    if (!s) throw new Error('URL 不能为空');
+    if (!s) throw new Error('URL не может быть пустым');
     const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s);
     const withScheme = hasScheme ? s : `https://${s}`;
     let parsed;
     try { parsed = new URL(withScheme); }
-    catch { throw new Error('URL 格式不合法: ' + s.slice(0, 120)); }
+    catch { throw new Error('Неверный формат URL: ' + s.slice(0, 120)); }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error(`仅支持 http/https 协议（已拒绝 ${parsed.protocol}）: ${s.slice(0, 120)}`);
+      throw new Error(`Поддерживаются только протоколы http/https (${parsed.protocol} отклонён): ${s.slice(0, 120)}`);
     }
-    if (!parsed.hostname) throw new Error('URL 缺少主机名: ' + s.slice(0, 120));
+    if (!parsed.hostname) throw new Error('В URL отсутствует имя хоста: ' + s.slice(0, 120));
     return parsed.toString();
   }
 
   async function openInChromium(url, durationMinutes, signal, customResolution, options = {}) {
     const targetUrl = normalizeTargetUrl(url);
 
-    // 优先采用 AI 显式指定的分辨率，未指定时默认使用插件设置中心配置的分辨率 (默认 1920x1080)
-    // 仅在调用方显式指定分辨率时才覆盖运行分辨率；否则交给网关沿用当前值（避免整桌重启、丢失标签页）
+    // В приоритете разрешение, явно заданное ИИ; иначе — разрешение из конфигурации центра
+    // настроек (по умолчанию 1920x1080)
+    // Разрешение переопределяется, только когда вызывающий явно его задал; в остальных случаях
+    // передаём управление шлюзу с текущим значением (чтобы не перезапускать весь стол и не терять вкладки)
     const explicitRes = typeof customResolution === 'string' && customResolution.trim() ? customResolution.trim().toLowerCase() : null;
     const parts = explicitRes ? explicitRes.split('x') : [];
     const width = parseInt(parts[0]) || undefined;
     const height = parseInt(parts[1]) || undefined;
     const effectiveRes = explicitRes || activeConfig.resolution || '1920x1080';
 
-    // 如果桌面未运行或需要调整分辨率，自动唤醒启动
+    // Если рабочий стол не запущен или нужно скорректировать разрешение — автоматически будим
     const startRes = await callDesktopManager('start', {
       durationMinutes,
       width,
@@ -302,13 +320,13 @@ export function apply(ctx, config = {}) {
       cdpPort: activeConfig.cdpPort
     });
     if (!startRes || startRes.ok === false) {
-      throw new Error(`容器桌面启动失败: ${startRes?.error || '网关无响应'}`);
+      throw new Error(`Запуск контейнерного рабочего стола не удался: ${startRes?.error || 'шлюз не ответил'}`);
     }
 
     let tabId = null;
     let reused = false;
 
-    // 等待 CDP 端口就绪 (若启用 CDP)
+    // Ждём готовности порта CDP (если CDP включён)
     if (activeConfig.enableCdp !== false) {
       let cdpReady = false;
       for (let i = 0; i < 20; i++) {
@@ -320,7 +338,7 @@ export function apply(ctx, config = {}) {
       }
 
       if (!cdpReady) {
-        throw new Error('CDP 调试端口未就绪，浏览器可能启动失败 (可用 browser_control status 查看桌面状态)');
+        throw new Error('Отладочный порт CDP не готов, возможно, браузер не запустился (посмотреть состояние можно через browser_control status)');
       }
 
       const forceNewTab = options.newTab === true;
@@ -337,7 +355,8 @@ export function apply(ctx, config = {}) {
               targetPage = pages.find(p => p.id === options.tabId);
             }
             if (!targetPage && pages.length > 0) {
-              // 优先复用空白页 (about:blank 或 chrome://newtab/)，其次复用已有页面
+              // В приоритете переиспользуем пустую страницу (about:blank или chrome://newtab/),
+              // иначе — уже существующую
               targetPage = pages.find(p => p.url === 'about:blank' || p.url === 'chrome://newtab/') || pages[pages.length - 1];
             }
 
@@ -351,11 +370,11 @@ export function apply(ctx, config = {}) {
             }
           }
         } catch (navErr) {
-          console.warn('[dsh-browser-desktop] 复用标签页导航失败，将降级新建标签页:', navErr.message);
+          console.warn('[dsh-browser-desktop] Сбой навигации с переиспользованием вкладки, деградируем до создания новой:', navErr.message);
         }
       }
 
-      // 若需要新建标签页或复用导航未成功，调用 CDP 新建标签页
+      // Если нужно создать новую вкладку или переиспользованная навигация не удалась — CDP создаёт вкладку
       if (!tabId) {
         const res = await fetch(`${cdpBase()}/json/new?${encodeURIComponent(targetUrl)}`, {
           method: 'PUT',
@@ -370,11 +389,11 @@ export function apply(ctx, config = {}) {
       }
 
       if (!tabId) {
-        throw new Error('未能创建或复用浏览器标签页 (CDP 无可用页面)');
+        throw new Error('Не удалось создать или переиспользовать вкладку браузера (в CDP нет доступных страниц)');
       }
     }
 
-    // 更新心跳时长
+    // Обновляем время «биения»/работы
     if (typeof durationMinutes === 'number' && durationMinutes > 0) {
       await callDesktopManager('keepalive', { durationMinutes });
     }
@@ -389,22 +408,28 @@ export function apply(ctx, config = {}) {
     };
   }
 
-  // 双引擎截图实现：支持画质选择 (high 高/原图, medium 中, low 低)、指定 tabId 与自定义保存路径
+  // Реализация двойного движка скриншотов: выбор качества (high высокое/оригинал, medium среднее,
+  // low низкое), конкретного tabId и своего пути сохранения
   async function captureScreenshotDual(savePath, customQuality, targetTabId, sessionCwd = process.cwd()) {
     const qualityLevel = (customQuality || activeConfig.screenshotQuality || 'high').toLowerCase();
     const isHigh = qualityLevel === 'high';
     const isLow = qualityLevel === 'low';
 
-    // 智能路径处理：
-    // 优先基于当前会话/项目自身的工作区 sessionCwd 进行解析，坚决避免污染容器外部 /workspace 根目录；
-    // 1. 若 AI 传入路径：绝对路径直接使用，相对路径基于当前项目工作区 sessionCwd 解析；
-    // 2. 若 AI 未提供 savePath：在当前项目工作区（或配置的子目录）自动生成时间戳唯一文件名，绝不覆盖历史截图；
-    // 3. 严格尊重 AI 指定的文件扩展名与路径，不再强制将 .png 改名为 .jpg。
+    // Умная обработка пути:
+    // в приоритете интерпретируем путь в рабочей области самой сессии/проекта sessionCwd,
+    // твёрдо избегая засорения корня /workspace вне контейнера;
+    // 1. если ИИ передал путь: абсолютный используем как есть, относительный интерпретируем
+    //    относительно рабочей области проекта sessionCwd;
+    // 2. если ИИ не дал savePath: автоматически генерируем уникальное имя с таймстампом
+    //    в рабочей области проекта (или настроенной поддиректории), никогда не перезаписывая
+    //    прежние скриншоты;
+    // 3. строго уважаем расширение и путь, заданные ИИ, без принудительного переименования .png в .jpg.
     const projectDir = sessionCwd || process.cwd();
     const resolvedProjectDir = path.resolve(projectDir);
 
-    // 真实路径解析：逐级向上找到第一个已存在的祖先目录，再用 realpath 解析，
-    // 从而识破"工作区内符号链接指向工作区外"的越界写法（仅靠字符串前缀比对无法发现）。
+    // Разбор реального пути: поднимаемся по каталогам до первого существующего предка,
+    // затем realpath — так раскрывается обход «symlink внутри рабочей области указывает наружу»
+    // (одной лишь сверки строковых префиксов недостаточно).
     function realParentOf(p) {
       let dir = path.dirname(p);
       for (let i = 0; i < 64; i++) {
@@ -421,14 +446,15 @@ export function apply(ctx, config = {}) {
       return parent === realRoot || parent.startsWith(realRoot + path.sep);
     };
 
-    // screenshotDir 必须落在工作区内，否则忽略该配置（避免把越界目录当作降级写入目标）
+    // screenshotDir обязан лежать в рабочей области, иначе эта настройка игнорируется
+    // (чтобы каталог за пределами рабочей области не становился целью деградации записи)
     let baseDir = resolvedProjectDir;
     if (activeConfig.screenshotDir && activeConfig.screenshotDir.trim()) {
       const candidate = path.resolve(resolvedProjectDir, activeConfig.screenshotDir.trim());
       if (isWithinWorkspace(candidate)) {
         baseDir = candidate;
       } else {
-        console.warn(`[dsh-browser-desktop] screenshotDir 越界，已忽略并回退到工作区根目录: ${activeConfig.screenshotDir}`);
+        console.warn(`[dsh-browser-desktop] screenshotDir за пределами рабочей области, игнорируем и откатываемся к корню рабочей области: ${activeConfig.screenshotDir}`);
       }
     }
 
@@ -437,7 +463,8 @@ export function apply(ctx, config = {}) {
       const trimmed = savePath.trim();
       const resolved = path.isAbsolute(trimmed) ? path.resolve(trimmed) : path.resolve(projectDir, trimmed);
 
-      // 工作区边界沙箱检查：既比对字符串前缀，也比对 realpath（防符号链接逃逸）
+      // Проверка-песочница границ рабочей области: сверяем и строковый префикс, и realpath
+      // (защита от побега через символьную ссылку)
       const withinByPath = resolved === resolvedProjectDir || resolved.startsWith(resolvedProjectDir + path.sep);
       if (!withinByPath || !isWithinWorkspace(resolved)) {
         const safeBase = path.basename(trimmed) || `screenshot-${Date.now()}`;
@@ -446,7 +473,7 @@ export function apply(ctx, config = {}) {
         targetFile = resolved;
       }
 
-      // 如果没有扩展名，根据画质自动补齐合适后缀
+      // Если расширения нет — дописываем подходящее по качеству
       if (!path.extname(targetFile)) {
         targetFile += (isHigh ? '.png' : '.jpg');
       }
@@ -461,13 +488,13 @@ export function apply(ctx, config = {}) {
 
     fs.mkdirSync(path.dirname(targetFile), { recursive: true });
 
-    // 唤醒桌面运行
+    // Будим рабочий стол
     const startRes = await callDesktopManager('start', {});
     if (!startRes || startRes.ok === false) {
-      throw new Error(`容器桌面启动失败: ${startRes?.error || '网关无响应'}`);
+      throw new Error(`Запуск контейнерного рабочего стола не удался: ${startRes?.error || 'шлюз не ответил'}`);
     }
 
-    // 1. 若启用了 CDP，优先尝试 CDP 网页级截图
+    // 1. Если CDP включён — в приоритете скриншот страницы через CDP
     if (activeConfig.enableCdp !== false) {
       try {
         const listRes = await fetch(`${cdpBase()}/json`, { signal: AbortSignal.timeout(1500) });
@@ -490,7 +517,7 @@ export function apply(ctx, config = {}) {
             const wsResult = await new Promise((resolve, reject) => {
               const timer = setTimeout(() => {
                 try { ws.close(); } catch {}
-                reject(new Error('CDP 截图超时'));
+                reject(new Error('Тайм-аут скриншота CDP'));
               }, 5000);
 
               const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -508,7 +535,8 @@ export function apply(ctx, config = {}) {
                 }));
               };
               ws.onmessage = (event) => {
-                // P6：同上 —— 只认本次请求 id（200）的响应，避免误清超时导致永久挂起
+                // P6: то же, что выше — считаем только ответ **с id текущего запроса (200)**,
+                // иначе преждевременный сброс тайм-аута даст вечное зависание
                 let msg;
                 try { msg = JSON.parse(event.data); } catch (e) {
                   clearTimeout(timer);
@@ -528,7 +556,7 @@ export function apply(ctx, config = {}) {
                     title: page.title || '',
                     url: page.url || '',
                     quality: qualityLevel,
-                    engine: `CDP (${captureFormat === 'png' ? 'PNG无损原图' : 'JPEG质量' + (isLow ? '40' : (isHigh ? '95' : '80'))})`,
+                    engine: `CDP (${captureFormat === 'png' ? 'PNG без потерь' : 'качество JPEG' + (isLow ? '40' : (isHigh ? '95' : '80'))})`,
                     status: 'captured'
                   });
                 } catch (e) { reject(e); }
@@ -543,11 +571,11 @@ export function apply(ctx, config = {}) {
           }
         }
       } catch (err) {
-        console.warn('[dsh-browser-desktop] CDP 暂不可达，自动回退到 X11 原生截屏引擎:', err.message);
+        console.warn('[dsh-browser-desktop] CDP временно недоступен, автооткат к нативному движку скриншотов X11:', err.message);
       }
     }
 
-    // 2. 当关闭 CDP 或 CDP 未就绪时：通过 X11 原生截屏引擎 (scrot) 直接抓取 :99 虚拟屏幕
+    // 2. Когда CDP выключен или не готов: нативный движок скриншотов X11 (scrot) снимает виртуальный экран :99
     const display = process.env.DISPLAY || ':99';
     const { spawnSync } = await import('node:child_process');
     const scrotArgs = captureFormat === 'png'
@@ -558,7 +586,7 @@ export function apply(ctx, config = {}) {
     });
 
     if (scrotRes.status !== 0 || !fs.existsSync(targetFile)) {
-      throw new Error(`截屏失败: ${scrotRes.stderr?.toString() || '无法保存图像'}`);
+      throw new Error(`Сбой скриншота: ${scrotRes.stderr?.toString() || 'не удалось сохранить изображение'}`);
     }
 
     const stat = fs.statSync(targetFile);
@@ -568,37 +596,37 @@ export function apply(ctx, config = {}) {
       title: 'Container Desktop Screen',
       url: 'x11://display' + display,
       quality: qualityLevel,
-      engine: `X11 scrot (${captureFormat === 'png' ? 'PNG无损原图' : 'JPEG质量' + (isLow ? '40' : (isHigh ? '95' : '80'))})`,
+      engine: `X11 scrot (${captureFormat === 'png' ? 'PNG без потерь' : 'качество JPEG' + (isLow ? '40' : (isHigh ? '95' : '80'))})`,
       status: 'captured'
     };
   }
 
-  // 工具定义：browser_open (打开网页，支持 AI 决定分辨率、智能复用/新开标签页)
+  // Определение инструмента: browser_open (открыть веб-страницу, ИИ сам выбирает разрешение, умное переиспользование/новая вкладка)
   const browserOpenDef = {
     name: 'browser_open',
-    description: '在容器内置的 Chromium 图形浏览器中打开指定网页。默认优先智能复用当前空白或活跃标签页以节约容器内存（可通过 newTab: true 显式新开标签页）。支持 AI 自主决定分辨率或工作时长。返回当前标签页的 tabId。',
+    description: 'Открыть указанную веб-страницу во встроенном графическом браузере Chromium контейнера. По умолчанию в приоритете умно переиспользует активную вкладку или открывает новую для экономии памяти контейнера (можно явно открыть новую через newTab: true). Поддерживает самостоятельно выбранное ИИ разрешение или время работы. Возвращает tabId текущей вкладки.',
     parameters: {
       type: 'object',
       properties: {
         url: {
           type: 'string',
-          description: '要打开的网页 URL（例如 https://github.com）'
+          description: 'URL веб-страницы для открытия (например https://github.com)'
         },
         newTab: {
           type: 'boolean',
-          description: '可选：是否在新标签页中打开（默认 false，优先复用当前空白或已有标签页导航，避免内存累积；需要多标签并存对比时传 true）。'
+          description: 'Необязательно: открывать ли в новой вкладке (по умолчанию false — в приоритете переиспользование текущей пустой или существующей вкладки, чтобы не копить память; передавайте true, когда нужно сравнение нескольких вкладок одновременно).'
         },
         tabId: {
           type: 'string',
-          description: '可选：指定要复用或导航的已有标签页 ID。留空且 newTab=false 时默认复用当前工作标签页。'
+          description: 'Необязательно: ID уже существующей вкладки для переиспользования/навигации. Если не указано и newTab=false, по умолчанию переиспользуется текущая рабочая вкладка.'
         },
         resolution: {
           type: 'string',
-          description: '可选：指定当前网页浏览的分辨率（如 "1920x1080", "1280x720", "1440x900", "2560x1440"）。未传时默认使用插件设置中心配置的参数 (默认 1920x1080)。'
+          description: 'Необязательно: разрешение просмотра текущей страницы (например "1920x1080", "1280x720", "1440x900", "2560x1440"). Если не передано — используется параметр из конфигурации центра настроек (по умолчанию 1920x1080).'
         },
         durationMinutes: {
           type: 'number',
-          description: '可选：指定允许浏览器工作并保持活跃的时长(分钟)，到期后将自动休眠以节约资源。留空则按默认空闲策略'
+          description: 'Необязательно: длительность разрешённой работы браузера и удержания активности (минут); по истечении — автоматический сон для экономии ресурсов. Пусто — по политике простоя по умолчанию'
         }
       },
       required: ['url'],
@@ -620,17 +648,18 @@ export function apply(ctx, config = {}) {
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `已在容器浏览器中打开 ${value.url} (标签页ID: ${value.tabId || '未知'}, ${value.reused ? '复用已有标签页' : '新建标签页'}, 分辨率: ${value.resolution || '默认'})，可通过桌面 VNC 查看实时画面。`
+        text: `Открыто в контейнерном браузере ${value.url} (ID вкладки: ${value.tabId || 'неизвестно'}, ${value.reused ? 'переиспользована существующая вкладка' : 'открыта новая вкладка'}, разрешение: ${value.resolution || 'по умолчанию'}) — живой экран смотрите через VNC рабочего стола.`
       }]
     },
     async execute(args, exec) {
-      // 调用前读一次本地权威配置（同步、零网络），确保「已彻底停用」时立即拒绝
+      // Перед вызовом читаем локальную авторитетную конфигурацию (синхронно, ноль сети),
+      // чтобы при «полностью отключено» немедленно отказать
       refreshAuthoritativeConfig();
       if (activeConfig.enabled === false) {
-        throw new Error('容器图形浏览器桌面已在管理后台被彻底停用');
+        throw new Error('Контейнерный графический браузер полностью отключён в панели управления');
       }
       if (!args || typeof args.url !== 'string') {
-        throw new Error('url 参数必须是非空字符串');
+        throw new Error('Параметр url должен быть непустой строкой');
       }
       return openInChromium(args.url.trim(), args.durationMinutes, exec.signal, args.resolution, {
         newTab: args.newTab === true,
@@ -639,25 +668,25 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  // 工具定义：browser_screenshot (支持 AI 自主指定路径、画质及目标标签页)
+  // Определение инструмента: browser_screenshot (поддержка самостоятельно выбранных ИИ пути, качества и целевой вкладки)
   const browserScreenshotDef = {
     name: 'browser_screenshot',
-    description: '对容器内的 Chromium 浏览器或当前桌面进行实时截屏。支持 AI 传入自定义保存路径 savePath（相对工作区或绝对路径），未传时自动在当前工作区生成带时间戳的唯一文件名（避免覆盖历史截图）。支持选择画质（high 高画质无损原图 / medium 中画质 / low 低画质），以及指定截取特定 tabId。',
+    description: 'Сделать скриншот окна браузера Chromium в контейнере или текущего рабочего стола в реальном времени. Поддерживается переданный ИИ путь сохранения savePath (относительно рабочей области или абсолютный); если не передан — во текущей рабочей области автоматически генерируется уникальное имя с таймстампом (чтобы не перезаписывать прежние скриншоты). Поддержка выбора качества (high высокое без потерь / medium среднее / low низкое), а также указания конкретной tabId.',
     parameters: {
       type: 'object',
       properties: {
         savePath: {
           type: 'string',
-          description: '可选：截图保存的文件路径（强烈推荐由 AI 传入有业务含义的路径，支持绝对路径或相对当前会话/项目工作区的相对路径，如 "screenshot.png", "doc/preview-login.png"）。若留空，则自动在当前会话/项目自己的文件夹中生成带时间戳的唯一文件名（如 screenshot-20260906120000.png），绝不覆盖历史截图。'
+          description: 'Необязательно: путь сохранения скриншота (очень желательно, чтобы ИИ передавал осмысленный путь; поддерживается абсолютный или относительный путь в рабочей области текущей сессии/проекта, например "screenshot.png", "doc/preview-login.png"). Если оставить пусто — в папке текущей сессии/проекта автоматически создаётся уникальное имя с таймстампом (например screenshot-20260906120000.png), прежние скриншоты не перезаписываются.'
         },
         tabId: {
           type: 'string',
-          description: '可选：指定要截屏的标签页 ID。未传时默认截取当前激活的前台标签页或桌面。'
+          description: 'Необязательно: ID вкладки для скриншота. Если не указано — по умолчанию снимается активная передняя вкладка или рабочий стол.'
         },
         quality: {
           type: 'string',
           enum: ['high', 'medium', 'low'],
-          description: '可选：截图画质选择。可选 "high" (高画质/无损原图，默认), "medium" (中画质/体积平衡), "low" (低画质/极致压缩)。未传时默认采用插件设置所配置的默认画质。'
+          description: 'Необязательно: выбор качества скриншота: "high" (высокое/без потерь, по умолчанию), "medium" (среднее/баланс размера), "low" (низкое/максимальное сжатие). Если не передано — берётся качество по умолчанию из настроек.'
         }
       },
       additionalProperties: false
@@ -677,14 +706,15 @@ export function apply(ctx, config = {}) {
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `已完成页面截图 (保存至: \`${value.path}\`, 大小: ${value.bytes} 字节, 画质: ${value.quality || '默认'}, 引擎: ${value.engine || '默认'})`
+        text: `Скриншот страницы готов (сохранён: \`${value.path}\`, размер: ${value.bytes} байт, качество: ${value.quality || 'по умолчанию'}, движок: ${value.engine || 'по умолчанию'})`
       }]
     },
     async execute(args, exec) {
-      // 调用前读一次本地权威配置（同步、零网络），确保「已彻底停用」时立即拒绝
+      // Перед вызовом читаем локальную авторитетную конфигурацию (синхронно, ноль сети),
+      // чтобы при «полностью отключено» немедленно отказать
       refreshAuthoritativeConfig();
       if (activeConfig.enabled === false) {
-        throw new Error('容器图形浏览器桌面已在管理后台被彻底停用');
+        throw new Error('Контейнерный графический браузер полностью отключён в панели управления');
       }
       const rawPath = typeof args?.savePath === 'string' ? args.savePath.trim() : null;
       const sessionCwd = exec?.agent?.session?.header?.cwd || process.cwd();
@@ -692,29 +722,29 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  // 工具定义：browser_control (供 AI 显式启停、调整分辨率、查询、关闭标签页)
+  // Определение инструмента: browser_control (для ИИ: явные запуск/остановка, смена разрешения, опрос, закрытие вкладок)
   const browserControlDef = {
     name: 'browser_control',
-    description: '控制容器图形浏览器的运行状态及标签页生命周期：包括关闭指定标签页(close_tab)、关闭所有页面重置为空白页(close_all_tabs)、查询标签页列表(tabs)、启动唤醒(start)、停止休眠(stop)、重启(restart)与状态查询(status)。',
+    description: 'Управление состоянием контейнерного графического браузера и жизненным циклом вкладок: закрыть указанную вкладку (close_tab), закрыть все страницы и сбросить в пустую (close_all_tabs), список вкладок (tabs), запуск/пробуждение (start), остановка сна (stop), перезапуск (restart) и запрос состояния (status).',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: ['close_tab', 'close_all_tabs', 'tabs', 'start', 'stop', 'restart', 'status'],
-          description: '要执行的操作：close_tab(关闭指定或当前标签页), close_all_tabs(关闭所有标签页并重置为空白页), tabs(查询当前所有标签页列表), start(启动/唤醒), stop(停止休眠整个桌面), restart(重启桌面), status(查询桌面运行状态)'
+          description: 'Выполняемое действие: close_tab (закрыть указанную или текущую вкладку), close_all_tabs (закрыть все вкладки и сбросить к пустой), tabs (список всех текущих вкладок), start (запустить/разбудить), stop (остановка сна всего рабочего стола), restart (перезапуск рабочего стола), status (состояние рабочего стола)'
         },
         tabId: {
           type: 'string',
-          description: '当 action 为 close_tab 时可选传入要关闭的标签页 ID。若未提供则默认关闭当前最新或活跃的标签页。'
+          description: 'Когда action=close_tab, необязательно: ID закрываемой вкладки. Если не указан — по умолчанию закрывается последняя новая или активная вкладка.'
         },
         resolution: {
           type: 'string',
-          description: '可选：设置启动或重启的分辨率（如 "1920x1080", "1280x720"）。未传时默认采用插件设置配置的分辨率。'
+          description: 'Необязательно: разрешение для запуска или перезапуска (например "1920x1080", "1280x720"). Если не передано — берётся разрешение из конфигурации.'
         },
         durationMinutes: {
           type: 'number',
-          description: '启动或保持活跃的工作时长(分钟)，到期后自动休眠'
+          description: 'Длительность работы или удержания активности (минут); по истечении — автоматический сон'
         }
       },
       required: ['action'],
@@ -731,12 +761,13 @@ export function apply(ctx, config = {}) {
       }]
     },
     async execute(args) {
-      // 调用前读一次本地权威配置（同步、零网络），确保「已彻底停用」时立即拒绝
+      // Перед вызовом читаем локальную авторитетную конфигурацию (синхронно, ноль сети),
+      // чтобы при «полностью отключено» немедленно отказать
       refreshAuthoritativeConfig();
       if (activeConfig.enabled === false) {
-        throw new Error('容器图形浏览器桌面已在管理后台被彻底停用');
+        throw new Error('Контейнерный графический браузер полностью отключён в панели управления');
       }
-      // 标签页查询与管理动作
+      // Действие с запросом/управлением вкладками
       if (args.action === 'tabs') {
         try {
           const listRes = await fetch(`${cdpBase()}/json`, { signal: AbortSignal.timeout(2000) });
@@ -750,29 +781,30 @@ export function apply(ctx, config = {}) {
             return { ok: true, tabs: pages, count: pages.length };
           }
         } catch (err) {
-          return { ok: false, error: '获取标签页列表失败或 CDP 暂不可达: ' + err.message };
+          return { ok: false, error: 'Не удалось получить список вкладок, или CDP временно недоступен: ' + err.message };
         }
-        return { ok: false, error: 'CDP 服务未返回正常响应' };
+        return { ok: false, error: 'Служба CDP не вернула корректный ответ' };
       }
 
       if (args.action === 'close_tab') {
         try {
           const listRes = await fetch(`${cdpBase()}/json`, { signal: AbortSignal.timeout(2000) });
-          if (!listRes.ok) return { ok: false, error: 'CDP 服务不可达' };
+          if (!listRes.ok) return { ok: false, error: 'Служба CDP недоступна' };
           const allTargets = await listRes.json();
           const pages = allTargets.filter(t => t.type === 'page');
-          if (pages.length === 0) return { ok: true, message: '当前没有打开的网页标签页' };
+          if (pages.length === 0) return { ok: true, message: 'Сейчас нет открытых вкладок' };
 
           let targetToClose = null;
           if (args.tabId) {
             targetToClose = pages.find(p => p.id === args.tabId);
-            if (!targetToClose) return { ok: false, error: `未找到 ID 为 ${args.tabId} 的标签页` };
+            if (!targetToClose) return { ok: false, error: `Вкладка с ID ${args.tabId} не найдена` };
           } else {
-            // 优先关闭非 about:blank 标签页，若都是空白页则关闭最后一个
+            // В приоритете закрываем не-about:blank вкладки; если все пустые — закрываем последнюю
             targetToClose = pages.find(p => p.url !== 'about:blank' && p.url !== 'chrome://newtab/') || pages[pages.length - 1];
           }
 
-          // 安全兜底：如果只剩这一个标签页，先预创一个空白页，防止 Chromium 进程因所有 Tab 关闭而退出
+          // Безопасная страховка: если остаётся только эта вкладка, заранее создаём пустую,
+          // чтобы процесс Chromium не вышел из-за закрытия всех вкладок
           if (pages.length <= 1) {
             try {
               await fetch(`${cdpBase()}/json/new?about:blank`, { method: 'PUT', signal: AbortSignal.timeout(5000) });
@@ -787,20 +819,21 @@ export function apply(ctx, config = {}) {
             status: closeRes.ok ? 'closed' : 'failed'
           };
         } catch (err) {
-          return { ok: false, error: '关闭标签页异常: ' + err.message };
+          return { ok: false, error: 'Исключение при закрытии вкладки: ' + err.message };
         }
       }
 
       if (args.action === 'close_all_tabs') {
         try {
           const listRes = await fetch(`${cdpBase()}/json`, { signal: AbortSignal.timeout(2000) });
-          if (!listRes.ok) return { ok: false, error: 'CDP 服务不可达' };
+          if (!listRes.ok) return { ok: false, error: 'Служба CDP недоступна' };
           const allTargets = await listRes.json();
           const pages = allTargets.filter(t => t.type === 'page');
 
-          // 先新建一个干净的 about:blank。
-          // P7：这一步【必须成功】——若失败就直接中止，绝不继续关闭全部页面，
-          //      否则 Chromium 会因"零标签页"而退出，整桌都要重新拉起（代价远高于报错）。
+          // Сначала создаём чистый about:blank.
+          // P7: этот шаг **обязан пройти успешно** — при сбое сразу прерываемся и закрывать
+          //       ничего не продолжаем, иначе Chromium выйдет «из-за нуля вкладок» и весь
+          //       рабочий стол придётся поднимать заново (это дороже ошибки).
           let blankId = null;
           try {
             const blankRes = await fetch(`${cdpBase()}/json/new?about:blank`, { method: 'PUT', signal: AbortSignal.timeout(4000) });
@@ -810,10 +843,10 @@ export function apply(ctx, config = {}) {
               if (blankId) await fetch(`${cdpBase()}/json/activate/${encodeURIComponent(blankId)}`, { signal: AbortSignal.timeout(3000) });
             }
           } catch (e) {
-            return { ok: false, error: '预建空白页失败，已中止关闭操作（避免浏览器无标签页退出）: ' + e.message };
+            return { ok: false, error: 'Предсоздание пустой вкладки не удалось, операция закрытия прервана (чтобы браузер не вышел без вкладок): ' + e.message };
           }
           if (!blankId) {
-            return { ok: false, error: '预建空白页失败（CDP 未返回新页面 id），已中止关闭操作以免浏览器退出' };
+            return { ok: false, error: 'Предсоздание пустой вкладки не удалось (CDP не вернул id новой страницы), операция закрытия прервана, чтобы не убить браузер' };
           }
 
           let closedCount = 0;
@@ -831,11 +864,12 @@ export function apply(ctx, config = {}) {
             resetTo: 'about:blank'
           };
         } catch (err) {
-          return { ok: false, error: '关闭全部标签页异常: ' + err.message };
+          return { ok: false, error: 'Исключение при закрытии всех вкладок: ' + err.message };
         }
       }
 
-      // 桌面管理动作：仅在 AI 显式指定分辨率时才覆盖运行分辨率（否则沿用当前值，避免误重启整桌）
+      // Управление рабочим столом: разрешение переопределяем, только когда ИИ явно его задал
+      // (иначе используется текущее значение, чтобы случайно не перезапустить весь стол)
       const bcRes = (typeof args.resolution === 'string' && args.resolution.trim()) ? args.resolution.trim().toLowerCase() : null;
       const parts = bcRes ? bcRes.split('x') : [];
       const width = parseInt(parts[0]) || undefined;
@@ -854,7 +888,7 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  // ── enabled 主开关：工具 / 提示词的可注销注册 ──────────────────
+  // ── Главный переключатель enabled: отзывная регистрация инструментов / промпта ──────────────────
   const promptSectionDef = {
     name: 'tool:browser_tools',
     order: 110,
@@ -863,44 +897,47 @@ export function apply(ctx, config = {}) {
 
   function registerTools() {
     if (registeredTools.length) return;
-    // ctx.tools.register() 返回注销该工具的 disposer，据此支持运行中动态启停
+    // ctx.tools.register() возвращает disposer отмены регистрации этого инструмента,
+    // благодаря чему поддерживается динамическое включение/отключение на ходу
     const added = [];
     try {
       for (const def of [browserOpenDef, browserScreenshotDef, browserControlDef]) {
         added.push(ctx.tools.register(def));
       }
     } catch (e) {
-      // 部分注册失败时回滚，保持"要么全注册、要么全没有"的一致性
+      // При частичном сбое регистрации откатываем, сохраняя инвариант «либо всё, либо ничего»
       for (const d of added) { try { d(); } catch {} }
       throw e;
     }
     registeredTools.push(...added);
-    console.log('[dsh-browser-desktop] 已注册 3 个浏览器工具 (browser_open/browser_screenshot/browser_control)');
+    console.log('[dsh-browser-desktop] Зарегистрировано 3 инструмента браузера (browser_open/browser_screenshot/browser_control)');
   }
 
   function unregisterTools() {
     for (const dispose of registeredTools.splice(0)) {
-      try { dispose(); } catch (e) { console.warn('[dsh-browser-desktop] 注销工具失败:', e.message); }
+      try { dispose(); } catch (e) { console.warn('[dsh-browser-desktop] Ошибка отмены регистрации инструмента:', e.message); }
     }
   }
 
   function registerPrompt() {
     if (registeredPrompt) return;
-    // ctx.systemPrompt.section() 返回 Cordis effect disposer，据此支持运行中移除注入
+    // ctx.systemPrompt.section() возвращает Cordis effect-disposer, благодаря чему
+    // поддерживается удаление внедрённого текста на ходу
     registeredPrompt = ctx.systemPrompt.section(promptSectionDef);
-    console.log('[dsh-browser-desktop] 已注入浏览器系统提示词段 (tool:browser_tools)');
+    console.log('[dsh-browser-desktop] Внедрена секция системного промпта браузера (tool:browser_tools)');
   }
 
   function unregisterPrompt() {
     if (!registeredPrompt) return;
-    try { registeredPrompt(); } catch (e) { console.warn('[dsh-browser-desktop] 移除提示词段失败:', e.message); }
+    try { registeredPrompt(); } catch (e) { console.warn('[dsh-browser-desktop] Ошибка удаления секции промпта:', e.message); }
     registeredPrompt = null;
-    console.log('[dsh-browser-desktop] 已移除浏览器系统提示词段 (tool:browser_tools)');
+    console.log('[dsh-browser-desktop] Секция системного промпта браузера удалена (tool:browser_tools)');
   }
 
-  // P2：注册失败后的**有限次退避重试**。
-  // 原先失败后只把 enabledState 置 null 等"下一次同步"，而同步入口只在三个工具的
-  // execute() 里 —— 工具压根没注册就永远调不到，等于永久僵死。这里用定时器自己重试。
+  // P2: **ограниченный** backoff-повтор после сбоя регистрации.
+  // Раньше после сбоя enabledState просто ставился в null в ожидании «следующей синхронизации»,
+  // а точка синхронизации — только execute() трёх инструментов: инструменты не зарегистрированы,
+  // значит execute не вызовется никогда = застыть навсегда. Здесь повтор ведёт свой таймер.
   let retryTimer = null;
   let retryCount = 0;
   const MAX_REGISTER_RETRIES = 5;
@@ -914,7 +951,7 @@ export function apply(ctx, config = {}) {
   function scheduleRegisterRetry() {
     if (retryTimer) return;
     if (retryCount >= MAX_REGISTER_RETRIES) {
-      console.error(`[dsh-browser-desktop] 工具注册连续失败 ${MAX_REGISTER_RETRIES} 次，停止重试（等待下次配置变更/重启）`);
+      console.error(`[dsh-browser-desktop] Регистрация инструментов не удалась ${MAX_REGISTER_RETRIES} раз подряд, повторы остановлены (ждём следующего изменения конфигурации/перезапуска)`);
       return;
     }
     const delay = REGISTER_RETRY_BASE_MS * Math.pow(2, retryCount);
@@ -923,19 +960,21 @@ export function apply(ctx, config = {}) {
       retryTimer = null;
       try {
         if (enabledState === true) return;
-        refreshAuthoritativeConfig(); // 内部会再次尝试 applyEnabledState
+        refreshAuthoritativeConfig(); // внутренне ещё раз попробует applyEnabledState
         if (enabledState !== true && activeConfig.enabled !== false) scheduleRegisterRetry();
       } catch (e) {
-        console.error('[dsh-browser-desktop] 注册重试异常:', e && e.message ? e.message : e);
+        console.error('[dsh-browser-desktop] Исключение при повторе регистрации:', e && e.message ? e.message : e);
         scheduleRegisterRetry();
       }
     }, delay);
     if (typeof retryTimer.unref === 'function') retryTimer.unref();
-    console.warn(`[dsh-browser-desktop] 将在 ${Math.round(delay / 1000)}s 后重试注册浏览器工具（第 ${retryCount}/${MAX_REGISTER_RETRIES} 次）`);
+    console.warn(`[dsh-browser-desktop] Повтор регистрации инструментов браузера через ${Math.round(delay / 1000)}с (попытка ${retryCount}/${MAX_REGISTER_RETRIES})`);
   }
 
-  // enabled 状态机：一次切换同时处理「工具注册 + 提示词注入 + 桌面运行」三件事。
-  // 关键：注册失败时【不置位】，并安排退避重试，避免"状态已启用但工具其实没注册"的僵死。
+  // Машина состояний enabled: одно переключение одновременно обрабатывает три вещи —
+  // «регистрация инструментов + внедрение промпта + запуск рабочего стола».
+  // Ключевой момент: при сбое регистрации состояние **не фиксируем** и планируем backoff-повтор,
+  // чтобы не получить «статус включён, а инструменты на деле не зарегистрированы».
   function applyEnabledState(enabled) {
     const next = enabled !== false;
     if (next === enabledState) return;
@@ -946,7 +985,7 @@ export function apply(ctx, config = {}) {
         enabledState = true;
         clearRegisterRetry();
       } catch (e) {
-        console.error('[dsh-browser-desktop] 注册工具/提示词失败（将自动重试）:', e && e.message ? e.message : e);
+        console.error('[dsh-browser-desktop] Сбой регистрации инструментов/промпта (будет автоматический повтор):', e && e.message ? e.message : e);
         enabledState = null;
         scheduleRegisterRetry();
       }
@@ -955,22 +994,23 @@ export function apply(ctx, config = {}) {
       unregisterTools();
       unregisterPrompt();
       enabledState = false;
-      // 关闭浏览器：停掉正在运行的虚拟桌面，释放 CPU/内存
+      // Останавливаем браузер: глушим работающий виртуальный рабочий стол, освобождаем CPU/память
       callDesktopManager('stop')
-        .then((r) => console.log('[dsh-browser-desktop] 插件已禁用，桌面停止结果:', JSON.stringify(r)))
+        .then((r) => console.log('[dsh-browser-desktop] Плагин отключён, результат остановки рабочего стола:', JSON.stringify(r)))
         .catch(() => {});
-      console.log('[dsh-browser-desktop] 插件已禁用：工具已注销、提示词已移除、桌面已停止');
+      console.log('[dsh-browser-desktop] Плагин отключён: инструменты сняты, промпт удалён, рабочий стол остановлен');
     }
   }
 
-  // 启动时先按本地权威配置决定：挂/不挂 AI 工具与提示词（因此重启后状态即准确）
+  // При старте решаем по локальной авторитетной конфигурации: вешать/не вешать инструменты ИИ
+  // и промпт (поэтому после перезапуска состояние сразу точное)
   refreshAuthoritativeConfig();
-  console.log(`[dsh-browser-desktop] 权威配置已加载: enabled=${activeConfig.enabled !== false}, resolution=${activeConfig.resolution}`);
+  console.log(`[dsh-browser-desktop] Авторитетная конфигурация загружена: enabled=${activeConfig.enabled !== false}, resolution=${activeConfig.resolution}`);
 
-  // 一次性旧值迁移（仅此一次，之后 DSH 设置命名空间不再生效）
-  migrateLegacySettingsOnce().catch((e) => console.warn('[dsh-browser-desktop] 旧设置迁移失败(已忽略):', e.message));
+  // Одноразовая миграция старых значений (только один раз; дальше пространство имён настроек DSH не действует)
+  migrateLegacySettingsOnce().catch((e) => console.warn('[dsh-browser-desktop] Сбой миграции старых настроек (игнорируется):', e.message));
 
-  // 插件被卸载/重载时清理注册，避免残留工具与提示词
+  // При выгрузке/перезагрузке плагина чистим регистрации, чтобы не остались инструменты и промпт
   if (typeof ctx.on === 'function') {
     ctx.on('dispose', () => {
       clearRegisterRetry();

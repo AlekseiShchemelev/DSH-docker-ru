@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Issue #10 本地单元级回归测试：
- *   1. WebSocket wss:// 安全升级 shim（node:vm 验证各协议、常量、原型、幂等与 HTTP/HTTPS 隔离）
- *   2. Content-Encoding 解压与 HTML/JS 注入替换（node:zlib 验证 gzip/deflate/br、未知编码与损坏降级）
- *   3. 模拟网关 proxyRes 响应生命周期（流式无压缩、缓冲解压、删除 Content-Encoding、失败回退）
+ * Локальный регрессионный тест уровня модулей (Issue #10):
+ *   1. Shim безопасного апгрейда WebSocket wss:// (проверка в node:vm протоколов, констант, прототипа, идемпотентности и изоляции HTTP/HTTPS)
+ *   2. Распаковка Content-Encoding и инъекция замены в HTML/JS (проверка в node:zlib gzip/deflate/br, неизвестного кодирования и деградации при повреждении)
+ *   3. Моделирование жизненного цикла ответа proxyRes шлюза (потоковая передача без сжатия, буферная распаковка, удаление Content-Encoding, откат при сбое)
  *
- * 用法: node scripts/gateway-encoding-ws-shim-test.mjs
+ * Запуск: node scripts/gateway-encoding-ws-shim-test.mjs
  */
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
@@ -37,7 +37,7 @@ function check(name, fn) {
   }
 }
 
-// 伪造标准 WebSocket 构造函数
+// Подмена стандартного конструктора WebSocket
 class MockWebSocket {
   static CONNECTING = 0;
   static OPEN = 1;
@@ -53,9 +53,9 @@ class MockWebSocket {
   close() {}
 }
 
-console.log('\n[模块 1] WebSocket wss:// 安全升级 shim（node:vm 隔离测试）');
+console.log('\n[Модуль 1] Shim безопасного апгрейда WebSocket wss:// (тест изоляции в node:vm)');
 
-check('HTTPS 页面下 ws:// 自动改写为 wss://，保留端口、路径、查询与 Hash', () => {
+check('На HTTPS-странице ws:// автоматически переписывается в wss:// с сохранением порта, пути, запроса и хеша', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/viewer' } },
     location: { protocol: 'https:', href: 'https://example.com/viewer' },
@@ -71,7 +71,7 @@ check('HTTPS 页面下 ws:// 自动改写为 wss://，保留端口、路径、�
   assert.equal(ws instanceof MockWebSocket, true);
 });
 
-check('HTTPS 页面下 URL 对象实例参数也能正确改写为 wss', () => {
+check('На HTTPS-странице аргумент в виде объекта URL тоже корректно переписывается в wss', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/' } },
     location: { protocol: 'https:', href: 'https://example.com/' },
@@ -86,7 +86,7 @@ check('HTTPS 页面下 URL 对象实例参数也能正确改写为 wss', () => {
   assert.equal(ws.url, 'wss://example.com/channel');
 });
 
-check('HTTPS 页面下 原生 wss://、http:// 等非 ws 协议保持原样，不被误改写', () => {
+check('на HTTPS-странице нативные wss://, http:// и прочие не-ws протоколы остаются без изменений, не переписываются ошибочно', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/' } },
     location: { protocol: 'https:', href: 'https://example.com/' },
@@ -103,7 +103,7 @@ check('HTTPS 页面下 原生 wss://、http:// 等非 ws 协议保持原样，�
   assert.equal(ws2.url, 'http://example.com/test');
 });
 
-check('子协议 protocols 参数透明传递给底层构造函数', () => {
+check('аргумент подпротоколов protocols прозрачно передаётся в нижележащий конструктор', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/' } },
     location: { protocol: 'https:', href: 'https://example.com/' },
@@ -118,7 +118,7 @@ check('子协议 protocols 参数透明传递给底层构造函数', () => {
   assert.deepEqual(ws.protocols, ['graphql-ws', 'v1']);
 });
 
-check('WebSocket 原型链与静态常量（CONNECTING/OPEN/CLOSING/CLOSED）完整保留', () => {
+check('цепочка прототипов WebSocket и статические константы (CONNECTING/OPEN/CLOSING/CLOSED) полностью сохраняются', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/' } },
     location: { protocol: 'https:', href: 'https://example.com/' },
@@ -135,7 +135,7 @@ check('WebSocket 原型链与静态常量（CONNECTING/OPEN/CLOSING/CLOSED）完
   assert.equal(ctx.WebSocket.prototype, MockWebSocket.prototype);
 });
 
-check('shim 具备幂等性（多次执行不重复包装、不破坏属性）', () => {
+check('shim идемпотентен (повторный запуск не оборачивает повторно и не ломает свойства)', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/' } },
     location: { protocol: 'https:', href: 'https://example.com/' },
@@ -153,7 +153,7 @@ check('shim 具备幂等性（多次执行不重复包装、不破坏属性）',
   assert.equal(ws.url, 'wss://example.com/idem');
 });
 
-check('HTTP 页面环境（location.protocol === "http:"）shim 不生效，WebSocket 保持原生', () => {
+check('в HTTP-окружении (location.protocol === "http:") shim не срабатывает, WebSocket остаётся нативным', () => {
   const ctx = vm.createContext({
     window: { location: { protocol: 'http:', href: 'http://example.com/' } },
     location: { protocol: 'http:', href: 'http://example.com/' },
@@ -168,7 +168,7 @@ check('HTTP 页面环境（location.protocol === "http:"）shim 不生效，WebS
   assert.equal(ws.url, 'ws://example.com/plain');
 });
 
-check('畸形 URL 或环境缺少 window 不抛出异常并平稳兜底', () => {
+check('некорректный URL или отсутствие window не бросает исключение и спокойно отрабатывает запасной путь', () => {
   const ctx1 = vm.createContext({
     window: { location: { protocol: 'https:', href: 'https://example.com/' } },
     location: { protocol: 'https:', href: 'https://example.com/' },
@@ -178,17 +178,17 @@ check('畸形 URL 或环境缺少 window 不抛出异常并平稳兜底', () => 
   ctx1.globalThis = ctx1;
   vm.runInContext(WS_UPGRADE_SHIM, ctx1);
 
-  // 传非法非 URL 字符串不炸
+  // Некорректный не-URL-строковый аргумент не взрывается
   const ws = new ctx1.WebSocket('not-a-valid-url:::');
   assert.equal(ws.url, 'not-a-valid-url:::');
 
-  // 无 window / 无 WebSocket 不炸
+  // Без window / без WebSocket не взрывается
   const ctx2 = vm.createContext({});
   ctx2.globalThis = ctx2;
   vm.runInContext(WS_UPGRADE_SHIM, ctx2);
 });
 
-check('RANDOM_UUID_POLYFILL 完整包含并成功注入 WS_UPGRADE_SHIM', () => {
+check('RANDOM_UUID_POLYFILL полностью содержит и успешно внедряет WS_UPGRADE_SHIM', () => {
   assert.ok(RANDOM_UUID_POLYFILL.includes('__dsh_wss_shimmed'));
   const injected = injectPolyfill('<!DOCTYPE html><html><head><title>T</title></head><body></body></html>');
   assert.ok(injected.includes('__DSH_TRANSPORT__'));
@@ -196,9 +196,9 @@ check('RANDOM_UUID_POLYFILL 完整包含并成功注入 WS_UPGRADE_SHIM', () => 
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[模块 2] Content-Encoding 识别与 zlib 解压逻辑');
+console.log('\n[Модуль 2] Распознавание Content-Encoding и логика распаковки zlib');
 
-check('getEncodingType 准确识别常用编码与未知编码', () => {
+check('getEncodingType точно распознаёт распространённые и неизвестные кодировки', () => {
   assert.equal(getEncodingType('gzip'), 'gzip');
   assert.equal(getEncodingType('GZIP'), 'gzip');
   assert.equal(getEncodingType('x-gzip'), 'gzip');
@@ -211,7 +211,7 @@ check('getEncodingType 准确识别常用编码与未知编码', () => {
   assert.equal(getEncodingType('gzip, deflate'), 'gzip');
 });
 
-check('decompressBuffer 针对 gzip/deflate/br 正确解压，未知格式抛出错误', () => {
+check('decompressBuffer корректно распаковывает gzip/deflate/br, неизвестный формат бросает ошибку', () => {
   const rawText = '<div>Hello DSH Univer Viewer!</div>';
   const rawBuf = Buffer.from(rawText, 'utf8');
 
@@ -231,7 +231,7 @@ check('decompressBuffer 针对 gzip/deflate/br 正确解压，未知格式抛出
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[模块 3] 上游压缩 HTML/JS 注入与降级行为');
+console.log('\n[Модуль 3] Инъекция в сжатый апстримом HTML/JS и сторожинная деградация');
 
 const TEST_HTML = `<!DOCTYPE html>
 <html>
@@ -239,7 +239,7 @@ const TEST_HTML = `<!DOCTYPE html>
 <body><div id="app">UNIVER-VIEWER-ORIG-MARKER</div></body>
 </html>`;
 
-check('对 gzip 压缩的 HTML，解压后注入 polyfill，标记完整且无 U+FFFD 乱码', () => {
+check('для gzip-сжатого HTML после распаковки внедряется polyfill, маркер полон и нет мусора U+FFFD', () => {
   const gzBuf = zlib.gzipSync(Buffer.from(TEST_HTML, 'utf8'));
   const encType = getEncodingType('gzip');
   assert.equal(encType, 'gzip');
@@ -247,12 +247,12 @@ check('对 gzip 压缩的 HTML，解压后注入 polyfill，标记完整且无 U
   const decompressed = decompressBuffer(gzBuf, encType);
   const injectedHtml = injectPolyfill(decompressed.toString('utf8'));
 
-  assert.ok(injectedHtml.includes('UNIVER-VIEWER-ORIG-MARKER'), '应保留原始标记');
-  assert.ok(injectedHtml.includes('__DSH_TRANSPORT__'), '应包含注入 polyfill');
-  assert.ok(!injectedHtml.includes('\uFFFD'), '不得含有乱码替换字符 U+FFFD');
+  assert.ok(injectedHtml.includes('UNIVER-VIEWER-ORIG-MARKER'), 'должен сохраниться исходный маркер');
+  assert.ok(injectedHtml.includes('__DSH_TRANSPORT__'), 'должен быть внедрён polyfill');
+  assert.ok(!injectedHtml.includes('\uFFFD'), 'не должно быть мусорных заменяющих символов U+FFFD');
 });
 
-check('对 deflate 压缩的 HTML，解压后注入 polyfill，标记完整', () => {
+check('для deflate-сжатого HTML после распаковки внедряется polyfill, маркер полон', () => {
   const dfBuf = zlib.deflateSync(Buffer.from(TEST_HTML, 'utf8'));
   const encType = getEncodingType('deflate');
   const decompressed = decompressBuffer(dfBuf, encType);
@@ -262,7 +262,7 @@ check('对 deflate 压缩的 HTML，解压后注入 polyfill，标记完整', ()
   assert.ok(injectedHtml.includes('__DSH_TRANSPORT__'));
 });
 
-check('对 br 压缩的 HTML，解压后注入 polyfill，标记完整', () => {
+check('для br-сжатого HTML после распаковки внедряется polyfill, маркер полон', () => {
   const brBuf = zlib.brotliCompressSync(Buffer.from(TEST_HTML, 'utf8'));
   const encType = getEncodingType('br');
   const decompressed = decompressBuffer(brBuf, encType);
@@ -272,7 +272,7 @@ check('对 br 压缩的 HTML，解压后注入 polyfill，标记完整', () => {
   assert.ok(injectedHtml.includes('__DSH_TRANSPORT__'));
 });
 
-check('对非压缩 HTML，直接注入 polyfill，行为与修改前保持一致（零回归）', () => {
+check('для несжатого HTML polyfill внедряется напрямую, поведение совпадает с прежним (ноль регрессий)', () => {
   const raw = TEST_HTML;
   const injectedHtml = injectPolyfill(raw);
 
@@ -280,7 +280,7 @@ check('对非压缩 HTML，直接注入 polyfill，行为与修改前保持一�
   assert.ok(injectedHtml.includes('__DSH_TRANSPORT__'));
 });
 
-check('损坏的 gzip 数据解压抛错可被捕获，不致程序崩溃', () => {
+check('ошибка распаковки повреждённых gzip-данных ловится, процесс не падает', () => {
   const corruptBuf = Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x99, 0x88, 0x77]);
   assert.throws(() => {
     decompressBuffer(corruptBuf, 'gzip');
@@ -288,7 +288,7 @@ check('损坏的 gzip 数据解压抛错可被捕获，不致程序崩溃', () =
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[模块 4] 模拟网关 proxyRes 完整生命周期流式与头信息处理');
+console.log('\n[Модуль 4] Моделирование полного жизненного цикла proxyRes шлюза: потоковость и обработка заголовков');
 
 function createMockRes() {
   const headers = {};
@@ -301,7 +301,8 @@ function createMockRes() {
     headers,
     chunks,
     get headersSent() { return headersSent; },
-    // 忠实模拟 Node ServerResponse：writeHead() 之后 headersSent=true，此后 setHeader 抛 ERR_HTTP_HEADERS_SENT
+    // Честная имитация Node ServerResponse: после writeHead() headersSent=true, и далее setHeader
+    // бросает ERR_HTTP_HEADERS_SENT
     writeHead(status, hdrs) {
       headersSent = true;
       if (hdrs) for (const [k, v] of Object.entries(hdrs)) headers[k.toLowerCase()] = v;
@@ -329,8 +330,9 @@ function createMockRes() {
   };
 }
 
-// 提取网关相同的 proxyRes HTML 处理核心逻辑进行纯单元验证
-// ⚠️ 必须与 gateway/index.js 的实现保持一致；失败分支不得调用 setHeader（writeHead 之后会抛错）。
+// Выделяем ту же самую ядру обработки HTML для proxyRes шлюза и проверяем её чистым юнит-способом
+// ⚠️ Должна совпадать с реализацией в gateway/index.js; на ветке сбоя setHeader вызывать нельзя
+// (после writeHead будет брошено).
 function simulateProxyResHtml(proxyRes, req, res) {
   const encType = getEncodingType(proxyRes.headers['content-encoding']);
 
@@ -402,23 +404,23 @@ function simulateProxyResHtml(proxyRes, req, res) {
   };
 }
 
-check('流式无压缩 HTML: 首块即时注入，保留流式输出，Content-Encoding 头不出现', () => {
+check('потоковый несжатый HTML: immediate-инъекция в первый чанк, потоковый вывод сохраняется, заголовка Content-Encoding нет', () => {
   const proxyRes = { headers: { 'content-type': 'text/html; charset=utf-8' } };
   const res = createMockRes();
   simulateProxyResHtml(proxyRes, {}, res);
-  res.writeHead(200, { ...proxyRes.headers }); // 模拟 http-proxy 在 pipe 之前 writeHead
+  res.writeHead(200, { ...proxyRes.headers }); // имитируем http-proxy: writeHead перед pipe
 
   res.write(Buffer.from('<html><head></head><body>chunk1-'));
   res.write(Buffer.from('chunk2</body></html>'));
   res.end();
 
   const out = res.getFinalBody().toString('utf8');
-  assert.ok(out.includes('__DSH_TRANSPORT__'), '首块成功注入');
-  assert.ok(out.includes('chunk1-chunk2'), '内容完整');
+  assert.ok(out.includes('__DSH_TRANSPORT__'), 'внедрение в первый чанк успешно');
+  assert.ok(out.includes('chunk1-chunk2'), 'контент полный');
   assert.equal(res.getHeader('content-encoding'), undefined);
 });
 
-check('gzip 压缩 HTML: 缓冲全部块后解压注入，删除 Content-Encoding，输出有效明文 HTML', () => {
+check('gzip-сжатый HTML: собираем все чанки, распаковываем и внедряем, Content-Encoding убираем, на выходе валидный RAW HTML', () => {
   const proxyRes = {
     headers: {
       'content-type': 'text/html; charset=utf-8',
@@ -431,23 +433,23 @@ check('gzip 压缩 HTML: 缓冲全部块后解压注入，删除 Content-Encodin
   res.setHeader('content-length', '123');
 
   simulateProxyResHtml(proxyRes, {}, res);
-  res.writeHead(200, { ...proxyRes.headers }); // http-proxy 在 pipe 前 writeHead（此后 headersSent=true）
+  res.writeHead(200, { ...proxyRes.headers }); // http-proxy делает writeHead перед pipe (после него headersSent=true)
 
   const gz = zlib.gzipSync(Buffer.from(TEST_HTML, 'utf8'));
-  // 分两块模拟传输
+  // делим на два чанка для имитации передачи
   res.write(gz.subarray(0, 50));
   res.write(gz.subarray(50));
   res.end();
 
-  assert.equal(res.getHeader('content-encoding'), undefined, 'Content-Encoding 响应头应被彻底删除');
-  assert.equal(res.getHeader('content-length'), undefined, 'Content-Length 响应头应被删除');
+  assert.equal(res.getHeader('content-encoding'), undefined, 'заголовок ответа Content-Encoding должен быть полностью удалён');
+  assert.equal(res.getHeader('content-length'), undefined, 'заголовок ответа Content-Length должен быть удалён');
   const out = res.getFinalBody().toString('utf8');
-  assert.ok(out.includes('UNIVER-VIEWER-ORIG-MARKER'), '应包含原始内容');
-  assert.ok(out.includes('__DSH_TRANSPORT__'), '应包含注入 polyfill');
-  assert.ok(!out.includes('\uFFFD'), '无乱码字符');
+  assert.ok(out.includes('UNIVER-VIEWER-ORIG-MARKER'), 'должен быть исходный контент');
+  assert.ok(out.includes('__DSH_TRANSPORT__'), 'должен быть внедрён polyfill');
+  assert.ok(!out.includes('\uFFFD'), 'без мусорных символов');
 });
 
-check('gzip 压缩 HTML 解压失败：res.end 不抛错（headersSent 后禁止 setHeader），原样透传', () => {
+check('gzip-сжатый HTML при ошибке распаковки: res.end не бросает (после headersSent setHeader запрещён), прозрачная передача как есть', () => {
   const corruptGz = Buffer.from('not-a-valid-gzip-stream-at-all');
   const proxyRes = {
     headers: {
@@ -457,14 +459,14 @@ check('gzip 压缩 HTML 解压失败：res.end 不抛错（headersSent 后禁止
   };
   const res = createMockRes();
   simulateProxyResHtml(proxyRes, {}, res);
-  res.writeHead(200, { ...proxyRes.headers }); // 关键：headersSent=true，复刻真实 http-proxy 时序
+  res.writeHead(200, { ...proxyRes.headers }); // ключевой момент: headersSent=true, воспроизводим реальную тайминговую схему http-proxy
 
   res.write(corruptGz);
-  assert.doesNotThrow(() => res.end(), '解压失败时 res.end 钩子绝不能抛异常（否则会触发 uncaughtException 拖垮网关）');
-  assert.deepEqual(res.getFinalBody(), corruptGz, '失败时应原样透传未修改的二进制');
+  assert.doesNotThrow(() => res.end(), 'при сбое распаковки хук res.end ни в коем случае не должен бросать (иначе uncaughtException свалит шлюз)');
+  assert.deepEqual(res.getFinalBody(), corruptGz, 'при сбое бинарные данные передаются как есть, без изменений');
 });
 
-check('未知编码（如 zstd）响应：保守原样透传，不拦截 write/end，不破坏流', () => {
+check('ответ с неизвестной кодировкой (например zstd): консервативная прозрачная передача, write/end не перехватываются, поток не ломается', () => {
   const proxyRes = {
     headers: {
       'content-type': 'text/html',
@@ -484,6 +486,6 @@ check('未知编码（如 zstd）响应：保守原样透传，不拦截 write/e
 
 // ─────────────────────────────────────────────────────────────
 console.log('\n========================================');
-console.log(`总计: ${pass} 通过, ${fail} 失败`);
+console.log(`Итог: ${pass} пройдено, ${fail} провалено`);
 console.log('========================================\n');
 process.exit(fail === 0 ? 0 : 1);

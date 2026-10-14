@@ -4,27 +4,28 @@ window.__ModuleLoader__.load({
     const module = { exports: {} };
     const React = require('react');
 
-    const zh = typeof window !== 'undefined' && window.navigator && window.navigator.language.toLowerCase().startsWith('zh');
+    const ru = typeof window !== 'undefined' && window.navigator && window.navigator.language.toLowerCase().startsWith('ru');
     const labels = {
-      title: zh ? '容器浏览器' : 'Container Browser',
-      description: zh ? '控制容器内 Chromium 图形浏览器、虚拟分辨率、CDP 调试与空闲休眠策略。' : 'Controls container Chromium browser, virtual resolution, CDP debugging, and idle sleep policy.',
-      resolution: zh ? '虚拟桌面分辨率' : 'Virtual Resolution',
-      screenshotQuality: zh ? 'AI 截图工具默认画质' : 'Default Screenshot Quality',
-      idleTimeout: zh ? '空闲休眠时间（分钟）' : 'Idle Sleep Timeout (Minutes)',
-      enableCdp: zh ? 'CDP 远程调试' : 'CDP Remote Debugging',
-      enableSidebarTab: zh ? '在右侧边栏嵌入桌面 Tab (实验性)' : 'Embed Desktop in Right Sidebar (Experimental)',
-      enabled: zh ? '启用容器浏览器' : 'Enable Container Browser',
+      title: ru ? 'Контейнерный браузер' : 'Container Browser',
+      description: ru ? 'Управление графическим браузером Chromium в контейнере, виртуальным разрешением, отладкой CDP и политикой сна по простою.' : 'Controls container Chromium browser, virtual resolution, CDP debugging, and idle sleep policy.',
+      resolution: ru ? 'Разрешение виртуального рабочего стола' : 'Virtual Resolution',
+      screenshotQuality: ru ? 'Качество скриншотов по умолчанию (ИИ)' : 'Default Screenshot Quality',
+      idleTimeout: ru ? 'Сон по простою (минут)' : 'Idle Sleep Timeout (Minutes)',
+      enableCdp: ru ? 'Удалённая отладка CDP' : 'CDP Remote Debugging',
+      enableSidebarTab: ru ? 'Встраивать рабочий стол во вкладку правой боковой панели (экспериментально)' : 'Embed Desktop in Right Sidebar (Experimental)',
+      enabled: ru ? 'Включить контейнерный браузер' : 'Enable Container Browser',
     };
 
-    // ── 只读状态卡：配置权威已统一到 Admin「浏览器与桌面控制」页 ──────
-    // 本卡片只展示当前状态并提供跳转，不再提供任何配置写入入口，
-    // 避免与 Admin 形成第二个写入点（消除配置多源）。
+    // ── Карточка только-чтения: авторитет конфигурации переехал на страницу Admin «Браузер и рабочий стол» ──────
+    // Карточка лишь показывает текущее состояние и даёт переход, никаких полей записи конфигурации,
+    // чтобы не появилась вторая точка записи рядом с Admin (устраняем множественность источников конфигурации).
     let desktopStatusData = null;
     let adminPath = '/admin';
 
-    // VNC 路径是可变更的：Admin 改路径后，【已渲染】的侧边栏 iframe 必须跟着重建，
-    // 否则会继续请求旧路径（表现为"必须手动刷新页面"）。这里用一个轻量事件总线
-    // 广播变更，配合 localStorage 的 storage 事件实现跨标签页同步。
+    // Путь VNC изменяем: после смены пути в Admin уже отрендеренный iframe боковой панели обязан
+    // пересоздаться, иначе он продолжит ходить на старый путь (будет «нужно вручную обновить страницу»).
+    // Здесь — лёгкая шина событий для рассылки изменений в сочетании с событием storage из localStorage
+    // для синхронизации между вкладками.
     const VNC_PATH_KEY = 'dsh_desktop_vnc_path';
     const VNC_PATH_EVENT = 'dsh-desktop-vnc-path-changed';
 
@@ -40,7 +41,7 @@ window.__ModuleLoader__.load({
         if (localStorage.getItem(VNC_PATH_KEY) === p) return;
         localStorage.setItem(VNC_PATH_KEY, p);
         window.dispatchEvent(new CustomEvent(VNC_PATH_EVENT, { detail: p }));
-      } catch (e) { /* 忽略隐私模式等 localStorage 异常 */ }
+      } catch (e) { /* Игнорируем исключения localStorage в приватном режиме и т.п. */ }
     }
 
     function subscribeVncPath(cb) {
@@ -54,7 +55,7 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // P13：加超时，避免网关重启时请求悬挂
+    // P13: добавляем тайм-аут, чтобы при перезапуске шлюза запрос не завис
     async function loadDesktopStatus() {
       try {
         const r = await fetch('/__api/desktop/status', { signal: AbortSignal.timeout(5000) });
@@ -67,7 +68,8 @@ window.__ModuleLoader__.load({
       } catch (e) { return null; }
     }
 
-    // P13：轮询专用 —— 上一次请求未完成则跳过本次（防请求堆积、状态乱序）
+    // P13: специально для поллинга — если предыдущий запрос ещё не завершился, этот пропускаем
+    // (защита от накопления запросов и перепутанного порядка состояний)
     let desktopPollInFlight = false;
     function pollDesktopStatus() {
       if (desktopPollInFlight) return Promise.resolve(null);
@@ -76,9 +78,9 @@ window.__ModuleLoader__.load({
     }
 
     function desktopStateText(d) {
-      if (!d) return zh ? '未知' : 'Unknown';
-      if (d.enabled === false) return zh ? '已彻底停用' : 'Disabled';
-      return d.running ? (zh ? '运行中' : 'Running') : (zh ? '已停止 / 休眠中' : 'Stopped');
+      if (!d) return ru ? 'неизвестно' : 'Unknown';
+      if (d.enabled === false) return ru ? 'полностью отключён' : 'Disabled';
+      return d.running ? (ru ? 'работает' : 'Running') : (ru ? 'остановлен / спит' : 'Stopped');
     }
 
     function BrowserDesktopCard(props = {}) {
@@ -90,7 +92,7 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         let alive = true;
         const tick = () => {
-          // 失败/被跳过的轮询保持上一次状态，避免卡片在网关重启期间闪成"--"
+          // Сбой/пропущенный поллинг держит прежнее состояние, чтобы карточка не мигала "--" во время перезапуска шлюза
           pollDesktopStatus().then(d => { if (alive && d) setStatus(d); });
         };
         tick();
@@ -98,17 +100,17 @@ window.__ModuleLoader__.load({
         return () => { alive = false; clearInterval(t); };
       }, []);
 
-      // VNC 路径变更（Admin 改路径）后，卡片里的跳转链接随之更新
+      // После смены пути VNC (изменён в Admin) ссылка перехода в карточке обновляется за ним
       React.useEffect(() => subscribeVncPath(setVncBase), []);
 
       const d = status?.desktop || null;
       const rows = [
         [labels.enabled, desktopStateText(d), d && d.enabled === false ? '#ef4444' : (d && d.running ? '#22c55e' : null)],
         [labels.resolution, d ? `${d.width} x ${d.height}` : '--'],
-        [labels.idleTimeout, d ? (d.idleTimeoutMinutes === 0 ? (zh ? '始终保持' : 'Always on') : `${d.idleTimeoutMinutes} ${zh ? '分钟' : 'min'}`) : '--'],
-        [labels.enableCdp, d ? (d.enableCdp ? `${zh ? '已启用' : 'On'} (:${d.cdpPort})` : (zh ? '已关闭' : 'Off')) : '--'],
+        [labels.idleTimeout, d ? (d.idleTimeoutMinutes === 0 ? (ru ? 'всегда' : 'Always on') : `${d.idleTimeoutMinutes} ${ru ? 'мин' : 'min'}`) : '--'],
+        [labels.enableCdp, d ? (d.enableCdp ? `${ru ? 'включён' : 'On'} (:${d.cdpPort})` : (ru ? 'выключен' : 'Off')) : '--'],
         [labels.screenshotQuality, d ? String(d.screenshotQuality || 'high') : '--'],
-        [labels.enableSidebarTab, d ? (d.enableSidebarTab ? (zh ? '已开启' : 'On') : (zh ? '已关闭' : 'Off')) : '--']
+        [labels.enableSidebarTab, d ? (d.enableSidebarTab ? (ru ? 'включено' : 'On') : (ru ? 'выключено' : 'Off')) : '--']
       ];
 
       const body = React.createElement(
@@ -116,8 +118,8 @@ window.__ModuleLoader__.load({
         { style: { display: 'grid', gap: '9px' } },
         React.createElement('p', {
           style: { margin: '0 0 2px', fontSize: '12px', lineHeight: 1.7, color: 'var(--dsw-alias-label-secondary, #64748b)' }
-        }, zh
-          ? '为避免同一配置出现多个写入点，本插件不再提供重复的配置项：分辨率 / 空闲休眠 / CDP / 截图默认值 / 侧边栏 Tab 统一由管理后台「浏览器与桌面控制」页管理（唯一权威），保存后即时持久化生效。'
+        }, ru
+          ? 'Чтобы не плодить несколько точек записи одной и той же конфигурации, этот плагин больше не даёт дублирующих настроек: разрешение / сон по простою / CDP / значения скриншотов по умолчанию / вкладка боковой панели целиком управляются на странице Admin «Браузер и рабочий стол» (единственный авторитет) и сохраняются мгновенно.'
           : 'To keep a single source of truth, this plugin no longer duplicates configuration: resolution, idle timeout, CDP, screenshot defaults and the sidebar tab are managed solely in the Admin "Browser & Desktop" page.'),
         ...rows.map(([k, v, color]) => React.createElement(
           'div',
@@ -133,18 +135,19 @@ window.__ModuleLoader__.load({
             target: '_blank',
             rel: 'noreferrer',
             style: { fontSize: '13px', color: 'var(--dsw-alias-link, #4176e6)', textDecoration: 'none' }
-          }, zh ? '前往管理后台配置 ↗' : 'Configure in Admin ↗'),
+          }, ru ? 'Настроить в Admin ↗' : 'Configure in Admin ↗'),
           React.createElement('a', {
             href: `${vncBase.replace(/\/+$/, '')}/`,
             target: '_blank',
             rel: 'noreferrer',
             style: { fontSize: '13px', color: 'var(--dsw-alias-link, #4176e6)', textDecoration: 'none' }
-          }, zh ? '在新窗口打开桌面 ↗' : 'Open desktop ↗')
+          }, ru ? 'Открыть рабочий стол в новом окне ↗' : 'Open desktop ↗')
         )
       );
 
-      // P16：全部改为自有命名空间 + 内联样式，不再复用上游私有类名（如 .YyYd_a_card），
-      // 上游一改名我们的卡片就会失去样式；内联样式则在任何 DSH 版本下都成立。
+      // P16: всё переведено на собственные пространства имён + инлайн-стили, приватные имена классов
+      // апстрима (вроде .YyYd_a_card) больше не используются — переименуй апстрим, и наша карточка
+      // потеряет стиль; инлайн-стили же работают под любой версией DSH.
       const cardStyle = isSection ? {
         background: 'var(--dsw-alias-bg-layer-2, #ffffff)',
         border: '1px solid var(--dsw-alias-border-l3, #e2e8f0)',
@@ -203,18 +206,19 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // 注入右侧边栏样式：
-    // 1) Tab 标签宽度保护 (防止文字被关闭按钮截断)
-    // 2) 桌面面板顶部栏配色 —— 全部使用 DSH 真实主题令牌 (--dsw-alias-*)，
-    //    浅色/深色主题下都有足够对比度。注意：
-    //    · 不存在 --dsw-alias-bg-subtle / --dsw-alias-fg-muted，误用会落到深色兜底，
-    //      在浅色主题下形成"深色栏 + 深色/近黑文字"的隐形问题；
-    //    · --dsw-alias-brand-primary 是"黑白对比色"(浅色#0f1115 / 深色#f9fafb)，
-    //      不是品牌蓝，不能拿来当链接色，链接应使用 --dsw-alias-link。
+    // Инжектим стили правой боковой панели:
+    // 1) защита ширины Tab (чтобы текст не обрезался кнопкой закрытия)
+    // 2) расцветка верхней панели рабочего стола — только реальные тематические токены DSH
+    //    (--dsw-alias-*), достаточная контрастность в светлой/тёмной темах. Внимание:
+    //    · токенов --dsw-alias-bg-subtle / --dsw-alias-fg-muted не существует, их использование
+    //      упадёт в тёмный fallback и в светлой теме даст скрытую проблему «тёмная полоса + тёмный/почти чёрный текст»;
+    //    · --dsw-alias-brand-primary — это «контрастный чёрно-белый» (светлая #0f1115 / тёмная #f9fafb),
+    //      а не фирменный синий, в качестве цвета ссылки его брать нельзя; для ссылок нужен --dsw-alias-link.
     if (typeof document !== 'undefined') {
       const STYLE_ID = 'dsh-browser-desktop-tab-css';
-      // P16：不再使用 :has 选择器 + 上游私有类名（上游一改名或旧浏览器不支持该选择器即失效）。
-      // Tab 宽度与防截断改由 VncDesktopTabTitle 的 useLayoutEffect 直接写内联样式完成。
+      // P16: больше не используем селектор :has и приватные классы апстрима (сменит имя апстрим/старый
+      // браузер не поддержит селектор — всё сломается).
+      // Ширина Tab и защита от обрезки выполняются инлайн-стилями из useLayoutEffect в VncDesktopTabTitle.
       const CSS = `
         .dshDesktopBar {
           display: flex;
@@ -274,18 +278,18 @@ window.__ModuleLoader__.load({
         styleEl.id = STYLE_ID;
         document.head.appendChild(styleEl);
       }
-      // 内容变化时同步更新，避免热更新/重复执行时沿用旧样式
+      // При изменении содержимого обновляем синхронно, чтобы при hot-update/повторном выполнении не оставался старый стиль
       if (styleEl.textContent !== CSS) styleEl.textContent = CSS;
     }
 
-    // 右侧边栏专用 Tab 标题组件 (精致 14px 矢量显示器图标 + 完美防截断)
+    // Компонент заголовка вкладки правой боковой панели (изящная 14-пиксельная векторная иконка монитора + идеальная защита от обрезки)
     function VncDesktopTabTitle() {
       const titleRef = React.useRef(null);
 
       React.useLayoutEffect(() => {
         const el = titleRef.current;
         if (!el) return;
-        // P16：直接给上游 Tab 容器写内联样式（不依赖 :has 选择器）
+        // P16: напрямую пишем инлайн-стили в контейнер вкладки апстрима (не полагаясь на селектор :has)
         const chip = el.closest('[data-dockkit-tab], [data-dockkit-float-grip]');
         if (chip) {
           chip.style.minWidth = '125px';
@@ -323,13 +327,15 @@ window.__ModuleLoader__.load({
           React.createElement('line', { x1: '8', y1: '21', x2: '16', y2: '21' }),
           React.createElement('line', { x1: '12', y1: '17', x2: '12', y2: '21' })
         ),
-        React.createElement('span', { style: { whiteSpace: 'nowrap' } }, zh ? '容器桌面' : 'Desktop')
+        React.createElement('span', { style: { whiteSpace: 'nowrap' } }, ru ? 'Контейнерный рабочий стол' : 'Desktop')
       );
     }
 
-    // 右侧边栏专用内嵌 VNC 容器组件 (当开关开启且上游环境支持 SidebarRight 时渲染)
+    // Компонент встроенного VNC-контейнера правой боковой панели (рендерится, когда переключатель
+    // включён и окружение апстрима поддерживает SidebarRight)
     function VncDesktopSidebarPane() {
-      // 订阅 VNC 路径：Admin 改路径后无需刷新页面，iframe 自动切到新地址重建
+      // Подписка на путь VNC: после смены в Admin без обновления страницы iframe автоматически
+      // пересоздаётся на новом адресе
       const [storedVncPath, setVncPath] = React.useState(getStoredVncPath());
       React.useEffect(() => subscribeVncPath(setVncPath), []);
       const vncUrl = `${storedVncPath.replace(/\/+$/, '')}/?autoconnect=1&resize=scale`;
@@ -355,7 +361,7 @@ window.__ModuleLoader__.load({
             'span',
             { className: 'dshDesktopBarTitle' },
             '🖥️',
-            zh ? 'Chromium 容器桌面' : 'Chromium Container Desktop'
+            ru ? 'Рабочий стол Chromium' : 'Chromium Container Desktop'
           ),
           React.createElement(
             'div',
@@ -367,7 +373,7 @@ window.__ModuleLoader__.load({
                 className: 'dshDesktopBarBtn',
                 onClick: () => setReloadKey(k => k + 1)
               },
-              zh ? '刷新画面' : 'Refresh'
+              ru ? 'Обновить изображение' : 'Refresh'
             ),
             React.createElement(
               'a',
@@ -377,7 +383,7 @@ window.__ModuleLoader__.load({
                 rel: 'noreferrer',
                 className: 'dshDesktopBarLink'
               },
-              (zh ? '新窗口全屏' : 'Open in Tab') + ' ↗'
+              (ru ? 'Полный экран в новом окне' : 'Open in Tab') + ' ↗'
             )
           )
         ),
@@ -414,7 +420,7 @@ window.__ModuleLoader__.load({
                 background: 'var(--dsw-alias-state-business-tertiary, #e0f2fe)',
                 color: 'var(--dsw-alias-state-business-primary, #0284c7)'
               }
-            }, zh ? '内置容器套件组件' : 'Builtin Suite Component')
+            }, ru ? 'Встроенный компонент контейнерного набора' : 'Builtin Suite Component')
           ),
           React.createElement('p', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-secondary, #64748b)', margin: 0, lineHeight: 1.5 } }, labels.description)
         ),
@@ -423,23 +429,26 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      // 配置权威已统一到 Admin「浏览器与桌面控制」页：客户端不再读写 DSH 设置命名空间。
+      // Авторитет конфигурации переехал на страницу Admin «Браузер и рабочий стол»:
+      // клиент больше не читает и не пишет пространство имён настроек DSH.
       if (ctx.slots && typeof ctx.slots.inject === 'function') {
-        // 1. 现代 DSH 规范 (>= 0.1.5 / 0.1.6)：将“容器浏览器”注册为设置中心的独立一等公民 Section (settings.section)
-        // 与 dshmarket 和 dsh-thinking-effort 保持完全一致的注册范式
+        // 1. Современный стандарт DSH (>= 0.1.5 / 0.1.6): регистрируем «контейнерный браузер»
+        // как самостоятельную секцию первого класса в центре настроек (settings.section)
+        // — та же парадигма регистрации, что у dshmarket и dsh-thinking-effort
         ctx.slots.inject('settings.section', () => {
           return ctx.slots.register({
             name: 'settings.section',
             id: 'browser-desktop',
             order: 45,
-            label: () => (zh ? '容器浏览器' : 'Container Browser')
+            label: () => (ru ? 'Контейнерный браузер' : 'Container Browser')
           }, BrowserDesktopSection);
         });
 
         // =========================================================================
-        // 【兼容老版本 DSH (<= 0.1.4 / 0.1.5) - 历史向下兼容】
-        // 说明：老版本 DSH 在“设置 -> 插件”菜单内通过 settings.plugin.item 插槽装载各插件的配置卡片。
-        // 若后续彻底移除对老版本 DSH 的支持，可直接安全删除以下整个代码块：
+        // 【Совместимость со старыми DSH (<= 0.1.4 / 0.1.5) — историческая поддержка вниз】
+        // Старые DSH грузят конфигурационные карточки плагинов в меню «Настройки -> Плагины»
+        // через слот settings.plugin.item.
+        // Когда поддержку старых DSH полностью уберут, весь блок ниже можно смело удалить:
         // =========================================================================
         ctx.slots.inject('settings.plugin.item', () => {
           return ctx.slots.register({
@@ -450,10 +459,11 @@ window.__ModuleLoader__.load({
         });
 
         // =========================================================================
-        // 【兼容老版本 DSH 结束】
+        // 【Конец совместимости со старыми DSH】
         // =========================================================================
 
-        // 2. 右侧边栏 Tab：权威来自网关（Admin「浏览器与桌面控制」页的「右侧边栏桌面 Tab」）
+        // 2. Вкладка правой боковой панели: авторитет исходит из шлюза (включатель «Вкладка рабочего
+        //    стола в правой боковой панели» на странице Admin «Браузер и рабочий стол»)
         const injectSidebarTab = (scopedCtx) => {
           window.__DSH_SIDEBAR_RIGHT__ = scopedCtx.sidebarRight;
           window.__DSH_OPEN_SIDEBAR_TAB__ = (kind) => {
@@ -462,11 +472,12 @@ window.__ModuleLoader__.load({
                 scopedCtx.sidebarRight.openTab({ kind });
               }
             } catch (err) {
-              console.warn('[dsh-browser-desktop] 呼出右侧边栏 Tab 失败:', err);
+              console.warn('[dsh-browser-desktop] Сбой вызова вкладки правой боковой панели:', err);
             }
           };
-          // P13：返回清理函数 —— Cordis 会在依赖失效/插件卸载时调用它回收全局键，
-          // 否则插件被卸载后 window 上会残留指向已销毁 ctx 的引用。
+          // P13: возвращается функция очистки — Cordis вызывает её при инвалидации зависимостей/выгрузке
+          // плагина, чтобы убрать глобальные ключи; иначе после выгрузки на window останутся ссылки
+          // на уже уничтоженный ctx.
           const cleanupGlobals = () => {
             try { delete window.__DSH_SIDEBAR_RIGHT__; } catch {}
             try { delete window.__DSH_OPEN_SIDEBAR_TAB__; } catch {}
@@ -479,15 +490,15 @@ window.__ModuleLoader__.load({
                   id: DESKTOP_ID,
                   kind: DESKTOP_KIND,
                   priority: 'extension',
-                  title: () => (zh ? '容器桌面' : 'Container Desktop'),
+                  title: () => (ru ? 'Контейнерный рабочий стол' : 'Container Desktop'),
                   guide: [{
                     order: 20,
-                    title: () => (zh ? '容器浏览器桌面' : 'Container Desktop'),
-                    description: () => (zh ? '打开容器内置 Chromium 浏览器与 noVNC 实时桌面 (支持 CDP 调试)' : 'Open Chromium browser & noVNC desktop')
+                    title: () => (ru ? 'Контейнерный браузер рабочий стол' : 'Container Desktop'),
+                    description: () => (ru ? 'Открыть встроенный браузер Chromium и живой рабочий стол noVNC (с отладкой CDP)' : 'Open Chromium browser & noVNC desktop')
                   }]
                 });
               } catch (e) {
-                console.warn('[dsh-browser-desktop] 注册 sidebar tab 警告:', e.message);
+                console.warn('[dsh-browser-desktop] Предупреждение регистрации вкладки боковой панели:', e.message);
               }
 
               for (const key of [DESKTOP_ID, DESKTOP_KIND]) {
@@ -514,7 +525,7 @@ window.__ModuleLoader__.load({
               try {
                 ctx.inject(['sidebarRightTabs', 'sidebarRight'], (scopedCtx) => injectSidebarTab(scopedCtx));
               } catch (err) {
-                console.warn('[dsh-browser-desktop] 条件注入右侧边栏依赖失败 (优雅降级):', err.message);
+                console.warn('[dsh-browser-desktop] Сбой условного внедрения зависимостей правой боковой панели (мягкая деградация):', err.message);
               }
             })
             .catch(() => {});

@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#f8fafc" />
-  <title>DeepSeek Harness - 初始化访问口令</title>
+  <title>DeepSeek Harness - Настройка кода доступа</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <style>
     :root {
@@ -25,7 +25,7 @@
       --shadow-card: 0 20px 30px -10px rgba(15, 23, 42, 0.08), 0 10px 15px -3px rgba(15, 23, 42, 0.04);
       --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     }
-    /* 移动端基线：禁止 iOS 横屏文字自动膨胀 */
+    /* Базовый уровень мобильных: запрет автоувеличения текста при горизонтальной ориентации экрана в iOS */
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
     * { box-sizing: border-box; margin: 0; padding: 0;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
@@ -34,7 +34,7 @@
     .card { width: 100%; max-width: 440px; background: var(--card-bg); border: 1px solid var(--card-border);
             border-radius: var(--radius-card); box-shadow: var(--shadow-card); padding: 34px 30px 28px; }
     .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
-    /* 与登录页保持一致：直接使用鲸鱼 LOGO（/favicon.svg），不再用蓝色方块 + 字母 D */
+    /* В соответствии со страницей входа: используем логотип-кита (/favicon.svg), без синего квадрата с буквой D */
     .brand-logo { width: 34px; height: 34px; display: block; object-fit: contain; }
     @media (prefers-color-scheme: dark) { .brand-logo { filter: invert(1); } }
     .brand-name { font-size: 17px; font-weight: 800; }
@@ -42,7 +42,7 @@
     .desc { font-size: 13px; color: var(--text-muted); line-height: 1.65; margin-bottom: 20px; }
     .form-group { margin-bottom: 15px; }
     .form-label { display: block; font-size: 12.5px; font-weight: 700; color: var(--text-muted); margin-bottom: 7px; }
-    /* ≥16px：避免 iOS Safari 聚焦输入框时自动放大整个页面 */
+    /* ≥16px: предотвращает автоматическое увеличение страницы iOS Safari при фокусировке на поле ввода */
     .form-input { width: 100%; padding: 11px 13px; font-size: 16px; color: var(--text-main);
                   background: #fff; border: 1px solid var(--card-border); border-radius: var(--radius-input);
                   transition: var(--transition); outline: none; }
@@ -62,7 +62,7 @@
     .rules { background: #f8fafc; border: 1px solid var(--card-border); border-radius: var(--radius-input);
              padding: 10px 13px; font-size: 12px; color: var(--text-muted); line-height: 1.7; margin-bottom: 16px; }
 
-    /* ===== 移动端适配 ===== */
+    /* ===== Адаптация под мобильные устройства ===== */
     @media (max-width: 520px) {
       body { padding: 16px 12px calc(16px + env(safe-area-inset-bottom, 0px)); }
       .card { padding: 24px 18px 22px; border-radius: 14px; }
@@ -78,7 +78,8 @@
       .brand-name { font-size: 15px; }
     }
 
-    /* 横屏 / 矮屏：垂直居中会把内容顶出视口，改为顶部对齐并压缩留白 */
+    /* Горизонтальная ориентация / низкий экран: вертикальное центрирование выталкивает контент,
+       выравниваем по верху и сжимаем отступы */
     @media (max-height: 660px) {
       body { justify-content: flex-start; }
       .card { padding-top: 20px; padding-bottom: 18px; }
@@ -91,32 +92,33 @@
       <img src="/favicon.svg" class="brand-logo" alt="DeepSeek Harness" />
       <div class="brand-name">DeepSeek Harness</div>
     </div>
-    <h1>初始化访问口令</h1>
+    <h1>Настройка кода доступа</h1>
     <p class="desc">
-      检测到本容器<strong>尚未设置访问口令</strong>。为避免服务在无保护状态下暴露，
-      请先设置一个口令 —— 它将同时保护 DSH Web、管理后台与容器桌面 (VNC)。
+      Обнаружено, что для этого контейнера <strong>код доступа ещё не задан</strong>. Чтобы
+      не оставлять службу незащищённой, сначала задайте код доступа — он будет защищать
+      и DSH Web, и панель управления, и рабочий стол контейнера (VNC).
     </p>
 
     <div class="alert alert-error" id="errBox"></div>
     <div class="alert alert-ok" id="okBox"></div>
 
     <div class="rules">
-      · 长度至少 <strong>6 位</strong>，建议混合字母、数字与符号<br />
-      · 不要使用 <code>admin</code> / <code>password</code> / <code>123456</code> 等弱口令<br />
-      · 口令会以 <code>0600</code> 权限持久化保存，容器重启后依然有效
+      · Длина не менее <strong>6 символов</strong>, рекомендуем сочетание букв, цифр и символов<br />
+      · Не используйте слабые пароли вроде <code>admin</code> / <code>password</code> / <code>123456</code><br />
+      · Пароль сохраняется постоянным с правами <code>0600</code> и останется действительным после перезапуска контейнера
     </div>
 
     <form id="setupForm" autocomplete="off">
       <div class="form-group">
-        <label class="form-label" for="pwd">访问口令</label>
-        <input class="form-input" id="pwd" type="password" autocomplete="new-password" placeholder="请输入访问口令" />
+        <label class="form-label" for="pwd">Код доступа</label>
+        <input class="form-input" id="pwd" type="password" autocomplete="new-password" placeholder="Введите код доступа" />
       </div>
       <div class="form-group">
-        <label class="form-label" for="pwd2">确认口令</label>
-        <input class="form-input" id="pwd2" type="password" autocomplete="new-password" placeholder="请再次输入以确认" />
+        <label class="form-label" for="pwd2">Подтверждение</label>
+        <input class="form-input" id="pwd2" type="password" autocomplete="new-password" placeholder="Введите пароль ещё раз для подтверждения" />
         <div class="hint" id="matchHint"></div>
       </div>
-      <button class="btn" id="submitBtn" type="submit">设置并进入</button>
+      <button class="btn" id="submitBtn" type="submit">Установить и войти</button>
     </form>
   </div>
 
@@ -136,7 +138,7 @@
     function checkMatch() {
       if (!pwd2.value) { matchHint.textContent = ''; matchHint.className = 'hint'; return; }
       const same = pwd.value === pwd2.value;
-      matchHint.textContent = same ? '两次输入一致' : '两次输入不一致';
+      matchHint.textContent = same ? 'Пароли совпадают' : 'Пароли не совпадают';
       matchHint.className = 'hint' + (same ? ' ok' : '');
     }
     pwd.addEventListener('input', checkMatch);
@@ -147,12 +149,12 @@
       clearError();
       const p = pwd.value;
       const p2 = pwd2.value;
-      if (p.length < MIN_LEN) return showError(`口令长度至少 ${MIN_LEN} 位`);
-      if (p !== p2) return showError('两次输入的口令不一致，请重新确认');
-      if (WEAK.includes(p.toLowerCase())) return showError('该口令过于常见，请更换更安全的口令');
+      if (p.length < MIN_LEN) return showError(`Длина пароля не менее ${MIN_LEN} символов`);
+      if (p !== p2) return showError('Введённые пароли не совпадают, проверьте ещё раз');
+      if (WEAK.includes(p.toLowerCase())) return showError('Этот пароль слишком распространён, выберите более надёжный');
 
       submitBtn.disabled = true;
-      submitBtn.textContent = '正在保存...';
+      submitBtn.textContent = 'Сохранение...';
       try {
         const res = await fetch('/__auth/setup', {
           method: 'POST',
@@ -161,14 +163,14 @@
           signal: AbortSignal.timeout(15000)
         });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok || !data.ok) throw new Error(data.error || `设置失败 (HTTP ${res.status})`);
-        okBox.textContent = '✅ 访问口令设置成功，正在进入管理后台...';
+        if (!res.ok || !data.ok) throw new Error(data.error || `Ошибка настройки (HTTP ${res.status})`);
+        okBox.textContent = '✅ Код доступа установлен, переход в панель управления...';
         okBox.classList.add('show');
         setTimeout(() => { window.location.href = '/admin/'; }, 900);
       } catch (err) {
-        showError('设置失败: ' + err.message);
+        showError('Ошибка настройки: ' + err.message);
         submitBtn.disabled = false;
-        submitBtn.textContent = '设置并进入';
+        submitBtn.textContent = 'Установить и войти';
       }
     });
   </script>

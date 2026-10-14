@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#f8fafc" />
   <meta http-equiv="refresh" content="3" />
-  <title>DeepSeek Harness - 容器桌面正在启动</title>
+  <title>DeepSeek Harness - Запуск рабочего стола контейнера</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <style>
     :root {
@@ -86,32 +86,32 @@
 <body>
   <main class="card" role="status" aria-live="polite">
     <div class="icon" aria-hidden="true">🖥️</div>
-    <h1 class="title">容器桌面正在启动</h1>
-    <p class="subtitle">首次启动或休眠唤醒通常需要几秒，页面会自动刷新，无需手动操作。</p>
+    <h1 class="title">Запуск рабочего стола контейнера</h1>
+    <p class="subtitle">Первый запуск или пробуждение после сна обычно занимает несколько секунд; страница обновится автоматически, никаких ручных действий не требуется.</p>
 
     <div class="progress" aria-hidden="true"><span></span></div>
 
-    <p class="countdown">将在 <b id="dsh-count">3</b> 秒后自动刷新</p>
-    <button type="button" class="btn" id="dsh-refresh">立即刷新</button>
+    <p class="countdown">Автообновление через <b id="dsh-count">3</b> с.</p>
+    <button type="button" class="btn" id="dsh-refresh">Обновить сейчас</button>
 
     <p class="hint" id="dsh-hint" hidden>
-      启动时间较长，可能遇到异常。<a href="__DSH_ADMIN_PATH__/">前往管理后台查看日志 →</a>
+      Запуск занимает слишком много времени, возможно, возникла проблема.<a href="__DSH_ADMIN_PATH__/">Открыть журнал в панели управления →</a>
     </p>
-    <p class="foot">DeepSeek Harness · 容器浏览器</p>
+    <p class="foot">DeepSeek Harness · Контейнерный браузер</p>
   </main>
 
   <script>
     (function () {
-      // 网关可注入 __DSH_RETRY_SECONDS__（默认 3）；直接打开文件时回退为 3。
+      // Шлюз может подставить __DSH_RETRY_SECONDS__ (по умолчанию 3); при открытии файла напрямую — 3.
       var DEFAULT_RETRY = (typeof __DSH_RETRY_SECONDS__ === 'number') ? __DSH_RETRY_SECONDS__ : 3;
       var q = parseInt(new URLSearchParams(location.search).get('retry') || '', 10);
       var RETRY = (isFinite(q) && q > 0) ? q : DEFAULT_RETRY;
 
-      // 保持 <meta refresh> 与倒计时一致（无 JS 时以静态 3s 兜底）
+      // Держим <meta refresh> в соответствии с обратным отсчётом (без JS — статические 3 с как запасной вариант)
       var meta = document.querySelector('meta[http-equiv="refresh"]');
       if (meta) meta.setAttribute('content', String(RETRY));
 
-      // 连续多次重载仍未就绪 → 升级提示（sessionStorage 仅本标签页有效）
+      // Несколько перезагрузок подряд, а страница всё ещё не готова → показываем подсказку (sessionStorage действует только для этой вкладки)
       var attempts = 0;
       try { attempts = parseInt(sessionStorage.getItem('dsh-desktop-starting-attempts') || '0', 10) || 0; } catch (e) {}
       attempts += 1;

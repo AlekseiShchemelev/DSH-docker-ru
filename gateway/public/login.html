@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#f8fafc" />
-  <title>DeepSeek Harness - 访问验证</title>
+  <title>DeepSeek Harness - Проверка доступа</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <style>
     :root {
@@ -25,7 +25,7 @@
       --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
-    /* 移动端基线：禁止 iOS 横屏文字自动膨胀 */
+    /* Базовый уровень мобильных: запрет автоувеличения текста при горизонтальной ориентации экрана в iOS */
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 
     * {
@@ -152,7 +152,7 @@
       padding: 0 14px 0 42px;
       border: 1.5px solid var(--card-border);
       border-radius: var(--radius-input);
-      /* ≥16px：避免 iOS Safari 聚焦输入框时自动放大整个页面 */
+      /* ≥16px: предотвращает автоматическое увеличение всей страницы iOS Safari при фокусировке на поле ввода */
       font-size: 16px;
       color: var(--text-main);
       background: #ffffff;
@@ -249,7 +249,7 @@
       color: #475569;
     }
 
-    /* ===== 移动端适配 ===== */
+    /* ===== Адаптация под мобильные устройства ===== */
     @media (max-width: 520px) {
       body { padding: 16px 12px calc(16px + env(safe-area-inset-bottom, 0px)); }
       .auth-card { padding: 26px 20px; border-radius: 14px; }
@@ -264,7 +264,8 @@
       .brand-title { font-size: 18px; }
     }
 
-    /* 横屏 / 矮屏：垂直居中会把内容顶出视口，改为顶部对齐并压缩留白 */
+    /* Горизонтальная ориентация / низкий экран: вертикальное центрирование выталкивает контент за пределы
+       видимой области, поэтому выравниваем по верху и сжимаем отступы */
     @media (max-height: 620px) {
       body { justify-content: flex-start; }
       .auth-card { padding-top: 22px; padding-bottom: 22px; }
@@ -279,14 +280,14 @@
       <div class="brand-header">
         <img src="/favicon.svg" class="brand-logo" alt="DeepSeek Harness" />
         <h1 class="brand-title">DeepSeek Harness</h1>
-        <p class="brand-subtitle">请输入认证码以访问工作空间与容器桌面</p>
+        <p class="brand-subtitle">Введите код доступа, чтобы открыть рабочее пространство и рабочий стол контейнера</p>
       </div>
 
       <div class="alert alert-error" id="errorAlert">
         <svg style="width:18px;height:18px;flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
         </svg>
-        <span id="errorMessage">认证码错误，请重新输入</span>
+        <span id="errorMessage">Неверный код доступа, попробуйте ещё раз</span>
       </div>
 
       <form id="authForm" onsubmit="handleLogin(event)">
@@ -301,8 +302,8 @@
               type="password"
               id="tokenInput"
               class="form-input"
-              aria-label="访问认证码 (Access Code)"
-              placeholder="请输入环境变量配置的 AUTH_TOKEN"
+              aria-label="Код доступа (Access Code)"
+              placeholder="Введите AUTH_TOKEN из переменных окружения"
               required
               autocomplete="current-password"
               autofocus
@@ -312,7 +313,7 @@
 
         <button type="submit" class="submit-btn" id="submitBtn">
           <span class="spinner" id="btnSpinner"></span>
-          <span id="btnText">进入工作区</span>
+          <span id="btnText">Войти в рабочее пространство</span>
         </button>
       </form>
     </div>
@@ -320,7 +321,7 @@
     <div class="footer-text">
       <div class="footer-badge">
         <span>●</span>
-        <span>DeepSeek Harness 网关</span>
+        <span>Шлюз DeepSeek Harness</span>
       </div>
     </div>
   </div>
@@ -330,7 +331,8 @@
     function getSafeRedirect(raw) {
       if (!raw || typeof raw !== 'string') return '/';
       try {
-        // 使用 WHATWG URL 严格限定 origin 必须与当前站点完全一致，彻底杜绝 //, /\\, \\t 等解析旁路
+        // Используем WHATWG URL, чтобы строго требовать, чтобы origin совпадал с текущим сайтом
+        // полностью, надёжно исключая пути обхода типа //, /\\, \\t при разборе
         const parsed = new URL(raw, window.location.origin);
         if (parsed.origin !== window.location.origin) {
           return '/';
@@ -361,7 +363,7 @@
       errorAlert.style.display = 'none';
       submitBtn.disabled = true;
       btnSpinner.style.display = 'inline-block';
-      btnText.textContent = '正在验证...';
+      btnText.textContent = 'Проверка...';
 
       try {
         const res = await fetch('/__auth/verify', {
@@ -374,27 +376,27 @@
         const data = await res.json();
 
         if (res.ok && data.ok) {
-          btnText.textContent = '验证通过，正在跳转...';
+          btnText.textContent = 'Проверка пройдена, переход...';
           setTimeout(() => {
             window.location.href = redirectUrl;
           }, 300);
         } else {
-          errorMessage.textContent = data.error || '认证码无效，请重试';
+          errorMessage.textContent = data.error || 'Код доступа недействителен, попробуйте ещё раз';
           errorAlert.style.display = 'flex';
           authCard.classList.remove('shake');
           void authCard.offsetWidth;
           authCard.classList.add('shake');
           submitBtn.disabled = false;
           btnSpinner.style.display = 'none';
-          btnText.textContent = '进入工作区';
+          btnText.textContent = 'Войти в рабочее пространство';
           document.getElementById('tokenInput').focus();
         }
       } catch (err) {
-        errorMessage.textContent = '网络连接异常，请检查网关服务';
+        errorMessage.textContent = 'Ошибка сети, проверьте службу шлюза';
         errorAlert.style.display = 'flex';
         submitBtn.disabled = false;
         btnSpinner.style.display = 'none';
-        btnText.textContent = '进入工作区';
+        btnText.textContent = 'Войти в рабочее пространство';
       }
     }
   </script>

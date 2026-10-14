@@ -12,7 +12,8 @@ on:
       - main
     tags:
       - 'v*'
-      # GitHub 的 tag 过滤是 glob 而非正则：`+` 是字面量，旧写法 '[0-9]+.[0-9]+.[0-9]+*' 永不匹配
+      # Фильтр тегов у GitHub — это glob, а не регулярное выражение: `+` здесь литеральный символ,
+      # старая запись '[0-9]+.[0-9]+.[0-9]+*' никогда не совпадала
       - '[0-9]*.[0-9]*.[0-9]*'
 
 permissions:
@@ -28,7 +29,7 @@ jobs:
       project_version: ${{ steps.version_detector.outputs.project_version }}
     steps:
       - name: Checkout repository
-        # 供应链安全：固定到 commit SHA（tag 可被移动）
+        # Безопасность цепочки поставок: фиксация на commit SHA (тег можно переносить)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 2
@@ -38,30 +39,30 @@ jobs:
         run: |
           SHOULD_BUILD="true"
 
-          # 1. 手动 workflow_dispatch 触发
+          # 1. ручной триггер workflow_dispatch
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             PROJ_VER="${{ github.event.inputs.version }}"
             [ -z "$PROJ_VER" ] && PROJ_VER="0.2.3"
-            echo "✔ 手动触发 (workflow_dispatch)，指定版本: ${PROJ_VER}"
+            echo "✔ Ручной запуск (workflow_dispatch), заданная версия: ${PROJ_VER}"
 
-          # 2. Git Tag 触发 (如 v0.0.9)
+          # 2. триггер по Git-тегу (например v0.0.9)
           elif [[ "${{ github.ref }}" =~ ^refs/tags/v?([0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
             PROJ_VER="${BASH_REMATCH[1]}"
-            echo "✔ Git Tag 触发发布，版本: ${PROJ_VER}"
+            echo "✔ Запуск релиза по Git-тегу, версия: ${PROJ_VER}"
 
-          # 3. main 分支 push 触发：严格比对版本号是否变动
+          # 3. push в main: строгое сравнение изменения номера версии
           else
             PROJ_VER=$(grep -E '^PROJ_VER=' build.sh | cut -d'"' -f2 || true)
             [ -z "$PROJ_VER" ] && PROJ_VER="0.2.3"
 
             PREV_VER=$(git show HEAD~1:build.sh 2>/dev/null | grep -E '^PROJ_VER=' | cut -d'"' -f2 || true)
-            echo "当前版本: [${PROJ_VER}], 上一提交版本: [${PREV_VER}]"
+            echo "Текущая версия: [${PROJ_VER}], версия в предыдущем коммите: [${PREV_VER}]"
 
             if [ -n "$PREV_VER" ] && [ "$PROJ_VER" = "$PREV_VER" ]; then
-              echo "⚠ 项目版本号未发生变动 (${PROJ_VER} == ${PREV_VER})，跳过镜像自动构建与发布！"
+              echo "⚠ Номер версии проекта не изменился (${PROJ_VER} == ${PREV_VER}), автопостроение и публикация образа пропускаются!"
               SHOULD_BUILD="false"
             else
-              echo "✔ 检测到项目版本号变更 (${PREV_VER:-init} -> ${PROJ_VER})，触发镜像构建！"
+              echo "✔ Обнаружено изменение номера версии проекта (${PREV_VER:-init} -> ${PROJ_VER}), запускаем построение образа!"
             fi
           fi
 
@@ -110,11 +111,12 @@ jobs:
           LATEST_TAG="${{ matrix.latest_tag }}"
           PROJ_VER="${{ needs.check-version.outputs.project_version }}"
 
-          # M10：内置 DSH 版本以 version.json#supply 为唯一来源（不再每次动态探测 registry，
-          # 否则同一份代码在不同时间会构建出不同内容的镜像）
+          # M10: встроенная версия DSH имеет единственный источник — version.json#supply
+          # (никакого динамического опроса registry при каждом построении, иначе тот же код
+          # в разное время соберётся в различающиеся по содержимому образы)
           DSH_VERSION=$(node -e "process.stdout.write(require('./version.json').supply.dshVersion||'')")
           if [ -z "$DSH_VERSION" ]; then
-            echo "错误: version.json#supply.dshVersion 未设置" >&2
+            echo "Ошибка: version.json#supply.dshVersion не задан" >&2
             exit 1
           fi
           echo "dsh_version=${DSH_VERSION}" >> $GITHUB_OUTPUT
@@ -122,18 +124,18 @@ jobs:
           echo "Current Project Version: ${PROJ_VER}"
 
           TAGS=""
-          # 默认主标签 (:latest / :latest-market)
+          # основной тег по умолчанию (:latest / :latest-market)
           TAGS="${TAGS}${IMAGE_NAME}:${LATEST_TAG},"
 
-          # 额外标签一：内置官方 DeepSeek Harness 版本号
+          # доп. тег 1: номер версии встроенного официального DeepSeek Harness
           TAGS="${TAGS}${IMAGE_NAME}:${DSH_VERSION}${SUFFIX},"
           TAGS="${TAGS}${IMAGE_NAME}:dsh-${DSH_VERSION}${SUFFIX},"
 
-          # 额外标签二：本项目工程版本号
+          # доп. тег 2: номер инженерной версии этого проекта
           TAGS="${TAGS}${IMAGE_NAME}:${PROJ_VER}${SUFFIX},"
           TAGS="${TAGS}${IMAGE_NAME}:v${PROJ_VER}${SUFFIX}"
 
-          # 兼容传统简写标签 (:market)
+          # совместимый традиционный короткий тег (:market)
           if [ "${{ matrix.variant }}" = "market" ]; then
             TAGS="${TAGS},${IMAGE_NAME}:market"
           fi
@@ -148,11 +150,12 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
-          # M10：生成 SLSA provenance 与 SBOM（供应链可追溯）
+          # M10: генерация SLSA provenance и SBOM (прослеживаемость цепочки поставок)
           provenance: mode=max
           sbom: true
-          # 每次构建唯一，强制 Dockerfile 预装层缓存失效，
-          # 让 plugins.market.list 里的 dshmarket@latest 真正拉到当次构建的最新版
+          # Уникально для каждой сборки — принудительная инвалидация кэша слоя предустановки
+          # в Dockerfile, чтобы dshmarket@latest из plugins.market.list действительно подтянул
+          # версию текущей сборки
           build-args: |
             NODE_IMAGE=node:24-trixie
             NOVNC_ASSET_REVISION=1.6.0
@@ -187,7 +190,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # M10：镜像发布后做最小冒烟测试 —— 起容器、等健康检查、验证 /healthz 与插件加载
+      # M10: после публикации образа — минимальный дымовой тест: поднять контейнер,
+      # дождаться health-проверки, проверить /healthz и загрузку плагинов
       - name: Smoke test container
         run: |
           set -euo pipefail
@@ -204,6 +208,6 @@ jobs:
           echo "--- /healthz ---"; cat /tmp/healthz.json || true; echo
           docker logs dsh-smoke | tail -40 || true
           docker rm -f dsh-smoke >/dev/null 2>&1 || true
-          [ "$ok" = "1" ] || { echo "冒烟测试失败: /healthz 未就绪"; exit 1; }
+          [ "$ok" = "1" ] || { echo "Дымовой тест провален: /healthz не готов"; exit 1; }
           grep -q '"ok":true' /tmp/healthz.json
-          echo "冒烟测试通过"
+          echo "Дымовой тест пройден"

@@ -1,17 +1,18 @@
 /**
- * P6 回归测试：profile 写锁（scripts/profile-lock.cjs）。
+ * P6 регрессионный тест: write-lock профиля (scripts/profile-lock.cjs).
  *
- * 覆盖：
- *   A. 锁文件路径与 DSH 一致（<profileDir>/package.json.lock）
- *   B. 获取/释放、锁文件内容写入持有者 PID
- *   C. 未持锁写 profile 被运行时护栏拦下（PROFILE_LOCK_NOT_HELD）
- *   D. 进程内可重入（嵌套不会自锁死）
- *   E. 并发任务被串行化（不交错）
- *   F. 锁被他人持有时按 waitMs 超时（PROFILE_LOCK_TIMEOUT）
- *   G. 陈旧锁回收：PID 已死 + mtime 超阈值 → 回收；PID 存活 → 绝不回收
- *   H. 跨进程互斥：多进程并发"读-改-写"同一个计数文件，零丢更新
+ * Покрытие:
+ *   A. путь файла lock совпадает с DSH (<profileDir>/package.json.lock)
+ *   B. получение/освобождение, в файл lock пишется PID владельца
+ *   C. запись profile без удержания lock отсекается runtime-защитой (PROFILE_LOCK_NOT_HELD)
+ *   D. вложенное получение в одном процессе явно отклоняется (без self-дедлока)
+ *   E. конкурентные задачи сериализуются (не перемешиваются)
+ *   F. когда lock держит другой — тайм-аут по waitMs (PROFILE_LOCK_TIMEOUT)
+ *   G. уборка устаревшего lock: PID умер + mtime превысил порог → уборка; PID жив → никогда
+ *   H. межпроцессное взаимоисключение: несколько процессов «читают-меняют-пишут»
+ *      один и тот же счётчик — ноль потерянных обновлений
  *
- * 用法: node scripts/profile-lock-test.mjs
+ * Запуск: node scripts/profile-lock-test.mjs
  */
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
@@ -20,7 +21,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 必须在 require 之前设置：让陈旧锁回收阈值变小，便于测试
+// Должно быть выставлено до require: уменьшаем порог уборки устаревшего lock для удобства теста
 process.env.DSH_PROFILE_LOCK_STALE_MS = '1200';
 process.env.DSH_PROFILE_LOCK_WARN_MS = '100000';
 
@@ -45,41 +46,41 @@ fs.mkdirSync(profileDir, { recursive: true });
 fs.writeFileSync(path.join(profileDir, 'package.json'), '{}\n');
 const lockPath = profileLockPath(profileDir);
 
-console.log('\n=== A. 锁文件路径与 DSH 一致 ===');
-ok(lockPath === path.join(profileDir, 'package.json.lock'), '锁文件为 <profileDir>/package.json.lock');
+console.log('\n=== A. Путь файла lock совпадает с DSH ===');
+ok(lockPath === path.join(profileDir, 'package.json.lock'), 'файл lock — <profileDir>/package.json.lock');
 
-console.log('\n=== B. 获取/释放与锁内容 ===');
+console.log('\n=== B. Получение/освобождение и содержимое lock ===');
 const rel = await acquireProfileLock(profileDir);
-ok(fs.existsSync(lockPath), '持锁期间锁文件存在');
-ok(fs.readFileSync(lockPath, 'utf8').trim() === String(process.pid), '锁文件写入持有者 PID');
-ok((fs.statSync(lockPath).mode & 0o777) === 0o600, '锁文件权限为 0600');
-ok(isProfileLockHeld(profileDir), 'isProfileLockHeld 为真');
+ok(fs.existsSync(lockPath), 'пока держится lock, файл существует');
+ok(fs.readFileSync(lockPath, 'utf8').trim() === String(process.pid), 'в файл lock записан PID владельца');
+ok((fs.statSync(lockPath).mode & 0o777) === 0o600, 'права файла lock — 0600');
+ok(isProfileLockHeld(profileDir), 'isProfileLockHeld возвращает true');
 rel();
-ok(!fs.existsSync(lockPath), '释放后锁文件被删除');
-ok(!isProfileLockHeld(profileDir), 'isProfileLockHeld 为假');
+ok(!fs.existsSync(lockPath), 'после освобождения файл lock удалён');
+ok(!isProfileLockHeld(profileDir), 'isProfileLockHeld возвращает false');
 
-console.log('\n=== C. 未持锁写 profile 被护栏拦下 ===');
+console.log('\n=== C. Запись profile без lock отсекается защитой ===');
 let guardCode = null;
 try { assertProfileLockHeld(profileDir); } catch (e) { guardCode = e.code; }
-ok(guardCode === 'PROFILE_LOCK_NOT_HELD', '未持锁时抛 PROFILE_LOCK_NOT_HELD');
+ok(guardCode === 'PROFILE_LOCK_NOT_HELD', 'без удержания lock бросается PROFILE_LOCK_NOT_HELD');
 
-console.log('\n=== D. 嵌套获取被明确拒绝（不静默自锁死） ===');
+console.log('\n=== D. Вложенное получение явно отклоняется (без self-дедлока) ===');
 const r1 = await acquireProfileLock(profileDir);
 let nestedCode = null;
 try { await acquireProfileLock(profileDir, { waitMs: 200 }); } catch (e) { nestedCode = e.code; }
-ok(nestedCode === 'PROFILE_LOCK_REENTRANT', '同进程重复取锁抛 PROFILE_LOCK_REENTRANT');
+ok(nestedCode === 'PROFILE_LOCK_REENTRANT', 'повторный захват lock в том же процессе бросает PROFILE_LOCK_REENTRANT');
 r1();
-ok(!isProfileLockHeld(profileDir), '释放后完全释放');
+ok(!isProfileLockHeld(profileDir), 'после освобождения всё полностью освобождено');
 
-console.log('\n=== E. 并发任务被串行化 ===');
+console.log('\n=== E. Конкурентные задачи сериализуются ===');
 const order = [];
 await Promise.all([
   withProfileLock(profileDir, async () => { order.push('a-in'); await sleep(120); order.push('a-out'); }),
   withProfileLock(profileDir, async () => { order.push('b-in'); await sleep(20); order.push('b-out'); })
 ]);
-ok(order.join(',') === 'a-in,a-out,b-in,b-out', `无交错（实际 ${order.join(',')}）`);
+ok(order.join(',') === 'a-in,a-out,b-in,b-out', `без перемешивания (факт ${order.join(',')})`);
 
-console.log('\n=== F. 跨进程等待超时 ===');
+console.log('\n=== F. Ожидание через процессы: тайм-аут ===');
 const holderScript = path.join(tmp, 'holder.cjs');
 fs.writeFileSync(holderScript, `
 const { acquireProfileLock } = require(${JSON.stringify(LOCK_MOD)});
@@ -99,12 +100,12 @@ const holderReady = new Promise((resolve) => {
 await Promise.race([holderReady, sleep(5000)]);
 let timeoutCode = null;
 try { await withProfileLock(profileDir, async () => {}, { waitMs: 150 }); } catch (e) { timeoutCode = e.code; }
-ok(timeoutCode === 'PROFILE_LOCK_TIMEOUT', '他人持锁时按 waitMs 超时并抛 PROFILE_LOCK_TIMEOUT');
+ok(timeoutCode === 'PROFILE_LOCK_TIMEOUT', 'когда lock держит другой, тайм-аут по waitMs и бросок PROFILE_LOCK_TIMEOUT');
 await holderExited;
-ok(!fs.existsSync(lockPath), '持有者释放后锁文件消失');
+ok(!fs.existsSync(lockPath), 'после освобождения владельцем файл lock исчезает');
 
-console.log('\n=== G. 陈旧锁回收（保守策略）===');
-// G1：PID 已不存在 + mtime 超阈值 → 应被回收
+console.log('\n=== G. Уборка устаревшего lock (консервативная) ===');
+// G1: PID не существует + mtime превысил порог → уборка ожидается
 fs.writeFileSync(lockPath, '999999\n', { flag: 'wx' });
 const oldTs = Date.now() / 1000 - 3600;
 fs.utimesSync(lockPath, oldTs, oldTs);
@@ -114,17 +115,17 @@ try {
   reclaimed = true;
   r();
 } catch { reclaimed = false; }
-ok(reclaimed, '锁内 PID 已死且超时 → 回收并成功获取');
+ok(reclaimed, 'PID в lock мёртв и срок превышен → уборка и успешное получение');
 
-// G2：PID 存活（写本进程 PID）+ mtime 超阈值 → 绝不回收
+// G2: PID жив (пишем PID этого процесса) + mtime превысил порог → никогда не убираем
 fs.writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
 fs.utimesSync(lockPath, oldTs, oldTs);
 let liveKept = false;
 try { await withProfileLock(profileDir, async () => {}, { waitMs: 300 }); } catch (e) { liveKept = e.code === 'PROFILE_LOCK_TIMEOUT'; }
-ok(liveKept, '锁内 PID 存活 → 即使 mtime 超阈值也不回收（保守）');
+ok(liveKept, 'PID в lock жив → даже при превышенном mtime не убираем (консервативно)');
 fs.rmSync(lockPath, { force: true });
 
-console.log('\n=== H. 跨进程互斥（零丢更新）===');
+console.log('\n=== H. Межпроцессное взаимоисключение (ноль потерь) ===');
 const childScript = path.join(tmp, 'child.cjs');
 fs.writeFileSync(childScript, `
 const { withProfileLock } = require(${JSON.stringify(LOCK_MOD)});
@@ -150,9 +151,9 @@ const runs = Array.from({ length: CHILDREN }, () => new Promise((resolve) => {
 }));
 await Promise.all(runs);
 const finalCount = Number(fs.readFileSync(counter, 'utf8'));
-ok(finalCount === CHILDREN * 10, `${CHILDREN} 进程 × 10 次读改写 = ${CHILDREN * 10}（实际 ${finalCount}，无丢更新）`);
-ok(!fs.existsSync(lockPath), '全部子进程结束后锁文件已释放');
+ok(finalCount === CHILDREN * 10, `${CHILDREN} процесса × 10 чтений/записей = ${CHILDREN * 10} (факт ${finalCount}, без потерь)`);
+ok(!fs.existsSync(lockPath), 'после завершения всех дочерних процессов файл lock освобождён');
 
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(`\n===== 汇总: 通过 ${pass} / 失败 ${fail} =====`);
+console.log(`\n===== Итог: пройдено ${pass} / провалено ${fail} =====`);
 process.exit(fail ? 1 : 0);

@@ -1,15 +1,15 @@
 /**
- * Issue #9「恢复范围可选」回归测试套件
+ * Регресс Issue #9 «Выбор области восстановления» (Restore Scope)
  * 
- * 按照设计文档 doc/issue-9/restore-scope-minutes.md §7 规格实现：
- * - TC-01 正例：现网有 S1~S3，快照含 B1~B5 → config-only 还原后：配置变快照值、S1~S3 仍在、B1~B5 未进入；
- * - TC-02 故障注入：staging 故障配置触发 boot 失败，精确逆向回滚后，现网 S1~S3 原地保留；
- * - TC-03 命名欺诈：含会话快照改名为 xxx-config-xxx.tar.gz，推断类型仍应为 full；
- * - TC-04 空环境：清空 .dsh 后 config-only 还原，无 workspace.json 冲突，DSH 正常引导；
- * - TC-05 离线：断网下 config-only 还原，不触发联网 pnpm install，用现网 node_modules 正常拉起；
- * - TC-06 兼容：不传 mode 时行为与现状完全一致（默认全量覆盖还原）。
+ * Реализация по спецификации design doc doc/issue-9/restore-scope-minutes.md §7:
+ * - TC-01 позитив: в актуальном окружении есть S1~S3, в снимке B1~B5 → после config-only восстановления: конфигурация становится из снимка, S1~S3 остаются, B1~B5 не импортированы;
+ * - TC-02 инъекция сбоя: неисправная конфигурация в staging вызывает сбой boot; после точного обратного отката S1~S3 остаются на месте;
+ * - TC-03 мошенничество с именем: архив с сессиями переименован в xxx-config-xxx.tar.gz, вывод типа всё равно должен быть full;
+ * - TC-04 пустое окружение: после очистки .dsh восстановление config-only без конфликтов workspace.json, DSH корректно загружается;
+ * - TC-05 оффлайн: восстановление config-only без сети не запускает сетевой pnpm install, поднимается на текущих node_modules;
+ * - TC-06 совместимость: при отсутствии mode поведение полностью идентично текущему (по умолчанию полная замена full).
  *
- * 运行方式:
+ * Запуск:
  *   node scripts/backup-restore-mode-test.mjs
  *   DSH_HOME=/tmp/custom-home node scripts/backup-restore-mode-test.mjs
  */
@@ -24,9 +24,9 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-// ── 1. 环境隔离与安全守护（绝对禁止触碰真实 /root/.dsh 与杀伤宿主 DSH 进程）──
+// ── 1. Изоляция окружения и страж безопасности (строжайше запрещено трогать реальный /root/.dsh и убивать DSH-процессы хоста) ──
 const envHome = process.env.DSH_HOME;
-// 若外部传入了非系统级的临时目录（如 DSH_HOME=/tmp/...），使用该目录；否则默认在 os.tmpdir() 创建独立临时沙箱
+// Если во внешнем окружении задан не системный временный каталог (например, DSH_HOME=/tmp/...), используем его; иначе по умолчанию создаём независимый временный песочница в os.tmpdir()
 const isCustomTemp = envHome && !envHome.startsWith('/root');
 const TEST_ROOT = isCustomTemp
   ? path.resolve(envHome)
@@ -41,16 +41,16 @@ fs.mkdirSync(TEST_DSH_HOME, { recursive: true });
 fs.mkdirSync(TEST_SNAPSHOTS_DIR, { recursive: true });
 fs.mkdirSync(TEST_DSH_DIR, { recursive: true });
 
-// 关键环境变量覆写：确保 backup-service require 时绑定测试目录
+// Ключевые переопределения переменных окружения: гарантируем, что при require backup-service привязка идёт к тестовым каталогам
 process.env.DSH_HOME = TEST_DSH_HOME;
 process.env.DSH_SNAPSHOTS_DIR = TEST_SNAPSHOTS_DIR;
-process.env.DSH_PORT = '39999'; // 避开 3079 端口，防止 fuser 误触现网服务
+process.env.DSH_PORT = '39999'; // обход порта 3079, чтобы fuser не затронул актуальный сервис
 
-// 安全拦截：禁止测试过程中的外部杀进程逻辑误杀容器内的主进程 (PID 128 等)
+// Страховочный перехват: запрет логики внешнего убийства процессов в тестах, которая могла бы убить главный процесс контейнера (PID 128 и т.п.)
 const origSpawnSync = cp.spawnSync;
 cp.spawnSync = function (cmd, args, opts) {
   if (cmd === 'ps' && Array.isArray(args) && args.includes('-eo')) {
-    // 伪装 ps 输出，避免 restoreBackup 的孤儿清理逻辑向宿主进程发送 SIGKILL
+    // Подделываем вывод ps, чтобы логика очистки сирот в restoreBackup не отправляла SIGKILL процессам хоста
     return { status: 0, stdout: '', stderr: '' };
   }
   if (cmd === 'fuser') {
@@ -59,7 +59,7 @@ cp.spawnSync = function (cmd, args, opts) {
   return origSpawnSync.apply(this, arguments);
 };
 
-// 引入被测模块
+// Подключение тестируемого модуля
 const manifestModule = require(path.join(here, '../gateway/snapshot-manifest.js'));
 
 let backupService = null;
@@ -68,11 +68,11 @@ let backupServiceLoadError = null;
 try {
   backupService = require(path.join(here, '../gateway/backup-service.js'));
 } catch (err) {
-  // 加载失败时记录原因，后续用例统一 SKIP 并打印待排查信息（不掩盖真实问题、不做源码改写）
+  // При неудачной загрузке фиксируем причину; последующие кейсы единообразно SKIP и печатают диагностику (не скрываем настоящую проблему, не переписываем исходники)
   backupServiceLoadError = err;
 }
 
-// ── 2. 测试计数器与报告工具 ───────────────────────────────────────────
+// ── 2. Счётчики тестов и утилиты отчётности ───────────────────────────────────────────
 let passCount = 0;
 let failCount = 0;
 let skipCount = 0;
@@ -84,14 +84,14 @@ function pass(id, msg) {
 
 function fail(id, msg, detail = '') {
   console.error(`   ❌ [FAIL] ${id}: ${msg}`);
-  if (detail) console.error(`      详情: ${detail}`);
+  if (detail) console.error(`      Подробности: ${detail}`);
   failCount++;
 }
 
 function skip(id, reason, assertions = []) {
   console.log(`   ⏭️ [SKIP] ${id}: ${reason}`);
   if (assertions.length > 0) {
-    console.log(`      【待后端就绪后应断言】`);
+    console.log(`      [Что следует утверждать после готовности бэкенда]`);
     for (const a of assertions) {
       console.log(`        · ${a}`);
     }
@@ -99,7 +99,7 @@ function skip(id, reason, assertions = []) {
   skipCount++;
 }
 
-// ── 3. 辅助函数：快速打包测试快照 ─────────────────────────────────────
+// ── 3. Вспомогательная функция: быстрая упаковка тестового снимка ─────────────────────────────
 function buildSnapshotArchive(filename, filesMap) {
   const stageDir = fs.mkdtempSync(path.join(TEST_ROOT, 'stage-build-'));
   const dshSub = path.join(stageDir, '.dsh');
@@ -118,7 +118,7 @@ function buildSnapshotArchive(filename, filesMap) {
   const archivePath = path.join(TEST_SNAPSHOTS_DIR, filename);
   const tarRes = origSpawnSync('tar', ['-czf', archivePath, '-C', stageDir, '.dsh'], { encoding: 'utf8' });
   if (tarRes.status !== 0) {
-    throw new Error(`打包测试快照失败: ${tarRes.stderr}`);
+    throw new Error(`Не удалось упаковать тестовый снимок: ${tarRes.stderr}`);
   }
   fs.rmSync(stageDir, { recursive: true, force: true });
   return archivePath;
@@ -129,7 +129,7 @@ function cleanLiveDsh() {
   fs.mkdirSync(TEST_DSH_DIR, { recursive: true });
 }
 
-// 检查后端是否已实现 mode: 'config-only'（通过 backup-service 源码或导出常量检测）
+// Проверка, реализован ли в бэкенде mode: 'config-only' (по исходному коду backup-service или экспортируемой константе)
 const hasConfigOnlySupport = (() => {
   if (!backupService) return false;
   try {
@@ -142,32 +142,32 @@ const hasConfigOnlySupport = (() => {
 })();
 
 console.log('================================================================');
-console.log('  Issue #9: 快照恢复范围可选 (Restore Scope) 回归用例验证套件');
-console.log(`  隔离工作区: ${TEST_ROOT}`);
-console.log(`  后端实现状态探测: ${hasConfigOnlySupport ? '已就绪 (全面执行业务断言)' : '并行施工中 (执行可运行的基线断言，其余按规范 SKIP)'}`);
+console.log('  Issue #9: набор регрессивных кейсов проверки выбора области восстановления снимка (Restore Scope)');
+console.log(`  Изолированное рабочее пространство: ${TEST_ROOT}`);
+console.log(`  Обнаружение состояния бэкенда: ${hasConfigOnlySupport ? 'готов (выполняются все бизнес-утверждения)' : 'в параллельной разработке (выполняются доступные базовые утверждения, остальное по спецификации SKIP)'}`);
 console.log('================================================================\n');
 
-// ── 4. 测试用例执行 ───────────────────────────────────────────────────
+// ── 4. Выполнение тестовых кейсов ───────────────────────────────────────────────────
 
-// TC-06 兼容性测试：不传 mode 时行为与现状完全一致（默认 full 整包替换）
+// TC-06 тест совместимости: при отсутствии mode поведение полностью идентично текущему (по умолчанию full-замена всего)
 async function testTC06() {
-  console.log('[用例执行] TC-06 兼容性：不传 mode 时默认执行完整覆盖还原');
+  console.log('[Выполнение кейса] TC-06 совместимость: при отсутствии mode по умолчанию выполняется полное перезаписывающее восстановление');
   if (!backupService) {
-    skip('TC-06 兼容性测试', 'gateway/backup-service.js 模块无法加载: ' + (backupServiceLoadError?.message || '模块未就绪'), [
-      '待后端就绪后应断言：不传 mode 时默认执行 full 全量替换还原，旧会话被快照替换'
+    skip('TC-06 совместимость', 'модуль gateway/backup-service.js не удалось загрузить: ' + (backupServiceLoadError?.message || 'модуль не готов'), [
+      'После готовности бэкенда следует утверждать: при отсутствии mode по умолчанию выполняется полное восстановление full, старые сессии заменяются снимком'
     ]);
     return;
   }
   try {
     cleanLiveDsh();
 
-    // 现网环境设置：含已有会话 s_live_1 与旧配置
+    // Настройка актуального окружения: уже имеющаяся сессия s_live_1 и старая конфигурация
     fs.mkdirSync(path.join(TEST_DSH_DIR, 'sessions/s_live_1'), { recursive: true });
     fs.writeFileSync(path.join(TEST_DSH_DIR, 'sessions/s_live_1/content.json'), '{"live":true}');
     fs.writeFileSync(path.join(TEST_DSH_DIR, 'cordis.patch.yml'), 'server: live_value');
     fs.writeFileSync(path.join(TEST_DSH_DIR, 'gateway.config.json'), '{"authToken":"live_token"}');
 
-    // 构造测试快照：含新会话 s_snap_1 与新配置
+    // Конструирование тестового снимка: с новой сессией s_snap_1 и новой конфигурацией
     const snapName = 'dsh-manual-2026-09-30-tc06.tar.gz';
     buildSnapshotArchive(snapName, {
       'cordis.patch.yml': 'server: snapshot_value',
@@ -179,7 +179,7 @@ async function testTC06() {
       boot: async () => ({ ok: true })
     };
 
-    // 不传 mode（或者传空 options）
+    // mode не передан (или переданы пустые options)
     const res = await backupService.restoreBackup(snapName, mockDsh);
 
     const cordisAfter = fs.readFileSync(path.join(TEST_DSH_DIR, 'cordis.patch.yml'), 'utf8');
@@ -190,26 +190,26 @@ async function testTC06() {
     const isOk = res && res.ok === true &&
       cordisAfter.includes('snapshot_value') &&
       hasSnapSession &&
-      !hasLiveSession && // 全量还原替换了旧数据
-      gwConfigAfter;      // gateway.config.json 穿透保留
+      !hasLiveSession && // полное восстановление заменило старые данные
+      gwConfigAfter;      // gateway.config.json сохранён сквозным образом
 
     if (isOk) {
-      pass('TC-06 兼容性测试', '不传 mode 时默认执行 full 全量替换还原，旧会话被快照替换，配置与穿透项正确保留');
+      pass('TC-06 совместимость', 'при отсутствии mode по умолчанию выполняется полное перезаписывающее восстановление full, старые сессии заменены снимком, конфигурация и сквозные элементы корректно сохранены');
     } else {
-      fail('TC-06 兼容性测试', '还原后的环境状态与预期不一致', JSON.stringify({ res, cordisAfter, hasSnapSession, hasLiveSession }));
+      fail('TC-06 совместимость', 'состояние окружения после восстановления не соответствует ожиданиям', JSON.stringify({ res, cordisAfter, hasSnapSession, hasLiveSession }));
     }
   } catch (err) {
-    fail('TC-06 兼容性测试', '执行抛出异常', err.message);
+    fail('TC-06 совместимость', 'при выполнении выброшено исключение', err.message);
   }
 }
 
-// TC-03 命名欺诈：含会话的归档命名为 xxx-config-xxx.tar.gz，类型判定仍应为 full
+// TC-03 мошенничество с именем: архив с сессиями назван xxx-config-xxx.tar.gz, тип всё равно должен определяться как full
 async function testTC03() {
-  console.log('[用例执行] TC-03 命名欺诈：含会话归档改名为 xxx-config-xxx，基于内容判定仍为 full');
+  console.log('[Выполнение кейса] TC-03 мошенничество с именем: архив с сессиями переименован в xxx-config-xxx, по содержимому тип всё равно full');
   try {
     const inferFn = manifestModule.inferFromMembers;
     if (typeof inferFn !== 'function') {
-      skip('TC-03 命名欺诈测试', 'snapshot-manifest.js 未导出 inferFromMembers 函数');
+      skip('TC-03 мошенничество с именем', 'в snapshot-manifest.js не экспортирована функция inferFromMembers');
       return;
     }
 
@@ -224,35 +224,35 @@ async function testTC03() {
     const inferred = inferFn(deceptiveMembers, deceptiveFilename);
 
     if (inferred && inferred.backupType === 'full') {
-      pass('TC-03 命名欺诈测试', `归档命名为 ${deceptiveFilename}，基于内部会话成员判定类型仍为 full (成功防御命名欺诈)`);
+      pass('TC-03 мошенничество с именем', `архив назван ${deceptiveFilename}, по внутренним членам-сессиям тип определён как full (мошенничество с именем успешно предотвращено)`);
     } else {
       skip(
-        'TC-03 命名欺诈测试',
-        'snapshot-manifest.js 尚未将 backupType 改为基于 hasSessions 的内容判定（当前代码行 319 仍根据文件名正则推断为 config）',
+        'TC-03 мошенничество с именем',
+        'в snapshot-manifest.js ещё не переведено определение backupType на содержимое по hasSessions (текущая строка 319 по-прежнему выводит config по регулярке имени файла)',
         [
-          '待后端同事修改 gateway/snapshot-manifest.js：使 backupType = hasSessions ? "full" : "config"',
-          `待后端就绪后应断言：inferFromMembers(deceptiveMembers, "${deceptiveFilename}").backupType === "full"`
+          'После готовности бэкенда следует утверждать: inferFromMembers(deceptiveMembers, "' + deceptiveFilename + '").backupType === "full"',
+          'Требуемая правка бэкенда: в gateway/snapshot-manifest.js сделать backupType = hasSessions ? "full" : "config"'
         ]
       );
     }
   } catch (err) {
-    fail('TC-03 命名欺诈测试', '执行抛出异常', err.message);
+    fail('TC-03 мошенничество с именем', 'при выполнении выброшено исключение', err.message);
   }
 }
 
-// TC-01 正例：现网有 S1~S3，快照含 B1~B5 → config-only 还原后：配置变快照值、S1~S3 仍在、B1~B5 未进入
+// TC-01 позитив: в актуальном окружении есть S1~S3, в снимке B1~B5 → после config-only восстановления: конфигурация из снимка, S1~S3 остаются, B1~B5 не импортированы
 async function testTC01() {
-  console.log('[用例执行] TC-01 正例：config-only 恢复保护现网会话 S1~S3，应用快照配置，排除快照会话 B1~B5');
+  console.log('[Выполнение кейса] TC-01 позитив: config-only восстановление защищает актуальные сессии S1~S3, применяет конфигурацию снимка, исключает сессии снимка B1~B5');
   if (!hasConfigOnlySupport) {
     skip(
-      'TC-01 正例测试 (config-only 恢复)',
-      'gateway/backup-service.js 尚未就绪（未检测到 mode: "config-only" 或 DATA_ENTRIES 支持）',
+      'TC-01 позитив (config-only восстановление)',
+      'gateway/backup-service.js ещё не готов (не обнаружена поддержка mode: "config-only" или DATA_ENTRIES)',
       [
-        '待后端就绪后应断言：restoreBackup(filename, dshManager, { mode: "config-only" }) 返回 { ok: true, mode: "config-only" }',
-        '待后端就绪后应断言：cordis.patch.yml 等配置文件已更新为快照内容',
-        '待后端就绪后应断言：现网会话 .dsh/sessions/S1, S2, S3 100% 完好无损保留',
-        '待后端就绪后应断言：快照中的会话 B1~B5 经由解压排除未被导入现网',
-        '待后端就绪后应断言：storages/workspace.json 保持现网原有索引，不被快照覆盖'
+        'После готовности бэкенда следует утверждать: restoreBackup(filename, dshManager, { mode: "config-only" }) возвращает { ok: true, mode: "config-only" }',
+        'После готовности бэкенда следует утверждать: cordis.patch.yml и прочие конфигурационные файлы обновлены содержимым снимка',
+        'После готовности бэкенда следует утверждать: актуальные сессии .dsh/sessions/S1, S2, S3 на 100% сохранены без повреждений',
+        'После готовности бэкенда следует утверждать: сессии снимка B1~B5 через исключение при распаковке не импортированы в актуальное окружение',
+        'После готовности бэкенда следует утверждать: storages/workspace.json сохраняет прежнюю индексацию актуального окружения и не перезаписан снимком'
       ]
     );
     return;
@@ -286,26 +286,26 @@ async function testTC01() {
     const hasB1 = fs.existsSync(path.join(TEST_DSH_DIR, 'sessions/B1'));
 
     if (res.ok && res.mode === 'config-only' && cordisAfter.includes('snapshot_light') && hasS1 && hasS2 && hasS3 && !hasB1) {
-      pass('TC-01 正例测试', 'config-only 恢复成功更新配置，现网会话 S1~S3 完整保留，快照会话 B1 未进入现网');
+      pass('TC-01 позитив', 'config-only восстановление успешно обновило конфигурацию, актуальные сессии S1~S3 полностью сохранены, сессия снимка B1 не импортирована в актуальное окружение');
     } else {
-      fail('TC-01 正例测试', '环境状态未满足预期', JSON.stringify({ res, hasS1, hasB1, cordisAfter }));
+      fail('TC-01 позитив', 'состояние окружения не соответствует ожиданиям', JSON.stringify({ res, hasS1, hasB1, cordisAfter }));
     }
   } catch (err) {
-    fail('TC-01 正例测试', '执行抛出异常', err.message);
+    fail('TC-01 позитив', 'при выполнении выброшено исключение', err.message);
   }
 }
 
-// TC-02 故障注入：staging 注入故障配置触发 boot 失败，精确逆向回滚后，现网 S1~S3 必须原封不动
+// TC-02 инъекция сбоя: неисправная конфигурация в staging вызывает сбой boot; после точного обратного отката S1~S3 обязаны остаться нетронутыми
 async function testTC02() {
-  console.log('[用例执行] TC-02 故障注入：DSH 启动失败触发精确逆向回滚，原地保留现网会话');
+  console.log('[Выполнение кейса] TC-02 инъекция сбоя: сбой запуска DSH вызывает точный обратный откат, актуальные сессии остаются на месте');
   if (!hasConfigOnlySupport) {
     skip(
-      'TC-02 故障注入测试 (精确逆向回滚 §4.6)',
-      'gateway/backup-service.js 尚未就绪（回滚机制尚未重构为精确逆向）',
+      'TC-02 инъекция сбоя (точный обратный откат §4.6)',
+      'gateway/backup-service.js ещё не готов (механизм отката ещё не переработан в точный обратный)',
       [
-        '待后端就绪后应断言：staging 配置故障导致 DSH 启动探活失败抛出异常',
-        '待后端就绪后应断言：精确逆向回滚机制仅移除 staging 搬入的条目，绝不调用 clearDir(DSH_DIR) 误删数据',
-        '待后端就绪后应断言：回滚后现网 S1~S3 会话 100% 原位保留，配置恢复至原始 live 状态'
+        'После готовности бэкенда следует утверждать: неисправная конфигурация в staging вызывает сбой проверки активности DSH и выброс исключения',
+        'После готовности бэкенда следует утверждать: механизм точного обратного отката удаляет только элементы, перенесённые из staging, и ни в коем случае не вызывает clearDir(DSH_DIR) с ложным удалением данных',
+        'После готовности бэкенда следует утверждать: после отката актуальные сессии S1~S3 на 100% сохранены на месте, конфигурация восстановлена до исходного live-состояния'
       ]
     );
     return;
@@ -338,33 +338,33 @@ async function testTC02() {
     const cordisAfter = fs.readFileSync(path.join(TEST_DSH_DIR, 'cordis.patch.yml'), 'utf8');
 
     if (thrown && hasS1 && cordisAfter.includes('original_live')) {
-      pass('TC-02 故障注入测试', 'DSH 启动失败正确触发精确逆向回滚，现网会话 S1 原地保留，配置完整还原');
+      pass('TC-02 инъекция сбоя', 'сбой запуска DSH корректно вызвал точный обратный откат, сессия S1 актуального окружения осталась на месте, конфигурация полностью восстановлена');
     } else {
-      fail('TC-02 故障注入测试', '回滚后状态异常或会话丢失', JSON.stringify({ thrown, hasS1, cordisAfter }));
+      fail('TC-02 инъекция сбоя', 'после отката состояние аномально или сессия потеряна', JSON.stringify({ thrown, hasS1, cordisAfter }));
     }
   } catch (err) {
-    fail('TC-02 故障注入测试', '执行抛出异常', err.message);
+    fail('TC-02 инъекция сбоя', 'при выполнении выброшено исключение', err.message);
   }
 }
 
-// TC-04 空环境：清空 .dsh 后 config-only 还原，无 workspace.json 冲突，DSH 正常引导
+// TC-04 пустое окружение: после очистки .dsh восстановление config-only без конфликтов workspace.json, DSH корректно загружается
 async function testTC04() {
-  console.log('[用例执行] TC-04 空环境测试：清空 .dsh 后以 config-only 还原');
+  console.log('[Выполнение кейса] TC-04 пустое окружение: после очистки .dsh восстановление в режиме config-only');
   if (!hasConfigOnlySupport) {
     skip(
-      'TC-04 空环境测试',
-      'gateway/backup-service.js 尚未就绪（未落地空环境 workspace.json 清洗与配置解压）',
+      'TC-04 пустое окружение',
+      'gateway/backup-service.js ещё не готов (не реализована очистка workspace.json для пустого окружения и распаковка конфигурации)',
       [
-        '待后端就绪后应断言：清空 .dsh 后 config-only 正常解出配置子集',
-        '待后端就绪后应断言：快照若含 workspace.json，清洗 sessionIds 避免虚假会话索引冲突',
-        '待后端就绪后应断言：DSH 正常引导完成且返回 ok: true'
+        'После готовности бэкенда следует утверждать: после очистки .dsh config-only корректно распаковывает подмножество конфигурации',
+        'После готовности бэкенда следует утверждать: если снимок содержит workspace.json, sessionIds очищаются во избежание конфликта ложной индексации сессий',
+        'После готовности бэкенда следует утверждать: DSH корректно завершает загрузку и возвращает ok: true'
       ]
     );
     return;
   }
 
   try {
-    cleanLiveDsh(); // 完全清空
+    cleanLiveDsh(); // полная очистка
     const snapName = 'dsh-clean-2026-09-30-tc04.tar.gz';
     buildSnapshotArchive(snapName, {
       'cordis.patch.yml': 'mode: empty_env_test',
@@ -383,31 +383,31 @@ async function testTC04() {
     if (wsExists) {
       const wsContent = JSON.parse(fs.readFileSync(path.join(TEST_DSH_DIR, 'storages/workspace.json'), 'utf8'));
       if (Array.isArray(wsContent.sessionIds) && wsContent.sessionIds.length > 0) {
-        cleanWs = false; // 存在未清洗的幽灵会话
+        cleanWs = false; // остались неочищенные призрачные сессии
       }
     }
 
     if (res.ok && cordisAfter.includes('empty_env_test') && cleanWs) {
-      pass('TC-04 空环境测试', '清空 .dsh 后 config-only 模式成功还原配置，workspace.json 无孤儿索引冲突，DSH 正常拉起');
+      pass('TC-04 пустое окружение', 'после очистки .dsh режим config-only успешно восстановил конфигурацию, в workspace.json нет конфликтов сиротской индексации, DSH корректно поднялся');
     } else {
-      fail('TC-04 空环境测试', '空环境还原后状态异常', JSON.stringify({ res, cleanWs }));
+      fail('TC-04 пустое окружение', 'после восстановления в пустом окружении состояние аномально', JSON.stringify({ res, cleanWs }));
     }
   } catch (err) {
-    fail('TC-04 空环境测试', '执行抛出异常', err.message);
+    fail('TC-04 пустое окружение', 'при выполнении выброшено исключение', err.message);
   }
 }
 
-// TC-05 离线：断网下 config-only 还原，不触发联网 pnpm install，用现网 node_modules 正常拉起
+// TC-05 оффлайн: восстановление config-only без сети не запускает сетевой pnpm install, поднимается на текущих node_modules
 async function testTC05() {
-  console.log('[用例执行] TC-05 离线测试：断网下 config-only 还原保留现网 node_modules，不触发 pnpm install');
+  console.log('[Выполнение кейса] TC-05 оффлайн: восстановление config-only без сети сохраняет актуальные node_modules, не запускает pnpm install');
   if (!hasConfigOnlySupport) {
     skip(
-      'TC-05 离线测试',
-      'gateway/backup-service.js 尚未就绪（未落地 profiles/*/node_modules 原地保留策略）',
+      'TC-05 оффлайн',
+      'gateway/backup-service.js ещё не готов (не реализована стратегия сохранения на месте profiles/*/node_modules)',
       [
-        '待后端就绪后应断言：config-only 解压排除 profiles/*/node_modules，避免冲掉现网依赖',
-        '待后端就绪后应断言：原地保留现网已有的 node_modules，不触发联网 pnpm install',
-        '待后端就绪后应断言：离线状态下 DSH 正常拉起就绪'
+        'После готовности бэкенда следует утверждать: при распаковке config-only исключаются profiles/*/node_modules, чтобы не затереть актуальные зависимости',
+        'После готовности бэкенда следует утверждать: уже имеющиеся в актуальном окружении node_modules сохраняются на месте, сетевой pnpm install не запускается',
+        'После готовности бэкенда следует утверждать: в оффлайн-состоянии DSH корректно поднимается и становится готов'
       ]
     );
     return;
@@ -435,16 +435,16 @@ async function testTC05() {
     const cachedExists = fs.existsSync(path.join(TEST_DSH_DIR, 'profiles/web/node_modules/cached_pkg/index.js'));
 
     if (res.ok && cachedExists) {
-      pass('TC-05 离线测试', 'config-only 还原成功保留现网 node_modules，未触发依赖覆盖与联网重装，DSH 正常就绪');
+      pass('TC-05 оффлайн', 'config-only восстановление успешно сохранило актуальные node_modules, перезапись зависимостей и сетевая переустановка не запускались, DSH корректно готов');
     } else {
-      fail('TC-05 离线测试', '现网 node_modules 未能正确保留', JSON.stringify({ res, cachedExists }));
+      fail('TC-05 оффлайн', 'актуальные node_modules не удалось корректно сохранить', JSON.stringify({ res, cachedExists }));
     }
   } catch (err) {
-    fail('TC-05 离线测试', '执行抛出异常', err.message);
+    fail('TC-05 оффлайн', 'при выполнении выброшено исключение', err.message);
   }
 }
 
-// ── 5. 执行全部用例并输出汇总 ─────────────────────────────────────────
+// ── 5. Выполнение всех кейсов и вывод итога ─────────────────────────────────────────
 async function runAll() {
   await testTC06();
   await testTC03();
@@ -454,10 +454,10 @@ async function runAll() {
   await testTC05();
 
   console.log('\n========================================');
-  console.log(`测试结果汇总: 通过 ${passCount} / 失败 ${failCount} / 跳过 ${skipCount}`);
+  console.log(`Итог тестов: пройдено ${passCount} / провалено ${failCount} / пропущено ${skipCount}`);
   console.log('========================================\n');
 
-  // 清理临时文件（若是脚本自建的临时目录）
+  // Очистка временных файлов (если временный каталог создан самим скриптом)
   if (isTempCreated) {
     try {
       fs.rmSync(TEST_ROOT, { recursive: true, force: true });
@@ -468,6 +468,6 @@ async function runAll() {
 }
 
 runAll().catch(err => {
-  console.error('测试套件运行异常:', err);
+  console.error('Исключение при выполнении набора тестов:', err);
   process.exit(1);
 });

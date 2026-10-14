@@ -1,32 +1,37 @@
 'use strict';
 /**
- * cordis.patch.yml 的**外科手术式**条目删除 + 安全闸。
+ * **Хирургическое** удаление записей cordis.patch.yml + предохранитель.
  *
- * 背景（P6 的第二个风险面）：官方 0.1.7 起 `profiles/web/cordis.patch.yml` 同时是
- * 「DSH 设置」的权威存储（`dsh-config-editor` 写它），里面可能有用户的关键条目，
- * 例如 `- id: llm-pi-ai`（模型 provider 定义，丢了就等于模型配置消失）。
+ * Предыстория (вторая рискованная грань P6): с официальной 0.1.7 `profiles/web/cordis.patch.yml`
+ * одновременно является авторитетным хранилищем «настроек DSH» (туда пишет `dsh-config-editor`),
+ * в нём могут быть ключевые записи пользователя, например `- id: llm-pi-ai`
+ * (определение model-provider; потерять — значит исчезнет конфигурация моделей).
  *
- * 之前的实现是「拆行 → 过滤 → 重新 join → 整文件写回」：虽然其它条目的文本会被保留，
- * 但仍是**全量重写**——一旦读到的快照落后于 DSH 的并发写入，就会把对方刚写的内容整体覆盖。
+ * Прежняя реализация была «разбить строки → фильтр → пересобрать → записать весь файл»:
+ * текст прочих записей вроде бы сохранялся, но это всё равно **полная перезапись** —
+ * если прочитанный снапшот отстал от конкурентной записи DSH, свеженаписанное целиком затиралось.
  *
- * 现在改为：
- *   1) 只在原文里**定位被删条目的字符区间**并删除该区间，其余字节（注释、空行、
- *      `!!js` 表达式、CRLF、行尾空格）**逐字保留**；
- *   2) 写入前跑 `assertPatchSafe()` 安全闸：结果不允许丢失任何"本不应删除"的顶层条目，
- *      也不允许丢失受保护条目（默认 `llm-pi-ai`，可用 `DSH_PATCH_PROTECTED_IDS` 覆盖），
- *      且结果必须是合法的顶层 YAML 序列；任一不满足则**放弃写入并抛错**。
+ * Теперь:
+ *   1) в исходном тексте **локализуется диапазон символов удаляемой записи** и удаляется только он,
+ *      остальные байты (комментарии, пустые строки, `!!js`-выражения, CRLF, пробелы в конце строк)
+ *      **сохраняются дословно**;
+ *   2) перед записью прогоняется предохранитель `assertPatchSafe()`: результат не должен терять
+ *      ни одну «не подлежащую удалению» верхнеуровневую запись и не должен терять защищённые записи
+ *      (по умолчанию `llm-pi-ai`, список можно заменить через `DSH_PATCH_PROTECTED_IDS`),
+ *      а также обязан быть корректной верхнеуровневой YAML-последовательностью;
+ *      при нарушении любого условия — **отказ от записи с броском ошибки**.
  *
- * 宁可残留一条补丁（无害），也绝不能吞掉用户的模型配置。
+ * Лучше оставить один безобидный патч, чем потерять конфигурацию моделей пользователя.
  */
 
-/** 默认必须保住、不允许被本模块删掉的顶层条目 id */
+/** Верхнеуровневые id записей, которые обязаны выжить и не могут быть удалены этим модулем */
 const DEFAULT_PROTECTED_IDS = ['llm-pi-ai'];
 
-/** 顶层条目起始行：`- ` / `-\t`；`- id: x` 视为带 id 的条目 */
+/** Стартовая строка верхнеуровневой записи: `- ` / `-\t`; `- id: x` считается записью с id */
 const ENTRY_START_RE = /^-\s/;
 const ENTRY_ID_RE = /^-\s*id:\s*["']?([^\s"'\r\n]+)/;
 
-/** 按"保留行尾"的方式切分，保证重新拼接后与原文字节一致（含 CRLF） */
+/** Разбивка «с сохранением конца строк», чтобы пересборка давала байт-в-байт исходный текст (включая CRLF) */
 function splitKeepEol(content) {
   return String(content).split(/(?<=\n)/);
 }
@@ -35,7 +40,7 @@ function lineWithoutEol(chunk) {
   return String(chunk).replace(/\r?\n$/, '');
 }
 
-/** 列出顶层带 id 的条目 id（缩进的嵌套 `- id:` 不计入） */
+/** Перечисляет id верхнеуровневых записей с id (вложенные с отступами `- id:` не учитываются) */
 function topLevelEntryIds(content) {
   const ids = [];
   for (const chunk of splitKeepEol(content)) {
@@ -46,9 +51,9 @@ function topLevelEntryIds(content) {
 }
 
 /**
- * 按"条目"粒度删除命中项；未命中的字节原样保留。
- * @param {string} content 原始 patch 文本
- * @param {(block: string) => boolean} matcher 命中判定（block 含该条目完整文本）
+ * Удаляет попавшие под критерий записи по гранулярности «записи»; не попавшие байты остаются как есть.
+ * @param {string} content исходный текст патча
+ * @param {(block: string) => boolean} matcher критерий попадания (block содержит полный текст записи)
  * @returns {{ text: string, removed: number, removedIds: string[] }}
  */
 function removePatchEntries(content, matcher) {
@@ -64,7 +69,7 @@ function removePatchEntries(content, matcher) {
       i += 1;
       continue;
     }
-    // 条目续行：缩进行，或条目之间的空行（与既有语义一致）
+    // Продолжение записи: строки с отступом или пустые строки между записями (как в прежней семантике)
     const start = i;
     let j = i + 1;
     while (j < chunks.length && !ENTRY_START_RE.test(chunks[j])) {
@@ -95,7 +100,7 @@ function protectedPatchIds() {
   return String(raw).split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-/** 结果是否像合法的 patch 文档：空内容、'[]'、或以顶层 `- ` 开头 */
+/** Похож ли результат на корректный документ патча: пусто, '[]' или начинается с верхнеуровневого `- ` */
 function looksLikePatchDocument(content) {
   const trimmed = String(content).trim();
   if (trimmed === '' || trimmed === '[]') return true;
@@ -103,9 +108,9 @@ function looksLikePatchDocument(content) {
 }
 
 /**
- * 安全闸：任何"会丢失条目/把文档改坏"的改写都必须被拦下。
+ * Предохранитель: любую перезапись, «теряющую записи / ломающую документ», нужно блокировать.
  * @param {{ before: string, after: string, removedIds?: string[] }} input
- * @throws {Error} 违反不变量时抛出（调用方应放弃写入）
+ * @throws {Error} при нарушении инварианта (вызывающий должен отказаться от записи)
  */
 function assertPatchSafe({ before, after, removedIds = [] }) {
   const beforeIds = topLevelEntryIds(before);
@@ -114,16 +119,16 @@ function assertPatchSafe({ before, after, removedIds = [] }) {
 
   const unexpectedLoss = beforeIds.filter((id) => !afterIds.includes(id) && !removed.has(id));
   if (unexpectedLoss.length > 0) {
-    throw new Error(`patch-yaml: 改写会丢失本不应删除的条目 [${unexpectedLoss.join(', ')}]，已放弃写入`);
+    throw new Error(`patch-yaml: перезапись потеряет записи, которые удалять нельзя [${unexpectedLoss.join(', ')}], отказано в записи`);
   }
 
   const protectedLoss = protectedPatchIds().filter((id) => beforeIds.includes(id) && !afterIds.includes(id));
   if (protectedLoss.length > 0) {
-    throw new Error(`patch-yaml: 改写会删除受保护条目 [${protectedLoss.join(', ')}]，已放弃写入（可用 DSH_PATCH_PROTECTED_IDS 调整保护清单）`);
+    throw new Error(`patch-yaml: перезапись удалит защищённые записи [${protectedLoss.join(', ')}], отказано в записи (список защиты можно поменять через DSH_PATCH_PROTECTED_IDS)`);
   }
 
   if (!looksLikePatchDocument(after)) {
-    throw new Error('patch-yaml: 改写结果不是合法的顶层 YAML 序列，已放弃写入');
+    throw new Error('patch-yaml: результат перезаписи не является корректной верхнеуровневой YAML-последовательностью, отказано в записи');
   }
   return true;
 }

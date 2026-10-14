@@ -1,12 +1,14 @@
 /**
- * S3 回归测试：空口令 → 初始化向导状态机 + 口令强度校验（纯函数层）。
- * 用法: node scripts/setup-gate-test.mjs
+ * S3 регрессионный тест: пустой код доступа → машина состояний мастера инициализации
+ * + проверка стойкости пароля (слой чистых функций).
+ * Запуск: node scripts/setup-gate-test.mjs
  */
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 关键：必须在 require 之前清空 AUTH_TOKEN，模拟"未设置口令"的首次启动
+// Ключевой момент: до require нужно очистить AUTH_TOKEN, имитируя первый запуск
+// с ещё не заданным кодом доступа
 process.env.AUTH_TOKEN = '';
 process.env.ACCESS_CODE = '';
 
@@ -17,41 +19,41 @@ const auth = require(path.join(here, '../gateway/auth.js'));
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { console.log('   ✔ ' + m); pass++; } else { console.log('   ❌ ' + m); fail++; } };
 
-console.log('\n=== A. 空口令 ⇒ 需要初始化 ===');
-ok(auth.isAuthEnabled() === false, '空口令时 auth 未启用');
-ok(auth.isSetupRequired() === true, '空口令时必须走初始化向导');
+console.log('\n=== A. Пустой пароль ⇒ нужна инициализация ===');
+ok(auth.isAuthEnabled() === false, 'при пустом пароле auth не включён');
+ok(auth.isSetupRequired() === true, 'при пустом пароле обязателен мастер инициализации');
 
-console.log('\n=== B. 设置口令后 ⇒ 不再需要初始化 ===');
+console.log('\n=== B. После задания пароля ⇒ инициализация больше не нужна ===');
 auth.updateAuthToken('Str0ng-Pass!');
-ok(auth.isAuthEnabled() === true, '设置后 auth 已启用');
-ok(auth.isSetupRequired() === false, '设置后不再需要初始化');
-ok(auth.verifyToken('Str0ng-Pass!') === true, '新口令校验通过');
-ok(auth.verifyToken('wrong') === false, '错误口令被拒');
+ok(auth.isAuthEnabled() === true, 'после задания auth включён');
+ok(auth.isSetupRequired() === false, 'после задания инициализация не нужна');
+ok(auth.verifyToken('Str0ng-Pass!') === true, 'новый пароль проходит проверку');
+ok(auth.verifyToken('wrong') === false, 'неверный пароль отклоняется');
 
-console.log('\n=== C. 清除口令 ⇒ 回到初始化 ===');
+console.log('\n=== C. Очистка пароля ⇒ возврат к инициализации ===');
 auth.updateAuthToken('');
-ok(auth.isSetupRequired() === true, '清除后重新需要初始化');
+ok(auth.isSetupRequired() === true, 'после очистки снова нужна инициализация');
 
-console.log('\n=== D. 口令强度校验 ===');
+console.log('\n=== D. Проверка стойкости пароля ===');
 for (const p of ['admin', 'Admin', 'password', '123456', '12345678', 'qwertyuiop', 'short', '', '   ', 'deepseek', 'letmein', '111111']) {
-  ok(auth.isWeakPassword(p) === true, `弱口令被拒: ${JSON.stringify(p)}`);
+  ok(auth.isWeakPassword(p) === true, `слабый пароль отклонён: ${JSON.stringify(p)}`);
 }
-for (const p of ['Str0ng-Pass!', 'my-secret-2026', 'aB3$xyz9', 'notweak123', '非常安全的口令2026', 'aB3$x9', 'pass6!']) {
-  ok(auth.isWeakPassword(p) === false, `强口令通过: ${JSON.stringify(p)}`);
+for (const p of ['Str0ng-Pass!', 'my-secret-2026', 'aB3$xyz9', 'notweak123', 'прочный-пароль2026', 'aB3$x9', 'pass6!']) {
+  ok(auth.isWeakPassword(p) === false, `стойкий пароль проходит: ${JSON.stringify(p)}`);
 }
-ok(auth.isWeakPassword(null) === true, 'null 视为弱口令');
-ok(auth.isWeakPassword('x'.repeat(300)) === true, '超长口令视为非法');
+ok(auth.isWeakPassword(null) === true, 'null считается слабым паролем');
+ok(auth.isWeakPassword('x'.repeat(300)) === true, 'слишком длинный пароль считается недопустимым');
 
-console.log('\n=== E. 路由：口令已设置后 /setup 必须跳登录页（不留僵尸表单）===');
+console.log('\n=== E. Маршрут: после задания пароля /setup должен уводить на страницу входа (не оставлять зомби-форму) ===');
 {
   const fs = require('node:fs');
   const src = fs.readFileSync(path.join(here, '../gateway/index.js'), 'utf8');
   const block = src.slice(src.indexOf("if (pathname === '/setup' && req.method === 'GET')"));
   const body = block.slice(0, block.indexOf('\n  }') + 4);
   ok(/if \(!isSetupRequired\(\)\) \{ res\.writeHead\(302, \{ Location: '\/login' \}\); return res\.end\(\); \}/.test(body),
-    '/setup 在口令已设置时 302 到 /login');
-  ok(/serveStaticHtml\(res, 'setup\.html'\)/.test(body), '仍保留未设置时的向导渲染');
+    '/setup при заданном пароле делает 302 на /login');
+  ok(/serveStaticHtml\(res, 'setup\.html'\)/.test(body), 'рендер мастера при незаданном пароле сохранён');
 }
 
-console.log(`\n===== 汇总: 通过 ${pass} / 失败 ${fail} =====`);
+console.log(`\n===== Итог: пройдено ${pass} / провалено ${fail} =====`);
 process.exit(fail ? 1 : 0);

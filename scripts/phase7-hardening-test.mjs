@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * 阶段 7 本地单测：工程化与打磨（M10–M13 + 轻微项）
- *  - 可运行部分：runTarAsync 超时/输出上限、atomicWrite、safeEqual(HMAC)、Cookie Secure、isSecureRequest；
- *  - 其余以源码级断言固化（Dockerfile / compose / workflow / gateway / entrypoint）。
+ * Этап 7: локальный юнит-тест инженерии и полировки (M10–M13 + мелкие пункты)
+ *  - выполнимые части: тайм-аут/лимит вывода runTarAsync, atomicWrite, safeEqual(HMAC),
+ *    Cookie Secure, isSecureRequest;
+ *  - остальное фиксируется утверждениями по исходникам (Dockerfile / compose / workflow / gateway / entrypoint).
  *
- * 用法: node scripts/phase7-hardening-test.mjs
+ * Запуск: node scripts/phase7-hardening-test.mjs
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -29,56 +30,56 @@ process.env.SESSION_SECRET = 'phase7-test-secret-0123456789';
 process.env.AUTH_TOKEN = 'phase7-token';
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[轻微项] 运行时可验证部分');
-await check('runTarAsync：超时会被强制中断并报错', async () => {
+console.log('\n[Мелкие пункты] Выполнимая на лету проверка');
+await check('runTarAsync: превышение времени принудительно прерывается и выводит ошибку', async () => {
   const backup = require(path.join(ROOT, 'gateway/backup-service.js'));
-  assert.equal(typeof backup.runTarAsync, 'function', 'runTarAsync 应被导出以便测试');
+  assert.equal(typeof backup.runTarAsync, 'function', 'runTarAsync должен экспортироваться для теста');
   const t0 = Date.now();
   const err = await backup.runTarAsync(['-cf', '/dev/null', '--use-compress-program=sleep 30', '.'], { timeoutMs: 1200 })
     .then(() => null, e => e);
-  assert.ok(err, '应当超时失败');
-  assert.match(err.message, /超时/);
-  assert.ok(Date.now() - t0 < 8000, '应被及时中断');
+  assert.ok(err, 'должно завершиться ошибкой тайм-аута');
+  assert.match(err.message, /превышено время/);
+  assert.ok(Date.now() - t0 < 8000, 'должно быть прервано вовремя');
 });
 
-await check('runTarAsync：输出超过上限即中断（防恶意归档撑爆内存）', async () => {
+await check('runTarAsync: выход за лимит вывода обрывается (защита от раздувания памяти враждебным архивом)', async () => {
   const backup = require(path.join(ROOT, 'gateway/backup-service.js'));
-  // 造一个成员很多的目录，让 tar -t 输出超过 1KB
+  // Создаём каталог с очень большим числом членов, чтобы вывод tar -t превысил 1 КБ
   const dir = path.join(tmp, 'many');
   fs.mkdirSync(dir, { recursive: true });
   for (let i = 0; i < 400; i++) fs.writeFileSync(path.join(dir, `file-${i}.txt`), 'x');
   const tarFile = path.join(tmp, 'many.tar.gz');
   await backup.runTarAsync(['-czf', tarFile, '-C', dir, '.']);
   const err = await backup.runTarAsync(['-tvzf', tarFile], { maxOutputBytes: 1024 }).then(() => null, e => e);
-  assert.ok(err, '应当因输出超限失败');
-  assert.match(err.message, /输出超过上限/);
+  assert.ok(err, 'должно завершиться ошибкой превышения лимита вывода');
+  assert.match(err.message, /превышен лимит вывода/);
 });
 
-await check('_bootInternal 包装器：以实现函数显式 resolve 的值结算（不被提前 undefined 覆盖）', async () => {
+await check('_bootInternal-обёртка: рассчитывается по явному resolve реализации (не перекрывается ранним undefined)', async () => {
   const mgr = require(path.join(ROOT, 'gateway/dsh-manager.js'));
   const orig = mgr._bootInternalImpl;
   try {
     mgr._bootInternalImpl = async (onProbe, resolve) => {
-      // 模拟"函数体先返回、稍后才在嵌套回调里 resolve"
+      // Имитация «тело функции возвращается, а resolve вызывается позже во вложенном колбэке»
       setTimeout(() => resolve({ ok: true, marker: 'late-resolve' }), 40);
     };
     const r = await mgr._bootInternal();
-    assert.equal(r && r.marker, 'late-resolve', '应等实现函数显式 resolve，而不是提前返回 undefined');
+    assert.equal(r && r.marker, 'late-resolve', 'должен ждать явного resolve реализации, а не вернуть undefined заранее');
   } finally { mgr._bootInternalImpl = orig; }
 });
 
-await check('safeEqual 改为先 HMAC（长度不同也不再提前返回）', () => {
+await check('safeEqual переведён на HMAC (при разной длине тоже не возвращается раньше времени)', () => {
   const auth = require(path.join(ROOT, 'gateway/auth.js'));
-  // 通过 verifyToken 间接验证行为仍然正确
+  // Через verifyToken косвенно проверяем, что поведение по-прежнему корректно
   assert.equal(auth.verifyToken('phase7-token'), true);
   assert.equal(auth.verifyToken('phase7-toke'), false);
   assert.equal(auth.verifyToken('phase7-token-longer'), false);
   assert.equal(auth.verifyToken(''), false);
   const src = read('gateway/auth.js');
-  assert.ok(/createHmac\('sha256', COMPARE_KEY\)/.test(src), 'safeEqual 应先 HMAC 再比较');
+  assert.ok(/createHmac\('sha256', COMPARE_KEY\)/.test(src), 'safeEqual должен сначала HMAC, затем сравнивать');
 });
 
-await check('Cookie Secure：仅 HTTPS 请求追加 Secure', () => {
+await check('Cookie Secure: флаг Secure добавляется только запросам HTTPS', () => {
   const auth = require(path.join(ROOT, 'gateway/auth.js'));
   assert.equal(auth.isSecureRequest({ socket: {}, headers: {} }), false);
   assert.equal(auth.isSecureRequest({ socket: { encrypted: true }, headers: {} }), true);
@@ -93,59 +94,60 @@ await check('Cookie Secure：仅 HTTPS 请求追加 Secure', () => {
   const plain = grab({ socket: {}, headers: {} });
   const secure = grab({ socket: {}, headers: { 'x-forwarded-proto': 'https' } });
   assert.ok(/HttpOnly/.test(plain) && /SameSite=Strict/.test(plain));
-  assert.ok(!/; Secure/.test(plain), 'HTTP 下不应带 Secure');
-  assert.ok(/; Secure/.test(secure), 'HTTPS 下应带 Secure');
+  assert.ok(!/; Secure/.test(plain), 'по HTTP не должно быть Secure');
+  assert.ok(/; Secure/.test(secure), 'по HTTPS должно быть Secure');
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[M12] 构建上下文与插件依赖');
-await check('.dockerignore 存在且排除关键目录', () => {
+console.log('\n[M12] Контекст сборки и зависимости плагинов');
+await check('.dockerignore существует и исключает ключевые каталоги', () => {
   const di = read('.dockerignore');
   for (const k of ['.git', '.env', 'data/', 'workspace/', '**/node_modules', 'doc/']) {
-    assert.ok(di.includes(k), '.dockerignore 应包含 ' + k);
+    assert.ok(di.includes(k), '.dockerignore должен содержать ' + k);
   }
 });
-await check('插件显式声明 schemastery 依赖', () => {
+await check('плагин явно объявляет зависимость schemastery', () => {
   const pkg = JSON.parse(read('plugins/dsh-browser-desktop/package.json'));
-  assert.ok(pkg.dependencies && pkg.dependencies['@deepseek-ai/schemastery'], '应声明 @deepseek-ai/schemastery');
+  assert.ok(pkg.dependencies && pkg.dependencies['@deepseek-ai/schemastery'], 'должна быть объявлена @deepseek-ai/schemastery');
 });
-await check('Dockerfile 显式创建插件依赖软链（不再依赖构建残留）', () => {
+await check('Dockerfile явно создаёт симлинк зависимости плагина (больше не полагается на остатки сборки)', () => {
   const df = read('Dockerfile');
-  assert.ok(/node_modules\/@deepseek-ai/.test(df), 'Dockerfile 应为插件创建 @deepseek-ai 软链');
+  assert.ok(/node_modules\/@deepseek-ai/.test(df), 'Dockerfile должен создать для плагина симлинк @deepseek-ai');
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[M10] 供应链');
-await check('version.json 固定 dsh / pnpm / 市场插件版本', () => {
+console.log('\n[M10] Цепочка поставок');
+await check('version.json фиксирует версии dsh / pnpm / плагинов маркетплейса', () => {
   const v = JSON.parse(read('version.json'));
-  assert.ok(v.supply && v.supply.dshVersion && v.supply.pnpmVersion, 'supply 块应含 dshVersion/pnpmVersion');
+  assert.ok(v.supply && v.supply.dshVersion && v.supply.pnpmVersion, 'блок supply обязан содержать dshVersion/pnpmVersion');
   assert.ok(v.supply.marketPlugins && v.supply.marketPlugins.dshmarket);
 });
-await check('plugins.market.list：预装插件全部跟随 @latest', () => {
+await check('plugins.market.list: предустановленные плагины все идут на @latest', () => {
   const lines = read('plugins.market.list').split('\n')
     .map(l => l.replace(/#.*/, '').trim()).filter(Boolean);
   assert.ok(lines.length >= 2);
-  // 全部有意写 @latest：每次构建拉最新（配合 Dockerfile MARKET_REFRESH 刷新预装层缓存）
+  // Все намеренно пишутся в @latest: при каждой сборке тянется последняя версия
+  // (совместно с MARKET_REFRESH в Dockerfile обновляет слой кэша предустановок)
   for (const l of lines) {
-    assert.match(l, /@latest$/, '应写 @latest: ' + l);
+    assert.match(l, /@latest$/, 'должно быть @latest: ' + l);
   }
 });
-await check('Dockerfile：--ignore-scripts + 白名单 rebuild + integrity 校验', () => {
+await check('Dockerfile: --ignore-scripts + whitelist-rebuild + проверка integrity', () => {
   const df = read('Dockerfile');
-  assert.ok(/--ignore-scripts/.test(df), '应使用 --ignore-scripts');
-  assert.ok(!/--ignore-scripts=false/.test(df), '不应再出现 --ignore-scripts=false');
-  assert.ok(!/allow-scripts all/.test(df), '不应再全局放开 allow-scripts');
-  assert.ok(/dist\.integrity/.test(df), '应校验 dist.integrity');
-  assert.ok(/npm rebuild node-pty/.test(df), '白名单 rebuild');
+  assert.ok(/--ignore-scripts/.test(df), 'должно использоваться --ignore-scripts');
+  assert.ok(!/--ignore-scripts=false/.test(df), 'не должно оставаться --ignore-scripts=false');
+  assert.ok(!/allow-scripts all/.test(df), 'allow-scripts не должен открываться глобально');
+  assert.ok(/dist\.integrity/.test(df), 'должна проверяться dist.integrity');
+  assert.ok(/npm rebuild node-pty/.test(df), 'rebuild по белому списку');
 });
-await check('build.sh 从 version.json#supply 读取固定版本', () => {
+await check('build.sh читает фиксированные версии из version.json#supply', () => {
   const bs = read('build.sh');
   assert.ok(/read_supply/.test(bs) && /PNPM_VERSION/.test(bs));
-  assert.ok(!/DSH_ALPHA=\$\(curl/.test(bs), '不应再动态探测 registry 决定 DSH 版本');
+  assert.ok(!/DSH_ALPHA=\$\(curl/.test(bs), 'версия DSH не должна определяться динамическим опросом registry');
 });
-await check('CI：action 固定 SHA + provenance/sbom + 冒烟测试', () => {
+await check('CI: экшены привязаны к SHA + provenance/sbom + дымовой тест', () => {
   const wf = read('.github/workflows/docker-build.yml');
-  assert.ok(!/uses:\s+actions\/checkout@v4\b/.test(wf), 'action 应固定到 SHA');
+  assert.ok(!/uses:\s+actions\/checkout@v4\b/.test(wf), 'экшен должен быть привязан к SHA');
   assert.ok(/actions\/checkout@[0-9a-f]{40}/.test(wf));
   assert.ok(/provenance:\s*mode=max/.test(wf));
   assert.ok(/sbom:\s*true/.test(wf));
@@ -153,94 +155,95 @@ await check('CI：action 固定 SHA + provenance/sbom + 冒烟测试', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[M11] 容器加固');
-await check('compose：no-new-privileges + cap_drop ALL + 最小 cap_add', () => {
+console.log('\n[M11] Укрепление контейнера');
+await check('compose: no-new-privileges + cap_drop ALL + минимальный набор cap_add', () => {
   for (const f of ['docker-compose.yml', 'docker-compose.market.yml']) {
     const c = read(f);
-    assert.ok(/no-new-privileges:true/.test(c), f + ' 应含 no-new-privileges');
-    assert.ok(/cap_drop:\s*\n\s*- ALL/.test(c), f + ' 应 cap_drop ALL');
-    assert.ok(/cap_add:/.test(c), f + ' 应回补最小能力集');
-    assert.ok(/user: "1001:1001"/.test(c), f + ' 应提供非 root 运行示例');
+    assert.ok(/no-new-privileges:true/.test(c), f + ' должен содержать no-new-privileges');
+    assert.ok(/cap_drop:\s*\n\s*- ALL/.test(c), f + ' должен cap_drop ALL');
+    assert.ok(/cap_add:/.test(c), f + ' должен возвращать минимальный набор capability');
+    assert.ok(/user: "1001:1001"/.test(c), f + ' должен приводить пример non-root запуска');
   }
 });
-await check('Dockerfile：非 root 用户 dsh(uid 1000) 且 /go 不再 777', () => {
+await check('Dockerfile: non-root пользователь dsh(uid 1000) и /go больше не 777', () => {
   const df = read('Dockerfile');
-  assert.ok(/useradd -m -u 1001/.test(df), '应创建 uid 1001 用户');
-  assert.ok(/chmod -R 0755 \/go/.test(df), '/go 应为 0755');
-  assert.ok(!/chmod -R 777/.test(df), '不应再有 777');
+  assert.ok(/useradd -m -u 1001/.test(df), 'должен создаваться пользователь с uid 1001');
+  assert.ok(/chmod -R 0755 \/go/.test(df), '/go должен быть 0755');
+  assert.ok(!/chmod -R 777/.test(df), '777 больше не должно быть');
 });
-await check('网关/入口脚本支持 DSH_HOME 迁移（非 root 部署）', () => {
+await check('шлюз/скрипты входа поддерживают перенос DSH_HOME (non-root развёртывание)', () => {
   for (const f of ['gateway/backup-service.js', 'gateway/dsh-manager.js', 'gateway/plugin-manager.js', 'gateway/internal-token.js']) {
-    assert.ok(/DSH_HOME/.test(read(f)), f + ' 应支持 DSH_HOME');
+    assert.ok(/DSH_HOME/.test(read(f)), f + ' должен поддерживать DSH_HOME');
   }
   const ep = read('scripts/entrypoint.sh');
-  assert.ok(/DSH_HOME/.test(ep) && !/\/root\/\.dsh/.test(ep), 'entrypoint 不应再硬编码 /root/.dsh');
+  assert.ok(/DSH_HOME/.test(ep) && !/\/root\/\.dsh/.test(ep), 'entrypoint не должен жёстко кодировать /root/.dsh');
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[M13] 配置单一来源');
-await check('显式 env 优先于持久化配置，且 /healthz 回显来源', () => {
+console.log('\n[M13] Единый источник конфигурации');
+await check('явный env имеет приоритет над сохранённой конфигурацией, а /healthz отдаёт источник', () => {
   const s = read('gateway/index.js');
   assert.ok(/const PROXY_PORT = Number\(process\.env\.PROXY_PORT \|\| persisted\.proxyPort\)/.test(s));
   assert.ok(/process\.env\.ADMIN_PATH \|\| persisted\.adminPath/.test(s));
   assert.ok(/AUTH_TOKEN_SOURCE/.test(s) && /configSource:/.test(s));
 });
-await check('分辨率默认值与 README/代码一致（1920x1080）', () => {
+await check('разрешение по умолчанию совпадает с README/кодом (1920x1080)', () => {
   assert.ok(!/DSH_DESKTOP_WIDTH=1440/.test(read('.env.example')));
   assert.ok(/DSH_DESKTOP_WIDTH=1920/.test(read('.env.example')));
   assert.ok(!/DSH_DESKTOP_WIDTH=1440/.test(read('docker-compose.yml')));
   assert.ok(/DSH_DESKTOP_WIDTH=1920/.test(read('docker-compose.market.yml')));
 });
-await check('compose 端口映射跟随 PROXY_PORT', () => {
+await check('compose: проброс портов следует за PROXY_PORT', () => {
   assert.ok(/\$\{PROXY_PORT:-3080\}:\$\{PROXY_PORT:-3080\}/.test(read('docker-compose.yml')));
   assert.ok(/PROXY_PORT=\$\{PROXY_PORT:-3080\}/.test(read('docker-compose.market.yml')));
 });
 
 // ─────────────────────────────────────────────────────────────
-console.log('\n[轻微项] 源码级回归');
-await check('不再有 new Promise(async executor) 反模式', () => {
+console.log('\n[Мелкие пункты] Регрессия по исходникам');
+await check('больше нет анти-паттерна new Promise(async executor)', () => {
   for (const f of ['gateway/backup-service.js', 'gateway/dsh-manager.js']) {
-    assert.ok(!/return new Promise\(async/.test(read(f)), f + ' 仍有反模式');
+    assert.ok(!/return new Promise\(async/.test(read(f)), f + ' всё ещё содержит анти-паттерн');
   }
 });
-await check('websockify 端点精确匹配', () => {
+await check('точное совпадение конечной точки websockify', () => {
   const s = read('gateway/index.js');
   assert.ok(!/pathname\.endsWith\('\/websockify'\)/.test(s));
   assert.ok(/pathname === vncWsPath \|\| pathname === '\/websockify'/.test(s));
 });
-await check('pkill 不再使用过宽的 chromium 匹配', () => {
+await check('pkill больше не использует слишком широкое совпадение по chromium', () => {
   const s = read('gateway/desktop-manager.js');
   const body = s.slice(s.indexOf('async forceCleanupSystemProcesses()'));
   const patterns = body.slice(0, body.indexOf('_pkill(pattern)'));
-  assert.ok(!/^\s*'chromium'\s*,/m.test(patterns), '不应再把 chromium 作为 pkill 模式');
+  assert.ok(!/^\s*'chromium'\s*,/m.test(patterns), 'chromium не должен быть шаблоном pkill');
   assert.ok(/--user-data-dir=\$\{this\.config\.userDataDir\}/.test(patterns));
 });
-await check('日志不回显 Cookie 内容片段', () => {
+await check('журнал не выводит фрагменты содержимого Cookie', () => {
   const s = read('gateway/token-crawler.js');
   assert.ok(!/cookiePair\.slice\(0, 25\)/.test(s));
   assert.ok(/len=\$\{cookiePair\.length\}/.test(s));
 });
-await check('version-service 不再静默吞异常', () => {
+await check('version-service больше не глотает исключения молча', () => {
   const s = read('gateway/version-service.js');
-  assert.ok(/读取本地 package\.json 版本失败/.test(s));
-  assert.ok(/读取本地版本元数据失败/.test(s));
+  assert.ok(/Ошибка чтения версии локального package\.json/.test(s));
+  assert.ok(/Ошибка чтения локальных метаданных версии/.test(s));
 });
-await check('install-plugin 使用原子写', () => {
+await check('install-plugin использует атомарную запись', () => {
   const s = read('scripts/install-plugin.mjs');
   assert.ok(/function atomicWrite/.test(s));
-  assert.ok(!/fs\.writeFileSync\(/.test(s.replace(/function atomicWrite[\s\S]*?\n}\n/, '')), '除 helper 外不应再有裸 writeFileSync');
-  // 回归守卫：helper 必须真的落盘，且不得递归调用自身（曾出现 atomicWrite(tmp,data) 自递归 → 栈溢出）
+  assert.ok(!/fs\.writeFileSync\(/.test(s.replace(/function atomicWrite[\s\S]*?\n}\n/, '')), 'кроме helper не должно оставаться голых writeFileSync');
+  // Страж регрессии: helper обязан реально писать на диск и не вызывать сам себя рекурсивно
+  // (бывало atomicWrite(tmp,data) сам в себе → переполнение стека)
   const helper = /function atomicWrite[\s\S]*?\n}\n/.exec(s);
-  assert.ok(helper, '应能定位 atomicWrite helper');
-  assert.ok(/fs\.writeFileSync\(tmp/.test(helper[0]), 'atomicWrite 内必须调用 fs.writeFileSync(tmp, ...) 真正写盘');
-  assert.ok(!/atomicWrite\(tmp/.test(helper[0]), 'atomicWrite 不得递归调用自身（会导致 Maximum call stack size exceeded）');
+  assert.ok(helper, 'должен находиться helper atomicWrite');
+  assert.ok(/fs\.writeFileSync\(tmp/.test(helper[0]), 'внутри atomicWrite обязан быть fs.writeFileSync(tmp, ...) реально пишущий на диск');
+  assert.ok(!/atomicWrite\(tmp/.test(helper[0]), 'atomicWrite не должен рекурсивно вызывать себя (будет Maximum call stack size exceeded)');
 });
-await check('DSH 日志落数据卷并轮转', () => {
+await check('журнал DSH пишется в том данных и ротируется', () => {
   const s = read('scripts/entrypoint.sh');
   assert.ok(/DSH_WEB_LOG:-.*\.dsh\/logs\/dsh-web\.log/.test(s));
   assert.ok(/DSH_WEB_LOG_MAX_BYTES/.test(s) && /mv -f "\$\{DSH_WEB_LOG\}"/.test(s));
 });
 
-console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
+console.log(`\nРезультат: ${pass} пройдено, ${fail} провалено`);
 fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail === 0 ? 0 : 1);

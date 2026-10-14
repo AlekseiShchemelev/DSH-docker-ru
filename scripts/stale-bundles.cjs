@@ -1,52 +1,59 @@
 'use strict';
 /**
- * 自动清理 profile 中「无法解析」的幽灵 bundle 条目。
+ * Автоматическая вычистка «неразрешаемых» ghost-записей bundle в профиле.
  *
- * 背景：官方 DSH 处于活跃迭代期，会合并/下线 bundle 包。例如 0.1.7 起
- * `@deepseek-ai/dsh-experimental-agent-team-web-profile` 被并入
- * `@deepseek-ai/dsh-experimental-agent-team-profile`，`@deepseek-ai/dsh-settings-file`
- * 被移除。镜像升级后，profile 的 `dsh.profile.bundles` 里会残留已不存在的包名，
- * DSH 每次加载都会向 stderr 打印 `skipping profile bundle "..." : cannot resolve ...`
- * 并在界面提示。
+ * Предыстория: официальный DSH активно развивается и объединяет/снимает bundle-пакеты.
+ * Например, с 0.1.7 `@deepseek-ai/dsh-experimental-agent-team-web-profile` влит в
+ * `@deepseek-ai/dsh-experimental-agent-team-profile`, а `@deepseek-ai/dsh-settings-file`
+ * удалён. После обновления образа в `dsh.profile.bundles` профиля остаются имена пакетов,
+ * которых больше нет, и DSH при каждой загрузке печатает в stderr
+ * `skipping profile bundle "..." : cannot resolve ...` и показывает подсказку в интерфейсе.
  *
- * 解析判定**完全对齐官方 `dsh-app-boot` 的 `resolveBundleDir`**：先在 DSH 安装锚点、
- * 再在 profile 目录锚点上，用 Node 的 `require.resolve.paths()` 逐个搜索路径检查
- * `<searchPath>/<name>/package.json` 是否存在（安装锚点优先，保证 `@deepseek-ai/*`
- * 始终来自同一份安装）。
+ * Критерий разрешимости **полностью совпадает с `resolveBundleDir` официального
+ * `dsh-app-boot`**: сначала по якорю установки DSH, затем по якорю каталога профиля,
+ * через `require.resolve.paths()` Node проверяется существование
+ * `<searchPath>/<name>/package.json` в каждом пути поиска (предпочтение якорю установки —
+ * чтобы `@deepseek-ai/*` всегда брался из одной и той же установки).
  *
- * 安全设计（默认「保守模式」，绝不误删并发写者/用户意图）：
- *   - 默认只清理**已知被上游下线/改名**的 bundle（{@link KNOWN_REMOVED_BUNDLES}，
- *     可用 `DSH_PRUNE_BUNDLES_EXTRA` 追加）。这样既解决升级残留告警，又不会碰
- *     DSH 原生插件管理器刚写入的任意条目（P6「不丢更新」保证）。
- *   - 只清理**确实无法解析**的条目：若该包又能解析了（用户重新装回），一律保留。
- *   - 已在依赖字段（dependencies / devDependencies / optionalDependencies /
- *     peerDependencies）中声明的条目保留，避免误删「已声明待安装」的意图。
- *   - 受保护核心 bundle（`@deepseek-ai/dsh-base` / `@deepseek-ai/dsh-web-app`）永不清理。
- *   - `DSH_PRUNE_STALE_BUNDLES=all` 可切换为「激进模式」：清理任意「无法解析且未声明」
- *     的条目；`=0/false/off/no` 完全关闭。
- * 本函数是纯内存变换（不写盘），由调用方在 profile 写锁内落盘，保证幂等且不丢其它条目。
+ * Требования безопасности (по умолчанию «консервативный режим», никогда не трогаем
+ * конкурентных писателей и намерения пользователя):
+ *   - по умолчанию чистим только **известно снятые/переименованные апстримом** bundle
+ *     ({@link KNOWN_REMOVED_BUNDLES}, можно расширить через `DSH_PRUNE_BUNDLES_EXTRA`).
+ *     Это решает предупреждения после обновления и при этом не касается записей, которые
+ *     только что написал нативный менеджер плагинов DSH (гарантия P6 «не терять обновления»).
+ *   - чистим только **действительно неразрешаемые** записи: если пакет снова разрешим
+ *     (пользователь переустановил) — всегда оставляем.
+ *   - записи, объявленные в полях зависимостей (dependencies / devDependencies /
+ *     optionalDependencies / peerDependencies), сохраняются — чтобы не удалить
+ *     «объявленное ожидание установки».
+ *   - защищённые core-bundle (`@deepseek-ai/dsh-base` / `@deepseek-ai/dsh-web-app`) никогда не вычищаются.
+ *   - `DSH_PRUNE_STALE_BUNDLES=all` переключает «агрессивный режим»: вычищаются любые
+ *     «неразрешаемые и необъявленные» записи; `=0/false/off/no` полностью отключает.
+ * Функция — чистое преобразование в памяти (на диск не пишет); вызывающая сторона сохраняет
+ * результат внутри write-lock профиля, что гарантирует идемпотентность и сохранность прочих записей.
  */
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
 
-/** 永远不清理的核心 bundle（即使解析失败也应保留并交由上层告警，而不是静默移除底座）。 */
+/** Core-bundle, который никогда не вычищается (даже при ошибке разрешения его сохраняют
+ * и передают в предупреждение вышестоящему коду, а не молча снимают из основания). */
 const DEFAULT_PROTECTED_BUNDLES = Object.freeze([
   '@deepseek-ai/dsh-base',
   '@deepseek-ai/dsh-web-app'
 ]);
 
 /**
- * 已知被上游下线/改名的 bundle 包（保守模式的清理清单）。
- * 依据：官方各版本 Release 说明与安装树实测。
- *   - `@deepseek-ai/dsh-experimental-agent-team-web-profile`：0.1.7 起并入
- *     `@deepseek-ai/dsh-experimental-agent-team-profile`（其 README 明确要求从
- *     `dsh.profile.bundles` 删除独立条目）。
- *   - `@deepseek-ai/dsh-settings-file`：0.1.7 起移除。
- *   - `@deepseek-ai/dsh-experimental-schedule-bundle`：0.2.1-alpha.1 起退役，
- *     自动化任务内建进 `dsh-web-app`（上游 `dsh-app-boot` 的 `RETIRED_BUNDLES`
- *     亦会剔除；此处与之对齐，使老数据卷 profile 清理口径一致）。
+ * Packеты bundle, известные как снятые/переименованные апстримом (список очистки консервативного режима).
+ * Основание: официальные Release-заметки разных версий и фактическая установочная структура.
+ *   - `@deepseek-ai/dsh-experimental-agent-team-web-profile`: с 0.1.7 влит в
+ *     `@deepseek-ai/dsh-experimental-agent-team-profile` (его README явно требует
+ *     удалить отдельную запись из `dsh.profile.bundles`).
+ *   - `@deepseek-ai/dsh-settings-file`: удалён с 0.1.7.
+ *   - `@deepseek-ai/dsh-experimental-schedule-bundle`: снят с 0.2.1-alpha.1, автоматизация
+ *     встроена в `dsh-web-app` (апстримный `dsh-app-boot` тоже удаляет его через `RETIRED_BUNDLES`;
+ *     здесь выровнено, чтобы профили старых томов данных чистились одинаково).
  */
 const KNOWN_REMOVED_BUNDLES = Object.freeze([
   '@deepseek-ai/dsh-experimental-agent-team-web-profile',
@@ -54,7 +61,7 @@ const KNOWN_REMOVED_BUNDLES = Object.freeze([
   '@deepseek-ai/dsh-experimental-schedule-bundle'
 ]);
 
-/** DSH 安装锚点候选（容器内实际为 `/usr/local/lib/node_modules/@deepseek-ai/dsh`）。 */
+/** Кандидаты-якоря установки DSH (в контейнере фактически `/usr/local/lib/node_modules/@deepseek-ai/dsh`). */
 function defaultInstallAnchors(env = process.env) {
   const candidates = [
     env.DSH_INSTALL_ANCHOR,
@@ -72,10 +79,10 @@ function defaultInstallAnchors(env = process.env) {
 }
 
 /**
- * 从某个锚点出发解析包目录，语义与官方 `packageDirFromAnchor` 一致。
- * @param {string} anchor 锚点文件（其所在目录向上搜索 node_modules）
- * @param {string} name 包名
- * @returns {string|undefined} 包目录绝对路径，未找到返回 undefined
+ * Разрешает каталог пакета от заданного якоря, семантика совпадает с официальным `packageDirFromAnchor`.
+ * @param {string} anchor файл-якорь (производит поиск node_modules вверх от своего каталога)
+ * @param {string} name имя пакета
+ * @returns {string|undefined} абсолютный путь каталога пакета; undefined, если не найден
  */
 function packageDirFromAnchor(anchor, name) {
   let searchPaths = null;
@@ -95,10 +102,10 @@ function packageDirFromAnchor(anchor, name) {
 }
 
 /**
- * 判断 bundle 是否可解析：安装锚点优先，其次 profile 目录锚点。
- * @param {string} name 包名
- * @param {string} profileDir profile 目录
- * @param {string[]} [installAnchors] DSH 安装锚点
+ * Определяет, разрешим ли bundle: сначала якорь установки, затем якорь каталога профиля.
+ * @param {string} name имя пакета
+ * @param {string} profileDir каталог профиля
+ * @param {string[]} [installAnchors] якоря установки DSH
  * @returns {boolean}
  */
 function isBundleResolvable(name, profileDir, installAnchors) {
@@ -109,7 +116,7 @@ function isBundleResolvable(name, profileDir, installAnchors) {
   return false;
 }
 
-/** 收集 manifest 中所有被声明为依赖（任何依赖字段）的包名。 */
+/** Собирает имена пакетов, объявленных зависимостями в manifest (в любом поле зависимостей). */
 function declaredNames(pkg) {
   const names = new Set();
   for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
@@ -122,9 +129,9 @@ function declaredNames(pkg) {
 }
 
 /**
- * 解析清理模式。
+ * Определяет режим очистки.
  * @param {Record<string,string|undefined>} [env]
- * @returns {'off'|'known'|'all'} 默认 'known'（保守：仅清理已知下线清单）
+ * @returns {'off'|'known'|'all'} по умолчанию 'known' (консервативно: только известный список снятых)
  */
 function pruneMode(env = process.env) {
   const value = String(env.DSH_PRUNE_STALE_BUNDLES ?? 'known').trim().toLowerCase();
@@ -133,12 +140,12 @@ function pruneMode(env = process.env) {
   return 'known';
 }
 
-/** 追加到已知下线清单的包名（`DSH_PRUNE_BUNDLES_EXTRA`，逗号分隔）。 */
+/** Имена пакетов, добавляемых к известному списку снятых (`DSH_PRUNE_BUNDLES_EXTRA`, через запятую). */
 function extraRemovedNames(env = process.env) {
   return parseExtraList(env.DSH_PRUNE_BUNDLES_EXTRA);
 }
 
-/** 解析「额外清理清单」：接受数组或逗号分隔字符串。 */
+/** Разбирает «дополнительный список очистки»: принимает массив или строку через запятую. */
 function parseExtraList(value) {
   if (Array.isArray(value)) return value.map((s) => String(s).trim()).filter(Boolean);
   return String(value ?? '')
@@ -148,9 +155,11 @@ function parseExtraList(value) {
 }
 
 /**
- * 综合环境变量与持久化配置（`gateway.config.json`）解析清理策略。
- * 优先级：环境变量 `DSH_PRUNE_STALE_BUNDLES` > 持久化 `pruneStaleBundles` > 默认 `known`；
- * 额外清单取两者并集（环境变量 `DSH_PRUNE_BUNDLES_EXTRA` + 持久化 `pruneBundlesExtra`）。
+ * Определяет стратегию очистки, объединяя переменные окружения и сохранённую конфигурацию
+ * (`gateway.config.json`).
+ * Приоритет: переменная окружения `DSH_PRUNE_STALE_BUNDLES` > сохранённый `pruneStaleBundles` > по умолчанию `known`;
+ * дополнительный список берётся как объединение обоих (переменная окружения `DSH_PRUNE_BUNDLES_EXTRA`
+ * + сохранённый `pruneBundlesExtra`).
  * @param {Record<string,string|undefined>} [env]
  * @param {{ pruneStaleBundles?: string, pruneBundlesExtra?: string|string[] }} [persisted]
  * @returns {{ mode: 'off'|'known'|'all', extraNames: string[] }}
@@ -174,11 +183,12 @@ function resolvePruneConfig(env = process.env, persisted = {}) {
 }
 
 /**
- * 剔除 profile manifest 中无法解析的幽灵 bundle 条目（原地修改 `pkg`）。
- * @param {any} pkg profile 的 package.json 对象
+ * Убирает из manifest профиля неразрешимые ghost-записи bundle (изменяет `pkg` на месте).
+ * @param {any} pkg объект package.json профиля
  * @param {{ profileDir: string, mode?: 'off'|'known'|'all', installAnchors?: string[], protectedNames?: string[], knownRemoved?: string[], extraNames?: string[] }} opts
  * @returns {{ pruned: string[], declared: string[], mode: string }}
- *          pruned=已剔除的幽灵条目；declared=命中候选但已声明为依赖、被保留的条目
+ *          pruned=удалённые ghost-записи; declared=подпадавшие под кандидатов, но объявленные
+ *          зависимостями и потому сохранённые записи
  */
 function pruneStaleBundles(pkg, opts = {}) {
   const profileDir = opts.profileDir;
@@ -201,7 +211,7 @@ function pruneStaleBundles(pkg, opts = {}) {
   for (const name of bundles) {
     if (typeof name !== 'string' || name === '') { next.push(name); continue; }
     if (protectedNames.has(name)) { next.push(name); continue; }
-    // 保守模式只处理已知下线清单；激进模式处理任意条目。
+    // Консервативный режим обрабатывает только известный список снятых; агрессивный — любые записи.
     if (mode !== 'all' && !knownRemoved.has(name)) { next.push(name); continue; }
     if (isBundleResolvable(name, profileDir, installAnchors)) { next.push(name); continue; }
     if (declared.has(name)) { keptDeclared.push(name); next.push(name); continue; }

@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-// 测试/调试用：DSH_PATCH_ONLY_DIR 存在时只扫描该目录，避免误改环境中其它 DSH 副本
+// Для тестов/отладки: при наличии DSH_PATCH_ONLY_DIR сканируется только этот каталог,
+// чтобы случайно не задеть другие экземпляры DSH в окружении
 const ONLY_DIR = process.env.DSH_PATCH_ONLY_DIR;
 const SEARCH_DIRS = ONLY_DIR ? [ONLY_DIR] : [
   process.env.DSH_INSTALL_DIR ? path.join(process.env.DSH_INSTALL_DIR, 'lib/node_modules/@deepseek-ai') : null,
@@ -18,9 +19,10 @@ const SEARCH_DIRS = ONLY_DIR ? [ONLY_DIR] : [
 
 const MARKER = '/* dsh-patch: loopback-host-mode-applied */';
 
-// ── 必需补丁追踪 ──────────────────────────────────────────────
-// 背景：本脚本靠字符串锚点给 DSH 源码打补丁，DSH 一升级锚点就可能失效。
-// 过去失效是"静默跳过 + 结尾打印成功"，本项目已因此踩过两次坑，这里改为必须显式失败。
+// ── Трекинг обязательных патчей ──────────────────────────────────────────────
+// Предыстория: скрипт патчит исходники DSH по строковым якорям; при апгрейде DSH
+// якоря могут перестать работать. Раньше промах был «молчаливый пропуск + итоговый
+// успех в конце», проект уже дважды наступал из-за этого; теперь промах = явный FATAL.
 const REQUIRED_PATCHES = ['client-loopback', 'auth-bypass', 'combo-fallback'];
 const appliedPatches = new Set();
 const missedPatches = new Set();
@@ -29,10 +31,13 @@ const markMissed = (name) => missedPatches.add(name);
 let loopbackSeen = false;
 
 /**
- * 读取「正在被扫描的那棵树」的 DSH 版本（用于与 version.json 的兼容区间比对）。
- * 必须优先跟随 DSH_PATCH_ONLY_DIR / DSH_INSTALL_DIR：否则离线审计（DSH_PATCH_ONLY_DIR
- * 指向某份安装树）时会读到环境里另一套 DSH（如本机 /usr/local 的旧版本），
- * 横幅版本与真实扫描对象不一致，容易误判（历史踩坑 R4）。
+ * Читает версию DSH «именно той дерева, которое сейчас сканируется» (для сверки с
+ * совместимым диапазоном version.json).
+ * Обязательно сначала следует DSH_PATCH_ONLY_DIR / DSH_INSTALL_DIR: иначе при
+ * офлайн-аудите (DSH_PATCH_ONLY_DIR указывает на какую-то установочную дерево) будет
+ * прочитан другой экземпляр DSH из окружения (например старая версия в /usr/local),
+ * и версия в баннере разойдётся с реальным объектом сканирования — легко ошибиться
+ * (история-грабли R4).
  */
 function readInstalledDshVersion() {
   const candidates = [
@@ -51,8 +56,9 @@ function readInstalledDshVersion() {
 }
 
 /**
- * 读取兼容区间元数据。离线审计（DSH_PATCH_ONLY_DIR）优先用仓库自身的 version.json，
- * 容器内则用 /app/version.json；可用 DSH_VERSION_JSON 显式覆盖。
+ * Читает метаданные совместимого диапазона. При офлайн-аудите (DSH_PATCH_ONLY_DIR)
+ * в приоритете version.json самого репозитория, в контейнере — /app/version.json;
+ * можно явно переопределить через DSH_VERSION_JSON.
  */
 function readCompatRange() {
   const candidates = [
@@ -71,25 +77,26 @@ function readCompatRange() {
   return { range: null, source: null };
 }
 
-/** 与 version.json 的 supportedDshRange 比对（仅告警，不阻断启动） */
+/** Сверка с supportedDshRange из version.json (только предупреждение, запуск не блокирует) */
 function warnIfVersionOutOfRange() {
   try {
     const { version: ver, source: verSrc } = readInstalledDshVersion();
     const { range, source: rangeSrc } = readCompatRange();
     if (!ver || !range) return;
-    console.log(`[patch-dsh-client] DSH 版本: ${ver} (来源: ${verSrc})，声明兼容区间: ${range} (来源: ${rangeSrc})`);
+    console.log(`[patch-dsh-client] DSH версия: ${ver} (Источник: ${verSrc}), заявленный совместимый диапазон: ${range} (Источник: ${rangeSrc})`);
   } catch (e) {
-    console.warn('[patch-dsh-client] 版本区间检查跳过:', e.message);
+    console.warn('[patch-dsh-client] Проверка диапазона версии пропущена:', e.message);
   }
 }
 
-// auth-bypass 锚点：方法签名随 DSH 版本漂移，按「新→旧」顺序尝试命中。
-//   - 0.2.1-alpha.2 起：`isAuthenticated(request, secure = false) {`（新增 secure 参数，浏览器认证加固）
-//   - 0.2.1-alpha.1 及更早：`isAuthenticated(request) {`
-// 该方法是 dsh-client-connection 中**唯一**的 isAuthenticated 定义（位于 BrowserAuth 类内，
-// alpha.2 见 lib/index.js:484）。HostConnectionService.requestRejection / authorizeIndex
-// 均经 this.browserAuth.isAuthenticated(...) 调用它，故在此单点注入 return true 即可覆盖
-// 全部 401 判定（403 的 Host/Origin fence 仍由 isTrustedApiRequest 独立把守，与本补丁无关）。
+// Якорь auth-bypass: сигнатура метода дрейфует по версиям DSH, пробуем по порядку «новая→старая».
+//   - с 0.2.1-alpha.2: `isAuthenticated(request, secure = false) {` (добавлен параметр secure, усиление аутентификации браузера)
+//   - 0.2.1-alpha.1 и раньше: `isAuthenticated(request) {`
+// Это **единственное** определение isAuthenticated в dsh-client-connection (класс BrowserAuth,
+// в alpha.2 см. lib/index.js:484). HostConnectionService.requestRejection / authorizeIndex
+// обращаются к нему через this.browserAuth.isAuthenticated(...), поэтому инжекта return true
+// в этой единственной точке достаточно, чтобы закрыть все 401-проверки (403-ограда Host/Origin
+// по-прежнему независимо сторожится isTrustedApiRequest и к этому патчу отношения не имеет).
 const AUTH_BYPASS_SIGNATURES = [
   'isAuthenticated(request, secure = false) {',
   'isAuthenticated(request) {'
@@ -101,9 +108,10 @@ const REPLACEMENTS = [
     replacement: 'true'
   },
   {
-    // 0.1.6/0.1.7 真实形态：ctx.remote.$host.isLoopback ? "host" : "memory"
-    // （旧的 connection.isLoopback 变体在两版中均不存在，属历史遗留死锚点；
-    //   这里改为真实 needle，使 host 持久化不再依赖 isLoopback 的间接链路）
+    // Реальная форма в 0.1.6/0.1.7: ctx.remote.$host.isLoopback ? "host" : "memory"
+    // (старый вариант connection.isLoopback в обеих версиях отсутствует — это мёртвый
+    //   якорь из прошлого; здесь — реальный needle, чтобы host-персистентность
+    //   больше не зависела от косвенной цепочки isLoopback)
     needle: 'ctx.remote.$host.isLoopback ? "host" : "memory"',
     replacement: '"host"'
   }
@@ -135,7 +143,8 @@ function findClientFiles(baseDir) {
 }
 
 function patchServerConnection(baseDir) {
-  // 1. 服务端鉴权：统一由网关接管认证，彻底消除 /api 与 WebSocket 连接中 token 换取的 401 拦截
+  // 1. Серверная аутентификация: аутентификацией целиком заведует шлюз —
+  //    полностью убираем 401-перехваты обмена токена в /api и WebSocket
   const connTarget = path.join(baseDir, 'dsh-client-connection/lib/index.js');
   if (fs.existsSync(connTarget)) {
     try {
@@ -151,18 +160,18 @@ function patchServerConnection(baseDir) {
           );
           fs.writeFileSync(connTarget, cContent, 'utf8');
           markApplied('auth-bypass');
-          console.log(`[patch-dsh-client] 成功修补服务端免鉴权直连 (由网关统一收口认证): ${connTarget}`);
+          console.log(`[patch-dsh-client] Успешно пропатчено серверное подключение без аутентификации (единая аутентификация шлюза): ${connTarget}`);
         } else {
           markMissed('auth-bypass');
-          console.warn(`[patch-dsh-client] ⚠️ 必需补丁 auth-bypass 未命中（锚点失效）: ${connTarget}`);
+          console.warn(`[patch-dsh-client] ⚠️ Обязательный патч auth-bypass не применён (якорь устарел): ${connTarget}`);
         }
       }
     } catch (err) {
-      console.warn(`[patch-dsh-client] 修补服务端放行失败: ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка пропатча серверного пропуска: ${err.message}`);
     }
   }
 
-  // 2. 目录选择器根路径微调 (若存在)
+  // 2. Тонкая настройка корневого пути выбора каталога (если присутствует)
   const pickerTarget = path.join(baseDir, 'dsh-host-directory-picker-browse/lib/index.js');
   if (fs.existsSync(pickerTarget)) {
     try {
@@ -170,10 +179,10 @@ function patchServerConnection(baseDir) {
       if (pContent.includes('const home = homedir();') && !pContent.includes('process.env.DSH_WORKSPACE')) {
         pContent = pContent.replace('const home = homedir();', 'const home = process.env.DSH_WORKSPACE || homedir();');
         fs.writeFileSync(pickerTarget, pContent, 'utf8');
-        console.log(`[patch-dsh-client] 成功对齐目录选择器默认根路径为 DSH_WORKSPACE: ${pickerTarget}`);
+        console.log(`[patch-dsh-client] Успешно выровнен корневой путь выбора каталога на DSH_WORKSPACE: ${pickerTarget}`);
       }
     } catch (err) {
-      console.warn(`[patch-dsh-client] 对齐目录选择器失败: ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка выравнивания выбора каталога: ${err.message}`);
     }
   }
 }
@@ -184,7 +193,7 @@ let checkedDirs = 0;
 for (const searchDir of SEARCH_DIRS) {
   if (!fs.existsSync(searchDir)) continue;
   checkedDirs++;
-  console.log(`[patch-dsh-client] 扫描模块目录: ${searchDir}`);
+  console.log(`[patch-dsh-client] Сканируем каталог модулей: ${searchDir}`);
   
   // 1. Client patch (host mode & loopback)
   const clientFiles = findClientFiles(searchDir);
@@ -207,23 +216,26 @@ for (const searchDir of SEARCH_DIRS) {
       if (modified) {
         content = `${MARKER}\n${content}`;
         fs.writeFileSync(file, content, 'utf8');
-        console.log(`[patch-dsh-client] 成功修补客户端: ${file}`);
+        console.log(`[patch-dsh-client] Успешно пропатчен клиент: ${file}`);
         patchedCount++;
         loopbackSeen = true;
       }
     } catch (err) {
-      console.warn(`[patch-dsh-client] 修补失败: ${file} - ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка патча: ${file} - ${err.message}`);
     }
   }
 
-  // 2. Server connection patch (gateway manages auth)
+  // 2. Патч серверного подключения (аутентификацией заведует шлюз)
   patchServerConnection(searchDir);
 
-  // 3. 修补 client-modules combo 静态资源路由
-  //    背景：客户端插件包 URL 形如 /plugins/??a/client.js,b/client.js&rev=<hash>；
-  //    DSH 重启后 hash 变化，**已打开的页面**若再去取旧 rev 的包会拿到 404 → 白屏。
-  //    3a. 同进程内 rev 变化：优先复用同前缀的历史 batch 响应；
-  //    3b. 跨进程重启后旧 rev 已彻底不存在：返回一段"自愈重载"脚本，让页面自动刷新恢复。
+  // 3. Патч составного маршрута статических ресурсов client-modules
+  //    Предыстория: URL пакетов клиентских плагинов выглядят как /plugins/??a/client.js,b/client.js&rev=<hash>;
+  //    после перезапуска DSH хэш меняется, и **уже открытая страница**, запрашивая пакет со старым rev,
+  //    получает 404 → белый экран.
+  //    3a. изменение rev в том же процессе: в приоритете переиспользование исторического batch-ответа
+  //        с тем же префиксом;
+  //    3b. после межпроцессного перезапуска старого rev уже нет вовсе: отдаём скрипт «самовосстановление
+  //        перезагрузкой», чтобы страница потолкала сама себя и восстановилась.
   const modulesTarget = path.join(searchDir, 'dsh-client-modules/lib/index.js');
   if (fs.existsSync(modulesTarget)) {
     try {
@@ -231,7 +243,8 @@ for (const searchDir of SEARCH_DIRS) {
       let changed = false;
       if (mContent.includes('/* dsh-patch: combo-fallback */')) markApplied('combo-fallback');
 
-      // 3a. 同进程内 rev 变化 → 复用同前缀历史 batch（兼容新旧两版 DSH 源码形态）
+      // 3a. изменение rev в том же процессе → переиспользуем исторический batch с тем же префиксом
+      //    (совместимо со старым и новым исходником DSH)
       if (!mContent.includes('/* dsh-patch: combo-fallback */')) {
         const needles = [
           'const response = this.responses.get(resourceUrl) ?? this.previousBatchResponses.get(resourceUrl) ?? this.chunkResponse(requestUrl);',
@@ -253,7 +266,8 @@ for (const searchDir of SEARCH_DIRS) {
         }
       }
 
-      // 3b. 旧 rev 已不存在（DSH 重启/换镜像后）→ 不再 404，返回自愈重载模块
+      // 3b. старого rev уже нет (после перезапуска DSH / смены образа) → вместо 404 отдаём
+      //    модуль «самовосстановление перезагрузкой»
       if (!mContent.includes('/* dsh-patch: bundle-404-selfheal */')) {
         const anchor = 'return { status: 404 };\n\t}\n\tserveBundle = async (req, res) => {';
         if (mContent.includes(anchor)) {
@@ -278,19 +292,19 @@ for (const searchDir of SEARCH_DIRS) {
       if (changed) {
         fs.writeFileSync(modulesTarget, mContent, 'utf8');
         markApplied('combo-fallback');
-        console.log(`[patch-dsh-client] 成功修补 combo 插件包版本自愈兼容机制: ${modulesTarget}`);
+        console.log(`[patch-dsh-client] Успешно пропатчен механизм самовосстановления версий combo-пакетов плагинов: ${modulesTarget}`);
       }
       if (!appliedPatches.has('combo-fallback')) {
         markMissed('combo-fallback');
-        console.warn(`[patch-dsh-client] ⚠️ 必需补丁 combo-fallback 未命中（锚点失效）: ${modulesTarget}`);
+        console.warn(`[patch-dsh-client] ⚠️ Обязательный патч combo-fallback не применён (якорь устарел): ${modulesTarget}`);
       }
     } catch (err) {
       markMissed('combo-fallback');
-      console.warn(`[patch-dsh-client] 修补 client-modules 失败: ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка патча client-modules: ${err.message}`);
     }
   }
 
-  // 4. 设置页面：彻底消除“打开配置文件”按钮，啥也不显示 (return null)
+  // 4. Страница настроек: полностью убираем кнопку «Открыть файл конфигурации», ничего не показываем (return null)
   const generalClientTarget = path.join(searchDir, 'dsh-client-ui-settings-general/lib/client.js');
   if (fs.existsSync(generalClientTarget)) {
     try {
@@ -301,14 +315,15 @@ for (const searchDir of SEARCH_DIRS) {
           'function SettingsDocumentAction(props) { return null; }\n\t\tfunction __ignored_SettingsDocumentAction('
         );
         fs.writeFileSync(generalClientTarget, gContent, 'utf8');
-        console.log(`[patch-dsh-client] 成功消除“配置文件”按钮: ${generalClientTarget}`);
+        console.log(`[patch-dsh-client] Успешно убрана кнопка «Файл конфигурации»: ${generalClientTarget}`);
       }
     } catch (err) {
-      console.warn(`[patch-dsh-client] 消除设置页按钮失败: ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка удаления кнопки на странице настроек: ${err.message}`);
     }
   }
 
-  // 5. 模型与引导：消除“内测声明”弹窗 (直接 return null 并通知 complete 放行，彻底消除卡死弹窗)
+  // 5. Модели и онбординг: убираем всплывающее окно «объявление о закрытом тесте»
+  //    (напрямую return null и уведомляем complete о продолжении, полностью убираем «зависающее» окно)
   const modelsClientTarget = path.join(searchDir, 'dsh-client-ui-settings-models/lib/client.js');
   if (fs.existsSync(modelsClientTarget)) {
     try {
@@ -319,14 +334,15 @@ for (const searchDir of SEARCH_DIRS) {
           '/* dsh-patch: welcome-notice-bypass */ function WelcomeNotice(props) { props?.complete?.(); return null;'
         );
         fs.writeFileSync(modelsClientTarget, mContent, 'utf8');
-        console.log(`[patch-dsh-client] 成功跳过内测声明弹窗: ${modelsClientTarget}`);
+        console.log(`[patch-dsh-client] Успешно пропущено окно «объявление о закрытом тесте»: ${modelsClientTarget}`);
       }
     } catch (err) {
-      console.warn(`[patch-dsh-client] 跳过内测声明弹窗失败: ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка пропуска окна «объявление о закрытом тесте»: ${err.message}`);
     }
   }
 
-  // 6. 修补 dsh-settings 兼容性：补齐 settingsNamespace 导出 (解决 dsh-better-sidebar 等市场插件因缺失 settingsNamespace 崩溃)
+  // 6. Патч совместимости dsh-settings: добавляем экспорт settingsNamespace
+  //    (решает краш плагинов marketplace вроде dsh-better-sidebar из-за отсутствия settingsNamespace)
   const settingsTarget = path.join(searchDir, 'dsh-settings/lib/index.js');
   if (fs.existsSync(settingsTarget)) {
     try {
@@ -338,31 +354,33 @@ for (const searchDir of SEARCH_DIRS) {
           polyfill + 'export { settingsNamespace, SettingsConflictError,'
         );
         fs.writeFileSync(settingsTarget, sContent, 'utf8');
-        console.log(`[patch-dsh-client] 成功修补 dsh-settings 的 settingsNamespace 导出: ${settingsTarget}`);
+        console.log(`[patch-dsh-client] Успешно пропатчен экспорт settingsNamespace у dsh-settings: ${settingsTarget}`);
       }
     } catch (err) {
-      console.warn(`[patch-dsh-client] 修补 dsh-settings 失败: ${err.message}`);
+      console.warn(`[patch-dsh-client] Ошибка патча dsh-settings: ${err.message}`);
     }
   }
 }
 
-console.log(`[patch-dsh-client] 补丁扫描完成，共修补 ${patchedCount} 个客户端文件 (已检查 ${checkedDirs} 个根目录)`);
+console.log(`[patch-dsh-client] Сканирование патчей завершено, пропатчено ${patchedCount} клиентских файлов (проверено ${checkedDirs} корневых каталогов)`);
 warnIfVersionOutOfRange();
 
-// 必需补丁必须命中：否则说明 DSH 源码锚点已漂移，补丁"静默失效"比启动失败更危险
+// Обязательные патчи обязаны попасть: иначе якоря исходников DSH уплыли, и «молчаливый
+// провал» патча опаснее ошибки запуска
 if (loopbackSeen) markApplied('client-loopback'); else markMissed('client-loopback');
-// 同一补丁在任一目录命中即视为满足（多份 DSH 副本时，只读副本失败不算致命）
+// Один патч, попавший в любом каталоге, считается выполненным (при нескольких копиях
+// DSH сбой в копии «только для чтения» не фатален)
 for (const name of appliedPatches) missedPatches.delete(name);
-console.log(`[patch-dsh-client] 必需补丁状态: 已应用=[${[...appliedPatches].join(', ') || '无'}] 未命中=[${[...missedPatches].join(', ') || '无'}]`);
+console.log(`[patch-dsh-client] Статус обязательных патчей: применено=[${[...appliedPatches].join(', ') || 'нет'}] не применено=[${[...missedPatches].join(', ') || 'нет'}]`);
 
 if (checkedDirs === 0) {
-  console.error('[patch-dsh-client] [FATAL] 未找到任何 DSH 模块目录，补丁完全没有执行（镜像结构异常）');
+  console.error('[patch-dsh-client] [FATAL] Не найден ни один каталог модулей DSH, патчи вообще не выполнялись (аномальная структура образа)');
   process.exit(1);
 }
 if (missedPatches.size > 0) {
-  console.error(`[patch-dsh-client] [FATAL] 必需补丁未命中: ${[...missedPatches].join(', ')}`);
-  console.error(`[patch-dsh-client] [FATAL] 必需补丁清单: ${REQUIRED_PATCHES.join(', ')}`);
-  console.error('[patch-dsh-client] [FATAL] 这通常意味着 DSH 版本已漂移、补丁源码锚点失效；请先更新 patch-dsh-client.mjs 再启动。');
+  console.error(`[patch-dsh-client] [FATAL] Обязательные патчи не применены: ${[...missedPatches].join(', ')}`);
+  console.error(`[patch-dsh-client] [FATAL] Список обязательных патчей: ${REQUIRED_PATCHES.join(', ')}`);
+  console.error('[patch-dsh-client] [FATAL] Обычно это значит, что версия DSH устарела и якоря исходников патчей поехали; обновите patch-dsh-client.mjs перед запуском.');
   process.exit(1);
 }
-console.log('[patch-dsh-client] 全部必需补丁已生效 ✅');
+console.log('[patch-dsh-client] Все обязательные патчи применены ✅');

@@ -5,8 +5,9 @@ export DSH_WORKSPACE="${DSH_WORKSPACE:-/workspace}"
 export PROXY_PORT="${PROXY_PORT:-3080}"
 export DSH_PORT="${DSH_PORT:-3079}"
 export VNC_PORT="${VNC_PORT:-6080}"
-# M13：ADMIN_PATH / VNC_PATH 只有在【显式设置】时才导出为环境变量；
-# 未设置时不注入默认值，从而让管理后台写入的持久化配置继续生效（env 显式设置才优先）。
+# M13: ADMIN_PATH / VNC_PATH экспортируются в окружение только при **явно заданном** значении;
+# без значения ничего не подставляется, чтобы сохранённая панелью управления конфигурация
+# продолжала действовать (явный env имеет приоритет).
 if [ -n "${ADMIN_PATH:-}" ]; then export ADMIN_PATH; fi
 if [ -n "${VNC_PATH:-}" ]; then export VNC_PATH; fi
 export NOVNC_ASSET_REVISION="${NOVNC_ASSET_REVISION:-1.6.0}"
@@ -14,20 +15,22 @@ export DSH_DESKTOP_ENABLED="${DSH_DESKTOP_ENABLED:-1}"
 export DSH_DESKTOP_WIDTH="${DSH_DESKTOP_WIDTH:-1920}"
 export DSH_DESKTOP_HEIGHT="${DSH_DESKTOP_HEIGHT:-1080}"
 export DSH_DESKTOP_DEPTH="${DSH_DESKTOP_DEPTH:-24}"
-# M11：运行根目录可迁移（非 root 部署时设为 /home/<user>），默认 /root
+# M11: корневой каталог можно переносить (при non-root развёртывании ставить /home/<user>), по умолчанию /root
 export DSH_HOME="${DSH_HOME:-/root}"
 export DSH_DIR="${DSH_HOME}/.dsh"
 export DSH_SNAPSHOT_DIR="${DSH_SNAPSHOT_DIR:-${DSH_HOME}/.dsh-snapshots}"
-# Issue #7：多核心版本隔离版本库。默认落在「快照与备份」卷内的子目录（复用现有挂载，不新增挂载点）
+# Issue #7: хранилище версий изолировано по ядрам. По умолчанию — подкаталог внутри тома «снимки и резервные
+# копии» (переиспользуем существующее монтирование, без новых точек монтирования)
 export DSH_VERSIONS_DIR="${DSH_VERSIONS_DIR:-${DSH_SNAPSHOT_DIR}/versions}"
 export CHROME_USER_DATA_DIR="${CHROME_USER_DATA_DIR:-${DSH_HOME}/.config/chromium}"
-# 轻微项：DSH 日志落数据卷（便于排障与留存），并做简单的体积轮转
+# Незначительное: журнал DSH пишется в том данных (удобно для диагностики и сохранности), плюс простая ротация по размеру
 export DSH_WEB_LOG="${DSH_WEB_LOG:-${DSH_HOME:-/root}/.dsh/logs/dsh-web.log}"
 export DSH_WEB_LOG_MAX_BYTES="${DSH_WEB_LOG_MAX_BYTES:-10485760}"
 export NODE_OPTIONS="${NODE_OPTIONS} --no-deprecation"
 export NODE_PATH="/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules:/usr/local/lib/node_modules:${NODE_PATH}"
 
-# 出站代理环境变量归一化 (兼容官方 0.1.5-rc.1 原生出站代理行为)
+# Нормализация переменных окружения исходящего прокси (совместимость с нативным исходящим
+# прокси официальной 0.1.5-rc.1)
 [ -n "$HTTP_PROXY" ] && export HTTP_PROXY="$HTTP_PROXY" http_proxy="${http_proxy:-$HTTP_PROXY}"
 [ -n "$HTTPS_PROXY" ] && export HTTPS_PROXY="$HTTPS_PROXY" https_proxy="${https_proxy:-$HTTPS_PROXY}"
 [ -n "$ALL_PROXY" ] && export ALL_PROXY="$ALL_PROXY" all_proxy="${all_proxy:-$ALL_PROXY}"
@@ -36,7 +39,7 @@ export NODE_PATH="/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules:/usr
 child_pid=""
 
 stop_all() {
-  echo "[entrypoint] 收到停止信号，正在退出..."
+  echo "[entrypoint] Получен сигнал остановки, выходим..."
   if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
     kill -TERM "$child_pid" 2>/dev/null || true
     wait "$child_pid" 2>/dev/null || true
@@ -47,10 +50,10 @@ stop_all() {
 trap stop_all SIGINT SIGTERM SIGHUP
 
 echo "========================================================"
-echo "    启动 DeepSeek Harness"
+echo "    Запускаем DeepSeek Harness"
 echo "========================================================"
 
-# 1. 确保必要目录就绪
+# 1. Готовим необходимые каталоги
 mkdir -p "${DSH_WORKSPACE}" "${DSH_DIR}" "${DSH_SNAPSHOT_DIR}" "${CHROME_USER_DATA_DIR}" "/tmp/dsh-desktop"
 mkdir -p "$(dirname "${DSH_WEB_LOG}")" 2>/dev/null || true
 if [ -f "${DSH_WEB_LOG}" ]; then
@@ -61,16 +64,17 @@ if [ -f "${DSH_WEB_LOG}" ]; then
 fi
 touch "${DSH_WEB_LOG}"
 
-# 1.0 自动配置 npm 与 pnpm 镜像源加速 (默认 npmmirror，海外可传 NPM_REGISTRY 覆盖)
+# 1.0 Автонастройка зеркал npm и pnpm (по умолчанию npmmirror; за рубежом можно переопределить через NPM_REGISTRY)
 NPM_REG="${NPM_REGISTRY:-https://registry.npmmirror.com}"
 npm config set registry "${NPM_REG}" 2>/dev/null || true
 which pnpm >/dev/null 2>&1 && pnpm config set registry "${NPM_REG}" 2>/dev/null || true
 
-# 1.01 确保 node-pty 的 spawn-helper 具备可执行权限
+# 1.01 Обеспечиваем исполняемость spawn-helper для node-pty
 find /usr/local/lib/node_modules -name "spawn-helper" -exec chmod 0755 {} + 2>/dev/null || true
 find /usr/local/lib/node_modules -name "ensure-spawn-helper.mjs" -exec node {} + 2>/dev/null || true
 
-# 1.1 修复 .dsh 目录与凭据文件的严格权限 (DSH 凭据服务强制校验 mode 600，拒绝 777/644 等跨权限读取崩溃)
+# 1.1 Чиним строгие права каталога .dsh и файлов с учётными данными
+# (сервис учётных данных DSH принудительно требует mode 600 и отказывается при 777/644 — краш при чтении из других прав)
 if [ -d "${DSH_DIR}" ]; then
   chmod 700 "${DSH_DIR}" 2>/dev/null || true
   find "${DSH_DIR}" -name "*credentials*.yaml" -o -name "*credentials*.yml" 2>/dev/null | while read -r f; do
@@ -78,21 +82,27 @@ if [ -d "${DSH_DIR}" ]; then
   done
 fi
 
-# 1.2 容器级配置预设：自官方 0.1.7 起，设置权威从 $DSH_DIR/settings.yaml 迁移到补丁层
-#     （旧 settings.yaml 只在 DSH 启动后被导入一次并改名 settings.yaml.imported），
-#     因此这里**不再**重建 settings.yaml——否则每次重启都会再次导入并回退用户在设置页改过的值。
-#     容器级预设（市场重启守护、原生侧边栏浏览器开关）统一由 install-plugin.mjs 写入
-#     Home 级补丁 $DSH_DIR/cordis.patch.yml（0.1.7 新增的最高优先级补丁层，对全部 profile 生效）。
-#     存量容器若仍有 settings.yaml，交由 DSH 首次启动完成一次性迁移，此处不干预。
+# 1.2 Контейнерные пресеты конфигурации: официально с 0.1.7 авторитет настроек переехал
+#      с $DSH_DIR/settings.yaml на патч-слой (старый settings.yaml импортируется только один раз
+#      после старта DSH и переименовывается в settings.yaml.imported),
+#      поэтому settings.yaml здесь **не пересоздаём** — иначе при каждом перезапуске он снова
+#      импортировался бы и откатывал значения, изменённые пользователем на странице настроек.
+#      Контейнерные пресеты (страж перезапуска маркетплейса, переключатель нативного браузера
+#      боковой панели) целиком пишутся install-plugin.mjs в патч уровня Home
+#      $DSH_DIR/cordis.patch.yml (слой 0.1.7 с наивысшим приоритетом, действует на все профили).
+#      Если в существующем контейнере ещё остался settings.yaml — однократную миграцию выполняет
+#      сам DSH при первом старте, сюда не вмешиваемся.
 
-# 1.15 版本库 (Issue #7)：目录就绪 + 中断自愈 + 残留清理 + 持久化自检
+# 1.15 хранилище версий (Issue #7): подготовка каталога + самовосстановление после обрыва + уборка остатков + самопроверка персистентности
 mkdir -p "${DSH_VERSIONS_DIR}/.staging" 2>/dev/null || true
 
 CORE_PARENT="/usr/local/lib/node_modules/@deepseek-ai"
 CORE_DIR="${CORE_PARENT}/dsh"
 
-# 1.15.1 中断自愈：活动核心缺失（上次原子置换被打断）时从最新回滚点还原，避免容器变砖
-# 优先用临时回滚点 (.dsh-rollback-tmp-*)，若无再退而使用受保护的单槽位备件 (.dsh-rollback-preserved)（保命优先于保留）
+# 1.15.1 Самовосстановление после обрыва: если активного ядра нет (последняя атомарная замена
+# была прервана) — восстанавливаем из свежайшей точки отката, чтобы контейнер не «окипел».
+# В приоритете временная точка отката (.dsh-rollback-tmp-*), при её отсутствии — защищённый
+# однослотовый запасной набор (.dsh-rollback-preserved) (спасение важнее сохранения)
 if [ ! -d "${CORE_DIR}" ]; then
   _rb="$(ls -1d "${CORE_PARENT}"/.dsh-rollback-tmp-* 2>/dev/null | sort | tail -1 || true)"
   if [ -z "${_rb}" ] || [ ! -d "${_rb}" ]; then
@@ -101,17 +111,19 @@ if [ ! -d "${CORE_DIR}" ]; then
     fi
   fi
   if [ -n "${_rb}" ] && [ -d "${_rb}" ]; then
-    echo "[entrypoint] ⚠️ 检测到活动核心缺失，正在从回滚点恢复: ${_rb}"
+    echo "[entrypoint] ⚠️ Активное ядро отсутствует, восстанавливаем из точки отката: ${_rb}"
     mv "${_rb}" "${CORE_DIR}" 2>/dev/null || true
   fi
 fi
 
-# 1.15.2 清理过期 staging/rollback 残留（>60 分钟），绝不触碰活动核心与受保护回滚点
+# 1.15.2 Убираем устаревшие остатки staging/rollback (>60 минут), никогда не трогая
+# активное ядро и защищённую точку отката
 find "${CORE_PARENT}" -maxdepth 1 -name ".dsh-staging-*" -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 find "${CORE_PARENT}" -maxdepth 1 -name ".dsh-rollback-*" ! -name ".dsh-rollback-preserved" -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 find "${DSH_VERSIONS_DIR}/.staging" -maxdepth 1 -mindepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
 
-# 1.15.3 持久化自检：版本库必须落在某个持久化挂载点内（默认即快照卷 <snapshots>/versions）
+# 1.15.3 Самопроверка персистентности: хранилище версий обязано лежать внутри какого-либо
+# персистентного монтирования (по умолчанию — том снимков <snapshots>/versions)
 _persisted=0
 while IFS= read -r _mp; do
   [ -z "$_mp" ] && continue
@@ -119,33 +131,35 @@ while IFS= read -r _mp; do
   case "${DSH_VERSIONS_DIR}/" in "${_mp}/"*) _persisted=1; break ;; esac
 done < <(awk '{print $5}' /proc/self/mountinfo 2>/dev/null)
 if [ "$_persisted" != "1" ]; then
-  echo "[entrypoint] ⚠️ 版本库 ${DSH_VERSIONS_DIR} 不在任何持久化挂载点内：容器重建/镜像更新后已归档版本将丢失（回切会重新下载）。"
-  echo "[entrypoint] ⚠️ 默认应落在快照卷内 (${DSH_SNAPSHOT_DIR}/versions)；如需独立隔离，可挂载 -v ./data/versions:/root/.dsh-versions 并设置 DSH_VERSIONS_DIR=/root/.dsh-versions"
+  echo "[entrypoint] ⚠️ хранилище версий ${DSH_VERSIONS_DIR} не находится ни в одном персистентном монтировании: после пересоздания контейнера/обновления образа архивные версии пропадут (при откате придётся качать заново)."
+  echo "[entrypoint] ⚠️ По умолчанию оно должно лежать в томе снимков (${DSH_SNAPSHOT_DIR}/versions); для независимой изоляции можно примонтировать -v ./data/versions:/root/.dsh-versions и задать DSH_VERSIONS_DIR=/root/.dsh-versions"
 fi
 
-# 2. 自动注册并安装 dsh-browser-desktop 插件到 DSH profile
+# 2. Автоматически регистрируем и устанавливаем плагин dsh-browser-desktop в DSH profile
 if [ -f "/app/scripts/install-plugin.mjs" ]; then
-  echo "[entrypoint] 注册 dsh-browser-desktop 插件到 Web Profile..."
+  echo "[entrypoint] Регистрируем плагин dsh-browser-desktop в Web Profile..."
   node /app/scripts/install-plugin.mjs || true
 fi
 
-# 3. 运行客户端与服务端回环持久化补丁（必需补丁未命中会以非零码退出，这里显著告警但不阻断启动）
+# 3. Применяем патчи loopback-персистентности клиента и сервера (обязательные патчи при недост.
+# выходят с ненулевым кодом — здесь громко предупреждаем, но запуск не блокируем)
 if [ -f "/app/scripts/patch-dsh-client.mjs" ]; then
-  echo "[entrypoint] 执行 DSH 客户端回环与宿主设置持久化补丁..."
+  echo "[entrypoint] Применяем патчи loopback-подключения DSH-клиента и персистентности настроек хоста..."
   if ! node /app/scripts/patch-dsh-client.mjs; then
-    echo "[entrypoint] ⚠️⚠️⚠️ 必需补丁未生效（详见上方 [FATAL] 行）！"
-    echo "[entrypoint] ⚠️ 服务仍会继续启动，但鉴权放行 / 回环 host 模式 / 插件包 404 自愈等补丁可能缺失；"
-    echo "[entrypoint] ⚠️ 请尽快更新镜像，或同步修正 scripts/patch-dsh-client.mjs 的补丁锚点。"
+    echo "[entrypoint] ⚠️⚠️⚠️ Обязательные патчи не применились (см. строки [FATAL] выше)!"
+    echo "[entrypoint] ⚠️ Сервис продолжит запуск, но патчи вроде пропуска аутентификации / loopback host-режима / самовосстановления 404 пакетов плагинов могут отсутствовать;"
+    echo "[entrypoint] ⚠️ Пожалуйста, обновите образ или поправьте якоря патчей в scripts/patch-dsh-client.mjs."
   fi
 fi
 
-# 4. 启动统一网关守护循环
-#    - 支持管理面板在线热重启网关（局部注入 NODE_ENV=production）
-#    - 指数退避（1s→2s→…→30s）；连续 10 次失败则退出容器，交由编排层/用户介入
+# 4. Запускаем единый цикл-страж шлюза
+#    - поддержка горячего перезапуска шлюза из панели управления (точечный NODE_ENV=production)
+#    - экспоненциальный backoff (1с→2с→…→30с); после 10 неудач подряд контейнер выходит,
+#      и вмешивается оркестрация/пользователь
 attempt=0
 backoff=1
 while true; do
-  echo "[entrypoint] 启动网关..."
+  echo "[entrypoint] Запускаем шлюз..."
   start_ts=$(date +%s)
   NODE_ENV=production node /app/gateway/index.js &
   child_pid=$!
@@ -154,7 +168,7 @@ while true; do
   child_pid=""
   ran=$(( $(date +%s) - start_ts ))
 
-  # 稳定运行超过 60s 视为一次成功启动：重置退避计数
+  # Стабильная работа дольше 60с считается успешным стартом: сбрасываем счётчик backoff
   if [ "$ran" -ge 60 ]; then
     attempt=0
     backoff=1
@@ -162,10 +176,10 @@ while true; do
 
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 10 ]; then
-    echo "[entrypoint] ❌ 网关已连续退出 ${attempt} 次（最近退出码 ${code}，运行 ${ran}s），放弃重启并退出容器"
+    echo "[entrypoint] ❌ Шлюз аварийно вышел ${attempt} раз подряд (последний код выхода ${code}, работал ${ran}с), прекращаем перезапуски и выходим из контейнера"
     exit 1
   fi
-  echo "[entrypoint] 网关进程已退出 (code=${code}，运行 ${ran}s)，${backoff}s 后重启（第 ${attempt} 次）..."
+  echo "[entrypoint] Процесс шлюза вышел (code=${code}, работал ${ran}с), перезапуск через ${backoff}с (попытка ${attempt})..."
   sleep "$backoff"
   backoff=$(( backoff * 2 ))
   [ "$backoff" -gt 30 ] && backoff=30

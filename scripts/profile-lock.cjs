@@ -1,36 +1,43 @@
 'use strict';
 /**
- * profile 写锁 —— 与官方 `@deepseek-ai/dsh-atomic-write` 的 `withFileLock` 语义对齐。
+ * Write-lock профиля — семантика выровнена с `withFileLock` официального `@deepseek-ai/dsh-atomic-write`.
  *
- * 背景（P6）：DSH 0.1.7 的原生插件管理器与设置编辑器在改 `profiles/web/package.json`
- * 与 `profiles/web/cordis.patch.yml` 之前，都会先取 `profiles/web/package.json.lock`
- * （`wx` 独占创建）。它们是跨进程互斥的；我们网关此前完全没参与这把锁，
- * 于是两边各自"读-改-写"整份文件，后写者会把先写者的修改整体覆盖 → 丢更新
- * （插件启停状态漂移、`llm-pi-ai` 等设置条目被吞）。
+ * Предыстория (P6): нативный менеджер плагинов и редактор настроек DSH 0.1.7 перед изменением
+ * `profiles/web/package.json` и `profiles/web/cordis.patch.yml` сначала берут
+ * `profiles/web/package.json.lock` (эксклюзивное создание через `wx`).
+ * Это межпроцессная взаимоисключающая блокировка; наш шлюз раньше вообще в ней не участвовал,
+ * и обе стороны делали собственное «читать-менять-писать» целого файла: последний пишущий
+ * целиком затирал изменения предыдущего → потеря обновлений (дрейф состояния включения
+ * плагинов, пропажа записей настроек вроде `llm-pi-ai`).
  *
- * 本模块让控制台成为该锁协议的合法参与者。与上游逐项对齐：
- *   | 项       | 上游行为                                                        |
+ * Этот модуль делает консоль легальным участником протокола блокировки. Пункт-в-пункт с апстримом:
+ *   | пункт       | поведение апстрима                                                |
  *   |----------|-----------------------------------------------------------------|
- *   | 锁文件   | `${filename}.lock`（此处即 `<profileDir>/package.json.lock`）    |
- *   | 创建     | writeFile(lock, `${pid}\n`, { flag: 'wx', mode: 0o600 })         |
- *   | 争用     | EEXIST；Windows 上 EPERM 且锁文件存在                            |
- *   | 退避     | 20ms 起 ×2，上限 200ms                                           |
- *   | 等待上限 | 上游默认 2s；插件管理器显式传 lockWaitMs=120s ⇒ 我们也默认 120s  |
- *   | 释放     | `finally { rm(lock, { force: true }) }`                          |
- *   | 读者     | 不持锁（rename 原子提交保证读者看到完整文件）                     |
+ *   | файл блокировки | `${filename}.lock` (здесь `<profileDir>/package.json.lock`)    |
+ *   | создание  | writeFile(lock, `${pid}\n`, { flag: 'wx', mode: 0o600 })         |
+ *   | конкуренция | EEXIST; на Windows EPERM и при существующем файле блокировки    |
+ *   | backoff    | с 20ms ×2, максимум 200ms                                        |
+ *   | предел ожидания | у апстрима по умолчанию 2s; менеджер плагинов явно передаёт lockWaitMs=120s ⇒ у нас тоже 120s по умолчанию |
+ *   | освобождение | `finally { rm(lock, { force: true }) }`                          |
+ *   | читатели  | не держат lock (атомарный commit через rename гарантирует читателю целый файл) |
  *
- * 相比上游多做的两件事（都不改变与 DSH 的互斥语义）：
- *   1) **进程内互斥队列**：文件锁只能跨进程互斥；同一进程里两个并发请求若同时进入
- *      "读-改-写"，一样会丢更新。因此在文件锁之外再串行化本进程内的获取者。
- *      注意：本模块**不支持嵌套获取**（同一进程重复获取同一把锁会抛
- *      PROFILE_LOCK_REENTRANT，避免静默自锁死）。需要"在锁内再做事"时，请调用
- *      各模块的 `*Locked` 内部函数，而不是再次取锁。
- *   2) **陈旧锁回收**：仅当锁内记录的 PID **已不存在** 且锁文件 mtime 超过阈值时才回收。
- *      上游不做回收，崩溃后会阻塞到超时；这里 PID 存活就绝不回收，因此不会破坏互斥。
- *      可用 DSH_PROFILE_LOCK_STALE_MS=0 关闭。
+ * Сверх апстрима добавлены две вещи (обе не меняют семантику взаимоисключения с DSH):
+ *   1) **внутрипроцессная очередь взаимоисключения**: файловая блокировка взаимоисключает
+ *      только между процессами; в одном процессе два параллельных запроса, войдя одновременно
+ *      в «читать-менять-писать», тоже потеряют обновления. Поэтому поверх файлового lock
+ *      сериализуем получения внутри данного процесса.
+ *      Внимание: **вложенное получение не поддерживается** (повторное взятие того же lock
+ *      в том же процессе бросает PROFILE_LOCK_REENTRANT, чтобы не получить молчаливый
+ *      self-дедлок). Если нужно «сделать что-то ещё внутри lock» — вызывайте внутренние
+ *      функции `*Locked` соответствующих модулей, а не берите lock повторно.
+ *   2) **уборка устаревшего lock**: удаляем только когда PID, записанный в lock, **не существует**
+ *      и mtime файла блокировки превысил порог. Апстрим не убирает; после краша он ждёт до тайм-аута.
+ *      Здесь же, пока PID жив, lock никогда не убираем — взаимоисключение не нарушается.
+ *      Отключить можно через DSH_PROFILE_LOCK_STALE_MS=0.
  *
- * 另提供 `assertProfileLockHeld()`：把「必须先持锁」变成运行时护栏，
- * 让"忘记加锁就直接写 profile"在测试与生产上都立即失败，而不是静默丢更新。
+ * Также предоставляется `assertProfileLockHeld()`: превращает «сначала обязательно держи lock»
+ * в runtime-защиту, чтобы «забыли залочиться и пишем profile» мгновенно падало и в тестах,
+ * и в проде, а не молча теряло обновления.
  */
 
 const fs = require('fs');
@@ -38,23 +45,23 @@ const path = require('path');
 
 const RETRY_INITIAL_MS = 20;
 const RETRY_MAX_MS = 200;
-/** 与 dsh-plugin-manager 的 lockWaitMs 默认值一致（它会持锁跑 pnpm 安装，可能持续很久） */
+/** Совпадает со значением lockWaitMs по умолчанию у dsh-plugin-manager (он держит lock под pnpm-установкой, что может быть долго) */
 const DEFAULT_WAIT_MS = 120000;
-/** 陈旧锁回收阈值（ms）；<=0 表示关闭回收 */
+/** Порог уборки устаревшего lock (ms); <=0 значит уборка выключена */
 const STALE_MS = process.env.DSH_PROFILE_LOCK_STALE_MS === undefined
   ? 600000
   : Number(process.env.DSH_PROFILE_LOCK_STALE_MS);
-/** 等待超过该阈值即告警（说明与 DSH 存在争用） */
+/** Ожидание дольше этого порога — предупреждение (значит, есть конкуренция с DSH) */
 const WARN_WAIT_MS = Number(process.env.DSH_PROFILE_LOCK_WARN_MS || 500);
 
-/** lockPath -> { waitedMs }；表示**本进程**当前持有该文件锁 */
+/** lockPath -> { waitedMs }; указывает, что **данный процесс** сейчас держит этот файловый lock */
 const held = new Map();
-/** lockPath -> Promise：本进程内获取队列的尾节点 */
+/** lockPath -> Promise: хвост очереди получения внутри текущего процесса */
 const chains = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** profile 写锁的路径（与 DSH 完全一致） */
+/** Путь write-lock профиля (полностью совпадает с DSH) */
 function profileLockPath(profileDir) {
   return path.join(profileDir, 'package.json.lock');
 }
@@ -64,15 +71,15 @@ function isProfileLockHeld(profileDir) {
 }
 
 /**
- * 运行时护栏：未持锁就写 profile 文件时立即抛错。
- * 这是防"静默丢更新"的最后一道防线（比静态检查更可靠）。
+ * Runtime-защита: при попытке писать файлы profile без удержания lock — мгновенная ошибка.
+ * Это последний рубеж против «молчаливой потери обновлений» (надёжнее статической проверки).
  */
 function assertProfileLockHeld(profileDir) {
   const lockPath = profileLockPath(profileDir);
   if (held.has(lockPath)) return;
   const err = new Error(
-    `profile-lock: 未持有 profile 写锁却尝试写入 ${profileDir}；` +
-    `请先用 withProfileLock() 包住整段"读-改-写"（锁文件: ${lockPath}）`
+    `profile-lock: попытка записи в ${profileDir} без удержания write-lock профиля; ` +
+    `оберните весь блок «читать-менять-писать» в withProfileLock() (файл lock: ${lockPath})`
   );
   err.code = 'PROFILE_LOCK_NOT_HELD';
   throw err;
@@ -80,14 +87,14 @@ function assertProfileLockHeld(profileDir) {
 
 function timeoutError(lockPath, waitMs, label) {
   const err = new Error(
-    `profile-lock: 等待 profile 写锁超时（${waitMs}ms）${label}: ${lockPath}；` +
-    `持有者可能是正在执行 pnpm 安装的 DSH，请稍后重试`
+    `profile-lock: тайм-аут ожидания write-lock профиля (${waitMs}мс)${label}: ${lockPath}; ` +
+    `владелец, вероятно, выполняет pnpm-установку DSH, повторите позже`
   );
   err.code = 'PROFILE_LOCK_TIMEOUT';
   return err;
 }
 
-/** 与上游 isLockContention 一致 */
+/** Совпадает с апстримной isLockContention */
 function isLockContention(error, lockPath) {
   const code = error && error.code;
   if (code === 'EEXIST') return true;
@@ -114,14 +121,15 @@ function isProcessAlive(pid) {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    // EPERM：进程存在但本进程无权限发信号 ⇒ 视为存活（保守）
+    // EPERM: процесс существует, но у этого процесса нет прав слать сигнал ⇒ считаем живым (консервативно)
     return Boolean(error && error.code === 'EPERM');
   }
 }
 
 /**
- * 保守回收陈旧锁：只有锁内 PID 确认不存在、且锁文件已超过 STALE_MS 未变动时才删除。
- * 任何一项无法确认（PID 存活 / 读不到 PID / 未超时）都保持不动。
+ * Консервативная уборка устаревшего lock: удаляем, только когда PID из lock подтверждённо
+ * не существует и файл lock не менялся дольше STALE_MS. Если что-то не подтверждено
+ * (PID жив / PID не прочитался / порог не превышен) — не трогаем.
  */
 function tryReclaimStale(lockPath) {
   if (!(STALE_MS > 0)) return false;
@@ -136,14 +144,14 @@ function tryReclaimStale(lockPath) {
   if (pid !== null && isProcessAlive(pid)) return false;
   try {
     fs.rmSync(lockPath, { force: true });
-    console.warn(`[profile-lock] 已回收陈旧锁（持有者 PID=${pid === null ? '未知' : pid}，mtime 超时 ${STALE_MS}ms）: ${lockPath}`);
+    console.warn(`[profile-lock] Убран устаревший lock (владелец PID=${pid === null ? 'неизвестен' : pid}, mtime старше ${STALE_MS}мс): ${lockPath}`);
     return true;
   } catch {
     return false;
   }
 }
 
-/** 带截止时间的等待（用于进程内队列，保证等待也可超时） */
+/** Ожидание с дедлайном (для внутрипроцессной очереди, чтобы и ожидание могло истечь) */
 async function waitUntil(promise, deadline, lockPath, waitMs, label) {
   const remain = deadline - Date.now();
   if (remain <= 0) throw timeoutError(lockPath, waitMs, label);
@@ -159,7 +167,7 @@ async function waitUntil(promise, deadline, lockPath, waitMs, label) {
 }
 
 /**
- * 进程内互斥：把本进程内对同一把锁的获取者串成队列。
+ * Внутрипроцессное взаимоисключение: получатели одного lock внутри текущего процесса выстраиваются в очередь.
  * @returns {{ prev: Promise<void>, release: () => void }}
  */
 function enqueueInProcessTurn(lockPath) {
@@ -175,7 +183,7 @@ function enqueueInProcessTurn(lockPath) {
   return { prev, release };
 }
 
-/** 获取跨进程文件锁（带截止时间与陈旧锁回收） */
+/** Получение межпроцессного файлового lock (с дедлайном и уборкой устаревшего lock) */
 async function acquireFileLock(lockPath, profileDir, deadline, waitMs, label) {
   fs.mkdirSync(profileDir, { recursive: true });
   let delay = RETRY_INITIAL_MS;
@@ -194,21 +202,22 @@ async function acquireFileLock(lockPath, profileDir, deadline, waitMs, label) {
 }
 
 /**
- * 获取 profile 写锁，返回释放函数（必须放在 finally 中调用）。
- * @param {string} profileDir profile 目录（如 `<DSH_HOME>/.dsh/profiles/web`）
+ * Получает write-lock профиля и возвращает функцию освобождения (обязательно вызывать в finally).
+ * @param {string} profileDir каталог профиля (например `<DSH_HOME>/.dsh/profiles/web`)
  * @param {{ waitMs?: number, label?: string }} [options]
- * @returns {Promise<() => void>} 释放函数
+ * @returns {Promise<() => void>} функция освобождения
  */
 async function acquireProfileLock(profileDir, options = {}) {
   const lockPath = profileLockPath(profileDir);
   const waitMs = Number.isFinite(options.waitMs) ? Number(options.waitMs) : DEFAULT_WAIT_MS;
   const label = options.label ? ` (${options.label})` : '';
 
-  // 不支持嵌套获取：本进程已持有该锁时立即报错，而不是静默自锁死
+  // Вложенное получение не поддерживается: если процесс уже держит этот lock — сразу ошибка,
+  // а не молчаливый self-дедлок
   if (held.has(lockPath)) {
     const err = new Error(
-      `profile-lock: 本进程已持有 profile 写锁 ${lockPath} 却再次获取；` +
-      `请在锁内调用各模块的 *Locked 内部函数，不要重复取锁`
+      `profile-lock: процесс уже держит write-lock профиля ${lockPath}, повторное получение; ` +
+      `вызывайте внутри lock внутренние функции *Locked модулей, а не берите lock снова`
     );
     err.code = 'PROFILE_LOCK_REENTRANT';
     throw err;
@@ -217,7 +226,8 @@ async function acquireProfileLock(profileDir, options = {}) {
   const started = Date.now();
   const deadline = started + waitMs;
 
-  // 1) 进程内排队（同进程并发必须串行，否则一样丢更新）
+  // 1) Очередь внутри процесса (конкурентные в одном процессе обязаны идти последовательно,
+  //   иначе снова потеряем обновления)
   const turn = enqueueInProcessTurn(lockPath);
   try {
     await waitUntil(turn.prev, deadline, lockPath, waitMs, label);
@@ -226,7 +236,7 @@ async function acquireProfileLock(profileDir, options = {}) {
     throw error;
   }
 
-  // 2) 跨进程文件锁
+  // 2) Межпроцессный файловый lock
   try {
     await acquireFileLock(lockPath, profileDir, deadline, waitMs, label);
   } catch (error) {
@@ -237,7 +247,7 @@ async function acquireProfileLock(profileDir, options = {}) {
   const waitedMs = Date.now() - started;
   held.set(lockPath, { waitedMs });
   if (waitedMs >= WARN_WAIT_MS) {
-    console.warn(`[profile-lock] 等待 profile 写锁 ${waitedMs}ms${label}（存在与 DSH 的争用）: ${lockPath}`);
+    console.warn(`[profile-lock] Ожидание write-lock профиля ${waitedMs}мс${label} (есть конкуренция с DSH): ${lockPath}`);
   }
 
   return () => {
@@ -249,13 +259,13 @@ async function acquireProfileLock(profileDir, options = {}) {
     try {
       fs.rmSync(lockPath, { force: true });
     } catch {
-      /* 释放失败不应影响调用方；陈旧锁由 tryReclaimStale 兜底 */
+      /* Сбой освобождения не должен влиять на вызывающего; устаревший lock добирает tryReclaimStale */
     }
     turn.release();
   };
 }
 
-/** 兼容入口：按路径释放（仅当确实由本进程持有时生效） */
+/** Совместимый вход: освобождение по пути (срабатывает, только если lock действительно держит этот процесс) */
 function releaseProfileLock(lockPath) {
   if (!held.has(lockPath)) return;
   held.delete(lockPath);
@@ -265,7 +275,7 @@ function releaseProfileLock(lockPath) {
 }
 
 /**
- * 在 profile 写锁内执行操作（整段"读-改-写"必须都放进来）。
+ * Выполняет операцию внутри write-lock профиля (весь блок «читать-менять-писать» обязан оказаться здесь).
  * @template T
  * @param {string} profileDir
  * @param {() => T | Promise<T>} operation

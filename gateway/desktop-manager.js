@@ -22,7 +22,8 @@ class DesktopManager {
 
     this.config = {
       display: process.env.DISPLAY || ':99',
-      // 管理后台「彻底开关」总开关：默认由环境变量决定，可被管理后台持久化覆盖
+      // «Главный переключатель» панели управления: по умолчанию определяется переменной окружения,
+      // панель управления может перезаписать его и сохранить
       enabled: process.env.DSH_DESKTOP_ENABLED !== '0',
       width: Number(process.env.DSH_DESKTOP_WIDTH) || 1920,
       height: Number(process.env.DSH_DESKTOP_HEIGHT) || 1080,
@@ -31,7 +32,7 @@ class DesktopManager {
       enableCdp: process.env.DSH_ENABLE_CDP !== '0',
       cdpPort: Number(process.env.DSH_CDP_PORT) || 9222,
       enableSidebarTab: process.env.DSH_ENABLE_SIDEBAR_TAB === '1' || false,
-      // 截图工具默认参数（由 Admin「浏览器与桌面控制」页配置，插件经 status 读取）
+      // Разрешение по умолчанию для скриншотов (настраивается на странице Admin «Браузер и рабочий стол», плагин читает через status)
       screenshotQuality: process.env.DSH_SCREENSHOT_QUALITY || 'high',
       screenshotDir: process.env.DSH_SCREENSHOT_DIR || '',
       userDataDir: process.env.CHROME_USER_DATA_DIR || '/root/.config/chromium',
@@ -44,7 +45,8 @@ class DesktopManager {
     // Start background idle watchdog
     this.watchdogTimer = setInterval(() => this.checkIdleWatchdog(), 15000);
     this.watchdogTimer.unref();
-    // 生命周期操作串行队列：start/stop/restart 依次执行，杜绝相互 await 造成的自等待死锁
+    // Последовательная очередь операций жизненного цикла: start/stop/restart выполняются по очереди,
+    // чтобы взаимные await не приводили к дедлоку ожидания самого себя
     this._opChain = Promise.resolve();
   }
 
@@ -52,11 +54,12 @@ class DesktopManager {
     this.lastActivity = Date.now();
     if (typeof durationMinutes === 'number' && durationMinutes > 0) {
       this.expiresAt = Date.now() + durationMinutes * 60 * 1000;
-      console.log(`[desktop-manager] 浏览器工作时长设置为 ${durationMinutes} 分钟，预计到期: ${new Date(this.expiresAt).toLocaleTimeString()}`);
+      console.log(`[desktop-manager] Время работы браузера задано: ${durationMinutes} мин, ожидаемое завершение: ${new Date(this.expiresAt).toLocaleTimeString()}`);
     } else if (durationMinutes === 0) {
-      // 显式传 0 = 取消工作时长限制（原实现会保留旧的 expiresAt，导致"取消"后仍被自动停）
+      // Явный 0 = отмена лимита времени работы (старая реализация сохраняла старый expiresAt,
+      // из-за чего после «отмены» браузер всё равно останавливался автоматически)
       this.expiresAt = null;
-      console.log('[desktop-manager] 已取消浏览器工作时长限制（不再自动到期停止）');
+      console.log('[desktop-manager] Лимит времени работы браузера снят (автоостановка по таймеру больше не произойдёт)');
     }
   }
 
@@ -64,25 +67,25 @@ class DesktopManager {
     if (!this.running) return;
     const now = Date.now();
 
-    // 1. Check AI-specified duration expiration
+    // 1. Проверка срока, заданного AI
     if (this.expiresAt && now >= this.expiresAt) {
-      console.log('[desktop-manager] 浏览器工作时长已到期，自动停止以节约资源');
-      this.stop().catch((e) => console.warn('[desktop-manager] 到期自动停止失败:', e.message));
+      console.log('[desktop-manager] Время работы браузера истекло, автоматическая остановка для экономии ресурсов');
+      this.stop().catch((e) => console.warn('[desktop-manager] Ошибка автоостановки по сроку:', e.message));
       return;
     }
 
-    // 2. Check idle timeout
+    // 2. Проверка тайм-аута простоя
     if (this.config.idleTimeoutMinutes > 0) {
       const idleMs = now - this.lastActivity;
       if (idleMs >= this.config.idleTimeoutMinutes * 60 * 1000) {
-        console.log(`[desktop-manager] 浏览器已空闲超过 ${this.config.idleTimeoutMinutes} 分钟，自动休眠`);
-        this.stop().catch((e) => console.warn('[desktop-manager] 空闲自动休眠失败:', e.message));
+        console.log(`[desktop-manager] Браузер простаивает более ${this.config.idleTimeoutMinutes} мин, автоматический сон`);
+        this.stop().catch((e) => console.warn('[desktop-manager] Ошибка автосна по простою:', e.message));
       }
     }
   }
 
-  // ── 生命周期串行化 ──────────────────────────────────────────
-  // 将生命周期操作串行化：前序操作无论成功失败都不阻塞后续操作
+  // ── Сериализация жизненного цикла ──────────────────────────────────────────
+  // Операции жизненного цикла сериализуются: предыдущая, успешно или нет, не блокирует следующие
   _enqueue(task) {
     const run = this._opChain.then(task, task);
     this._opChain = run.then(() => {}, () => {});
@@ -106,20 +109,23 @@ class DesktopManager {
   }
 
   async _startInternal(options = {}) {
-    // 管理后台「彻底停用」时拒绝一切启动请求（覆盖 AI 工具、VNC 自动唤醒、bootstrap 自举等所有入口）
+    // При полностью отключённом «главном переключателе» в Admin отказываем во всех запусках
+    // (перекрывает инструменты ИИ, автопробуждение VNC, загрузку через bootstrap и т.д.)
     if (this.config.enabled === false) {
-      console.log('[desktop-manager] 容器浏览器已被管理后台彻底停用，拒绝启动请求');
-      return { ok: false, disabled: true, error: '容器浏览器已在管理后台被彻底停用', status: this.getStatus() };
+      console.log('[desktop-manager] Контейнерный браузер полностью отключён панелью управления, запрос запуска отклонён');
+      return { ok: false, disabled: true, error: 'Контейнерный браузер полностью отключён в панели управления', status: this.getStatus() };
     }
 
-    // 启动请求可携带运行时配置（分辨率 / CDP 开关与端口），统一收敛到单一权威配置
+    // Запрос запуска может нести runtime-конфигурацию (разрешение / флаг и порт CDP),
+    // сводим её к единой авторитетной конфигурации
     const reqWidth = options.width ? Number(options.width) : null;
     const reqHeight = options.height ? Number(options.height) : null;
     const reqCdp = typeof options.enableCdp === 'boolean' ? options.enableCdp : null;
     const reqCdpPort = Number(options.cdpPort) ? Number(options.cdpPort) : null;
 
     if (this.running) {
-      // 运行中：先校验真实健康度，避免“标志为真但进程已死”导致启动被短路
+      // Уже запущен: сначала проверяем реальную «живость», чтобы флаг «запущен» при мёртвом процессе
+      // не замыкал запуск накоротко
       const healthy = await this.isHealthy();
       if (healthy) {
         const resChanged = (reqWidth && reqWidth !== this.config.width) ||
@@ -127,8 +133,9 @@ class DesktopManager {
         const cdpChanged = (reqCdp !== null && reqCdp !== this.config.enableCdp) ||
                            (reqCdpPort !== null && reqCdpPort !== this.config.cdpPort);
         if (resChanged || cdpChanged) {
-          console.log(`[desktop-manager] 收到运行时配置变更 (分辨率/CDP)，重新应用...`);
-          // 直接调用内部方法，绝不通过公共 start/stop/restart，避免队列自等待死锁
+          console.log(`[desktop-manager] Получено изменение runtime-конфигурации (разрешение/CDP), применяем заново...`);
+          // Напрямую вызываем внутренние методы, ни в коем случае не публичные start/stop/restart,
+          // чтобы не создать дедлок ожидания себя в очереди
           await this._stopInternal();
           return this._startInternal(options);
         }
@@ -138,11 +145,11 @@ class DesktopManager {
         this.touchActivity(options.durationMinutes);
         return { ok: true, alreadyRunning: true, status: this.getStatus() };
       }
-      console.warn('[desktop-manager] 检测到桌面进程不健康（关键进程已退出），执行自愈重启...');
+      console.warn('[desktop-manager] Обнаружен нездоровый процесс рабочего стола (критичный процесс завершился), выполняем перезапуск с самовосстановлением...');
       await this._stopInternal();
     }
 
-    // 应用本次启动携带的运行时配置
+    // Применяем runtime-конфигурацию из текущего запуска
     this.updateConfig({
       ...(reqWidth ? { width: reqWidth } : {}),
       ...(reqHeight ? { height: reqHeight } : {}),
@@ -159,9 +166,10 @@ class DesktopManager {
     }
     const durationMinutes = options.durationMinutes;
 
-    console.log(`[desktop-manager] 启动虚拟桌面 (分辨率: ${width}x${height}, CDP: ${this.config.enableCdp ? this.config.cdpPort : '关闭'})...`);
+    console.log(`[desktop-manager] Запуск виртуального рабочего стола (разрешение: ${width}x${height}, CDP: ${this.config.enableCdp ? this.config.cdpPort : 'выключен'})...`);
 
-    // 启动前清理：回收陈旧 X 显示占用、清理 X 锁、等待端口释放，避免快速重启竞争
+    // Очистка перед запуском: освобождаем устаревший X-display, чистим X-lock, ждём освобождения портов
+    // (чтобы быстрый перезапуск не конкурировал сам с собой)
     await this._prepareEnvironment();
 
     // Clean chromium lock files
@@ -171,7 +179,7 @@ class DesktopManager {
       fs.rmSync(path.join(this.config.userDataDir, 'SingletonSocket'), { force: true });
     } catch {}
 
-    // 1. Start Xvfb
+    // 1. Запуск Xvfb
     this._spawnTracked('xvfb', 'Xvfb', [
       this.config.display,
       '-screen', '0', `${width}x${height}x${this.config.depth}`,
@@ -184,7 +192,7 @@ class DesktopManager {
       await sleep(100);
       const xvfb = this.processes.xvfb;
       if (!xvfb || xvfb.exitCode !== null) {
-        console.error('[desktop-manager] Xvfb 进程提前退出');
+        console.error('[desktop-manager] Процесс Xvfb завершился раньше времени');
         break;
       }
       if (await this._displayAlive()) {
@@ -194,24 +202,24 @@ class DesktopManager {
     }
 
     if (!displayReady) {
-      console.error('[desktop-manager] Xvfb 显示服务启动失败或超时');
+      console.error('[desktop-manager] Запуск дисплейного сервиса Xvfb не удался или превышен тайм-аут');
       await this._stopInternal();
-      return { ok: false, error: 'Xvfb 虚拟显示服务启动失败' };
+      return { ok: false, error: 'Запуск виртуального дисплейного сервиса Xvfb не удался' };
     }
 
     const env = { ...process.env, DISPLAY: this.config.display };
 
-    // 2. Start Openbox
+    // 2. Запуск Openbox
     this._spawnTracked('openbox', 'openbox', [], { env, logFile: 'openbox.log' });
 
-    // 3. Start x11vnc
+    // 3. Запуск x11vnc
     this._spawnTracked('x11vnc', 'x11vnc', [
       '-display', this.config.display,
       '-forever', '-shared', '-repeat', '-noxdamage',
       '-rfbport', '5900', '-localhost', '-nopw'
     ], { env, logFile: 'x11vnc.log' });
 
-    // 4. Start websockify (noVNC web at /usr/share/novnc)
+    // 4. Запуск websockify (noVNC-веб на /usr/share/novnc)
     const vncPort = Number(process.env.VNC_PORT) || 6080;
     this._spawnTracked('websockify', 'websockify', [
       '--web=/usr/share/novnc',
@@ -219,7 +227,7 @@ class DesktopManager {
       '127.0.0.1:5900'
     ], { logFile: 'novnc.log' });
 
-    // 5. Start Chromium
+    // 5. Запуск Chromium
     const chromeArgs = [
       `--user-data-dir=${this.config.userDataDir}`,
       '--window-position=0,0',
@@ -239,7 +247,7 @@ class DesktopManager {
     this.startedAt = Date.now();
     this.touchActivity(durationMinutes);
 
-    console.log('[desktop-manager] 虚拟桌面与 Chromium 启动成功');
+    console.log('[desktop-manager] Виртуальный рабочий стол и Chromium запущены успешно');
     return { ok: true, status: this.getStatus() };
   }
 
@@ -249,8 +257,9 @@ class DesktopManager {
       return { ok: true, alreadyStopped: true };
     }
 
-    console.log('[desktop-manager] 正在停止浏览器与桌面所有进程...');
-    // 先复位状态，避免子进程退出回调把正常停止误判为异常崩溃
+    console.log('[desktop-manager] Останавливаем браузер и все процессы рабочего стола...');
+    // Сначала сбрасываем состояние, чтобы колбэк выхода дочернего процесса не принял
+    // корректную остановку за аварийный краш
     this.running = false;
     this.unhealthy = false;
 
@@ -260,12 +269,12 @@ class DesktopManager {
     this.startedAt = null;
     this.expiresAt = null;
 
-    // 等待显示真正释放，避免紧接着的启动撞上未退场的旧 X server
+    // Ждём реального освобождения дисплея, чтобы тут же следующий запуск не наткнулся на не ушедший старый X server
     await this._waitDisplayGone(3000);
     return { ok: true, status: this.getStatus() };
   }
 
-  // ── 进程托管 ────────────────────────────────────────────────
+  // ── Управление процессами ────────────────────────────────────────────────
   _spawnTracked(name, cmd, args, { env, logFile } = {}) {
     let fd = null;
     let stdio = 'ignore';
@@ -273,7 +282,7 @@ class DesktopManager {
       fd = fs.openSync(path.join(this.config.logsDir, logFile), 'a');
       stdio = ['ignore', fd, fd];
     }
-    // detached: 独立进程组，便于一次性回收 Chromium 全部子进程
+    // detached: отдельная группа процессов, чтобы за раз собрать все дочерние процессы Chromium
     const proc = spawn(cmd, args, { env, stdio, detached: true });
     if (fd !== null) { try { fs.closeSync(fd); } catch {} }
     proc.on('exit', (code, signal) => this._onChildExit(name, code, signal));
@@ -284,22 +293,22 @@ class DesktopManager {
 
   _onChildExit(name, code, signal) {
     const wasRunning = this.running;
-    console.warn(`[desktop-manager] 子进程 ${name} 已退出 (code=${code}, signal=${signal})`);
+    console.warn(`[desktop-manager] Дочерний процесс ${name} завершился (code=${code}, signal=${signal})`);
     if (this.processes[name]) this.processes[name] = null;
     if (!wasRunning) return;
     if (name === 'xvfb' || name === 'chromium') {
       this.unhealthy = true;
-      console.error(`[desktop-manager] 关键进程 ${name} 异常退出，桌面标记为不健康，将在下次启动时自愈`);
+      console.error(`[desktop-manager] Критичный процесс ${name} завершился аварийно, рабочий стол помечен нездоровым — самовосстановление при следующем запуске`);
     }
   }
 
   _onChildError(name, err) {
-    console.error(`[desktop-manager] 子进程 ${name} 启动错误: ${err.message}`);
+    console.error(`[desktop-manager] Ошибка запуска дочернего процесса ${name}: ${err.message}`);
     if (this.processes[name]) this.processes[name] = null;
     if (this.running && (name === 'xvfb' || name === 'chromium')) this.unhealthy = true;
   }
 
-  // 回收本管理器派生并记录的进程句柄（先 SIGTERM 优雅退出，超时再 SIGKILL）
+  // Сбор дескрипторов процессов, порождённых и отслеживаемых этим менеджером (сначала SIGTERM, при тайм-ауте SIGKILL)
   async killTrackedProcesses() {
     const entries = Object.entries(this.processes).filter(([, p]) => p);
     await Promise.all(entries.map(([name, proc]) => this._terminate(name, proc)));
@@ -315,7 +324,7 @@ class DesktopManager {
 
       const signal = (sig) => {
         try {
-          if (proc.pid) process.kill(-proc.pid, sig); // 整组回收
+          if (proc.pid) process.kill(-proc.pid, sig); // собираем всю группу
           else proc.kill(sig);
         } catch {
           try { proc.kill(sig); } catch {}
@@ -330,13 +339,14 @@ class DesktopManager {
     });
   }
 
-  // 兜底清理可能残留的系统级进程 (防止端口/显示被孤儿进程占用)
+  // Запасная очистка возможно оставшихся системных процессов (чтобы порт/дисплей не занимали осиротевшие процессы)
   async forceCleanupSystemProcesses() {
-    // 轻微项：不再用过于宽泛的 `pkill -f chromium`（会误杀容器内其它用途的 Chromium，
-    // 例如管理后台截图脚本启动的无头实例），只匹配本桌面自己的进程特征。
+    // Незначительный момент: отказываемся от слишком широкого `pkill -f chromium`
+    // (им можно зацепить чужой Chromium в контейнере, например headless-инстанс от
+    // скрипта скриншотов панели управления), матчим только признаки именно этого рабочего стола.
     const patterns = [
       `Xvfb ${this.config.display}`,
-      `--user-data-dir=${this.config.userDataDir}`, // Chromium（仅本桌面的用户数据目录）
+      `--user-data-dir=${this.config.userDataDir}`, // Chromium (только каталог данных этого рабочего стола)
       'x11vnc',
       'websockify'
     ];
@@ -352,7 +362,7 @@ class DesktopManager {
     });
   }
 
-  // ── 健康探测与资源等待 ──────────────────────────────────────
+  // ── Проверка живости и ожидание ресурсов ──────────────────────────────────────
   async isHealthy() {
     if (!this.running || this.unhealthy) return false;
     const xvfb = this.processes.xvfb;
@@ -360,9 +370,10 @@ class DesktopManager {
     if (!(await this._displayAlive())) return false;
     const chrome = this.processes.chromium;
     if (!chrome || chrome.exitCode !== null) return false;
-    // 说明：此处不校验 CDP 端口就绪。CDP 在 Chromium 刚拉起时可能尚未监听，
-    // 若纳入健康判定会导致刚启动就被误判为“不健康”而整桌重启、丢失已开标签页。
-    // CDP 可达性由调用方（插件 browser_open/screenshot）在需要时自行探测。
+    // Примечание: порт CDP здесь не проверяем. CDP в первые мгновения после подъёма Chromium
+    // может ещё не слушать; включение его в критерий живости заставит только что запущенный
+    // рабочий стол считаться «нездоровым» и перезапустит его целиком, потеряв открытые вкладки.
+    // Доступность CDP при необходимости проверяет вызывающая сторона (плагин browser_open/screenshot).
     return true;
   }
 
@@ -395,11 +406,11 @@ class DesktopManager {
 
   async _ensureCleanDisplay() {
     if (await this._displayAlive()) {
-      console.warn(`[desktop-manager] 检测到显示 ${this.config.display} 被陈旧进程占用，正在清理...`);
+      console.warn(`[desktop-manager] Обнаружено, что дисплей ${this.config.display} занят устаревшим процессом, очищаем...`);
       await this._pkill(`Xvfb ${this.config.display}`);
       await this._waitDisplayGone(5000);
     }
-    // 清理可能残留的 X 锁文件 (否则 Xvfb 会因 "Server is already active" 拒绝启动)
+    // Чистим возможные остатки X-lock файлов (иначе Xvfb откажет запуск с ошибкой "Server is already active")
     try { fs.rmSync(this._xLockPath(), { force: true }); } catch {}
   }
 
@@ -427,7 +438,7 @@ class DesktopManager {
       }
       if (!busy.length) return true;
       if (Date.now() >= deadline) {
-        console.warn(`[desktop-manager] 端口仍被占用: ${busy.join(', ')}`);
+        console.warn(`[desktop-manager] Порт всё ещё занят: ${busy.join(', ')}`);
         return false;
       }
       await sleep(300);
@@ -481,7 +492,8 @@ class DesktopManager {
     return this.config;
   }
 
-  // 管理后台「彻底开关」专用：仅这里可以翻转总开关（插件热更新不可更改）
+  // Только для «главного переключателя» панели управления: здесь единственное место,
+  // где можно перевернуть глобальный выключатель (горячее обновление от плагина его не меняет)
   isEnabled() {
     return this.config.enabled !== false;
   }
@@ -490,13 +502,13 @@ class DesktopManager {
     const next = enabled !== false;
     if (this.config.enabled === next) return this.config.enabled;
     this.config.enabled = next;
-    console.log(`[desktop-manager] 容器浏览器总开关已${next ? '启用' : '彻底停用'}`);
+    console.log(`[desktop-manager] Глобальный выключатель контейнерного браузера: ${next ? 'включён' : 'полностью отключён'}`);
     return this.config.enabled;
   }
 
-  // 应用运行时配置补丁（keepalive 等热更新入口），返回本次实际发生变化的字段
+  // Применение runtime-патча конфигурации (вход горячего обновления вроде keepalive), возвращает фактически изменившиеся поля
   applyConfig(patch = {}) {
-    // 总开关由管理后台专有：插件 keepalive 不得翻转
+    // Глобальный выключатель монопольно принадлежит панели управления: keepalive плагина его не трогает
     const safe = { ...patch };
     delete safe.enabled;
     const keys = ['width', 'height', 'idleTimeoutMinutes', 'enableCdp', 'cdpPort', 'enableSidebarTab', 'screenshotQuality', 'screenshotDir'];
@@ -508,14 +520,14 @@ class DesktopManager {
       if (before[k] !== this.config[k]) changed[k] = this.config[k];
     }
     if (Object.keys(changed).length) {
-      console.log('[desktop-manager] 运行时配置已更新:', JSON.stringify(changed));
+      console.log('[desktop-manager] Runtime-конфигурация обновлена:', JSON.stringify(changed));
     }
-    // 分辨率 / CDP 相关变更需要重启桌面才能真正生效
+    // Изменения разрешения / CDP требуют перезапуска рабочего стола, чтобы вступить в силу
     const restartKeys = ['width', 'height', 'enableCdp', 'cdpPort'];
     if (this.running && Object.keys(changed).some(k => restartKeys.includes(k))) {
-      console.log('[desktop-manager] 运行时配置变更需重启桌面以生效，正在异步重启...');
+      console.log('[desktop-manager] Изменение runtime-конфигурации требует перезапуска рабочего стола, перезапускаем асинхронно...');
       this.restart({ width: this.config.width, height: this.config.height })
-        .catch(err => console.error('[desktop-manager] 配置变更重启失败:', err.message));
+        .catch(err => console.error('[desktop-manager] Ошибка перезапуска из-за изменения конфигурации:', err.message));
     }
     return changed;
   }

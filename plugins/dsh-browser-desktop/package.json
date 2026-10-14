@@ -1,7 +1,7 @@
 {
   "name": "@dsh-custom/dsh-browser-desktop",
   "version": "1.0.1",
-  "description": "容器 Chromium 图形浏览器与 noVNC 桌面集成插件，支持 AI 自主浏览网页、多标签管理与实时无损截图",
+  "description": "Плагин интеграции графического браузера Chromium и рабочего стола noVNC в контейнере: автономный просмотр веб-страниц ИИ, управление вкладками и скриншоты в реальном времени без потерь",
   "type": "module",
   "main": "./index.js",
   "exports": {

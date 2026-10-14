@@ -10,11 +10,14 @@ const {
   inspectArchive
 } = require('./snapshot-manifest');
 
-// Issue #9: 统一数据类目录单一事实源（创建侧仅配置模式排除项与还原侧仅配置模式保留项共用）
+// Issue #9: единый источник истины для списка каталогов данных
+// (на стороне создания — исключения режима «только конфигурация», на стороне восстановления —
+// что сохраняется в режиме «только конфигурация»)
 const DATA_ENTRIES = ['sessions', 'attachments', 'storages', 'plugin-data', 'logs', 'cache'];
 
 const SNAPSHOTS_DIR = process.env.DSH_SNAPSHOTS_DIR || '/root/.dsh-snapshots';
-// M11：支持通过 DSH_HOME 迁移运行根目录（非 root 部署时指向 /home/<user>）
+// M11: поддерживается перенос корневого каталога через DSH_HOME (при развёртывании
+// не от root указывайте /home/<user>)
 const DSH_DIR = path.join(process.env.DSH_HOME || '/root', '.dsh');
 const DSH_PORT = Number(process.env.DSH_PORT) || 3079;
 const MAX_UPLOAD_BYTES = 300 * 1024 * 1024; // 300MB
@@ -70,16 +73,19 @@ function hasPigz() {
 }
 
 /**
- * 异步执行 tar 命令，完全解耦 Node.js 主事件循环
+ * Асинхронный запуск команды tar, полностью развязанный с главным циклом событий Node.js.
  *
- * ⚠️ 本函数的 maxOutputBytes 只是「防止子进程吐出海量文本把父进程内存打满」的资源兜底，
- * **不能**用来判定归档是否可信：合法快照的成员清单会随使用量无上限增长。
- * 需要逐成员校验的场合（restore / import）请用 validateArchiveMembers()——它按行流式解析，
- * 不设字节硬上限，因此不会误杀大快照（Issue #8）。
+ * ⚠️ Параметр maxOutputBytes здесь — лишь защитный предохранитель «чтобы дочерний процесс
+ * не выдал гигабайты текста и не забил память родителя»; он НЕ ПРИГОДЕН для решения о том,
+ * заслуживает ли архив доверия: список элементов корректного снимка растёт с объёмом данных
+ * без верхней границы. Для проверки каждого элемента (restore / import) используйте
+ * validateArchiveMembers() — она разбирает вывод построчно в потоке, без жёсткого лимита
+ * в байтах, и потому не отбраковывает большие снимки (Issue #8).
  */
 function runTarAsync(args, options = {}) {
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 10 * 60 * 1000;
-  // 给「捕获完整 stderr 用于报错」留足余量；真正的安全判定不依赖这个值
+  // Запас по «полному захвату stderr для сообщения об ошибке»; решение о безопасности
+  // от этого значения не зависит
   const maxOutputBytes = Number(options.maxOutputBytes) > 0 ? Number(options.maxOutputBytes) : 64 * 1024 * 1024;
   const spawnOptions = { ...options };
   delete spawnOptions.timeoutMs;
@@ -100,7 +106,7 @@ function runTarAsync(args, options = {}) {
       if (settled) return;
       settled = true;
       try { child.kill('SIGKILL'); } catch {}
-      reject(new Error(`tar 执行超时（${Math.round(timeoutMs / 1000)}s）: tar ${args.join(' ')}`));
+      reject(new Error(`tar: превышено время выполнения (${Math.round(timeoutMs / 1000)} c): tar ${args.join(' ')}`));
     }, timeoutMs);
     if (timer.unref) timer.unref();
 
@@ -111,7 +117,7 @@ function runTarAsync(args, options = {}) {
         settled = true;
         clearTimeout(timer);
         try { child.kill('SIGKILL'); } catch {}
-        reject(new Error(`tar 输出超过上限（已读 ${outBytes} 字节，上限 ${maxOutputBytes} 字节）: tar ${args.join(' ')}`));
+        reject(new Error(`tar: превышен лимит вывода (прочитано ${outBytes} байт, лимит ${maxOutputBytes} байт): tar ${args.join(' ')}`));
         return;
       }
       if (isErr) stderr += chunk.toString('utf8');
@@ -135,9 +141,11 @@ function runTarAsync(args, options = {}) {
   });
 }
 
-// 本服务创建的快照一律以 `tar -cf <file> -C /root .dsh` 打包，因此成员必须全部位于 `.dsh/` 之下。
+// Все снимки, создаваемые этим сервисом, упаковываются как `tar -cf <file> -C /root .dsh`,
+// поэтому все элементы обязаны находиться внутри `.dsh/`.
 const ALLOWED_ARCHIVE_PREFIX = '.dsh';
-// 快照里 node_modules 下的软链会指向这些依赖安装位置（install-plugin.mjs / pnpm 产生），属合法目标
+// Симлинки в node_modules снимка указывают на эти места установки зависимостей
+// (создаются install-plugin.mjs / pnpm) — это легальные цели
 const ALLOWED_LINK_PREFIXES = [
   '/usr/local/lib/node_modules/',
   '/usr/lib/node_modules/',
@@ -146,60 +154,77 @@ const ALLOWED_LINK_PREFIXES = [
   '/opt/'
 ];
 
-// ── 归档校验（validateArchiveMembers）的资源上限 ──────────────────────────────
-// Issue #8 教训：**不能用「tar 清单输出字节数」去判定归档是否可信**。
-// 合法快照的成员数会随插件依赖、会话与附件持续增长（实测约 138~160 字节/成员），
-// v0.1.4~v0.1.9 用写死的 8 MiB 清单上限，使成员数超过约 5~6 万的正常快照被误判为「恶意/损坏」。
-// 现在改为「按行流式解析 + 只限制成员数」，内存 O(1)，上限宽松到不会误伤真实大快照。
+// ── Лимиты ресурсов для проверки архива (validateArchiveMembers) ─────────────
+// Урок Issue #8: **нельзя решать, заслуживает ли архив доверия, по числу байтов
+// вывода списка tar**. Число элементов корректного снимка растёт вместе с плагинами,
+// сессиями и вложениями (на практике около 138~160 байт на элемент), поэтому
+// жёсткий лимит манифеста 8 MiB в v0.1.4~v0.1.9 ошибочно помечал как «вредоносный/
+// повреждённый» нормальные снимки с числом элементов свыше примерно 50–60 тысяч.
+// Теперь разбор идёт построчно в потоке, а лимит распространяется только на число
+// элементов: память O(1), а запас предела достаточен, чтобы не отбраковать настоящие
+// большие снимки.
 const DEFAULT_MAX_ARCHIVE_MEMBERS = Number(process.env.DSH_MAX_ARCHIVE_MEMBERS) > 0
   ? Number(process.env.DSH_MAX_ARCHIVE_MEMBERS)
   : 1000 * 1000;
-// 单行长度兜底：`tar -tv` 一行不会超过「PATH_MAX + 元数据」，超长说明输出已不可信
+// Запас по длине строки: строка `tar -tv` не бывает длиннее «PATH_MAX + метаданные»;
+// превышение означает, что выводу уже нельзя доверять
 const MAX_LISTING_LINE_BYTES = 64 * 1024;
-// 清单总字节兜底：仅用于兜住「tar 疯狂吐垃圾」的极端情况（流式解析本身不占内存）
+// Запас по суммарному числу байтов списка: страхует только от случая «tar безудержно
+// сыплет мусор» (сам потоковый разбор память не потребляет)
 const DEFAULT_MAX_LISTING_BYTES = 512 * 1024 * 1024;
-// 链接成员的分隔文案：符号链接是 ` -> `（不本地化）；硬链接是本地化字符串。
-// 这里固定 spawn 的 LC_ALL=C，同时兼容 zh_CN 的 ` 连接到 `，避免再被 locale 咬一次。
+// Разделители для элементов-ссылок: символическая ссылка выводится как ` -> ` (не локализуется);
+// жёсткая ссылка — локализованной строкой. Здесь LC_ALL=C фиксируется при spawn,
+// но строка для zh_CN (` 连接到 `) тоже сохранена, чтобы снова не попасться на локаль.
 const LINK_SEPARATORS = [' -> ', ' link to ', ' 连接到 '];
-// 允许作为符号链接绝对目标前缀的「归档根」：快照里真实存在
-// `.dsh-module-fallback/node_modules/<pkg> -> <home>/.dsh/profiles/web/node_modules/<pkg>` 这类软链，
-// 其目标仍在被还原的树内，属合法成员（旧实现会整包拒收 → 老快照永远还原不了）。
-// 第 1 项 = 本次运行的 DSH home；第 2 项 = 「默认部署根」下的 .dsh，
-// 用于「从默认 root 部署迁移到自定义 DSH_HOME（非 root 部署）」后仍能还原旧快照；
-// 与 DSH_DIR 同样从 env 派生（可用 DSH_LEGACY_HOME 覆盖），不写死具体 home。
+// Допустимые префиксы «корня архива» для абсолютных целей симлинков: в снимках реально
+// встречаются симлинки вида `.dsh-module-fallback/node_modules/<pkg> -> <home>/.dsh/profiles/web/node_modules/<pkg>` —
+// их цель по-прежнему внутри восстанавливаемого дерева, поэтому это легальные элементы
+// (старая реализация отклоняла весь архив → старые снимки вообще не восстанавливались).
+// 1-й элемент = DSH home текущего запуска; 2-й элемент = `.dsh` под «корнем развёртывания
+// по умолчанию» — чтобы после переезда «с развёртывания от root по умолчанию на
+// собственный DSH_HOME (не от root)» старые снимки по-прежнему восстанавливались;
+// как и DSH_DIR, вычисляется из env (можно переопределить DSH_LEGACY_HOME), конкретный
+// home не зашит жёстко.
 const LEGACY_DSH_DIR = path.join(process.env.DSH_LEGACY_HOME || '/root', '.dsh');
 const ARCHIVE_ROOT_ABS_PREFIXES = Array.from(new Set([DSH_DIR + '/', LEGACY_DSH_DIR + '/']));
-// Issue #9：相对软链目标按「真实还原落点」换算时使用的归档根候选（当前 home + 默认部署根）。
-// 老快照里 pnpm 为 `link:` 依赖生成的相对软链会"向上逃出归档根"，但按落点换算后指向的
-// 正是白名单目录（如 /usr/local/lib/node_modules/...），与写成绝对路径完全等价。
+// Issue #9: кандидаты «корня архива» при пересчёте относительных целей симлинков
+// по реальному месту восстановления (текущий home + корень развёртывания по умолчанию).
+// Относительные симлинки, созданные pnpm для зависимостей `link:` в старых снимках,
+// «выползают вверх за корень архива», но после пересчёта по месту восстановления они
+// указывают ровно на каталоги из белого списка (например /usr/local/lib/node_modules/...),
+// что полностью эквивалентно записи абсолютного пути.
 const ARCHIVE_ROOT_BASES = Array.from(new Set([DSH_DIR, LEGACY_DSH_DIR]));
 const toPosix = (p) => String(p).replace(/\\/g, '/');
-// 纵深防御：追踪符号链接成员，拒绝任何位于符号链接之下的成员
-// （GNU tar 解压时会拒绝这种写法，但白名单不该依赖下游行为）；
-// 同时给追踪集合一个上限，避免病态归档用海量软链把内存顶爆。
+// Оборона в глубину: отслеживаем элементы-симлинки и отказываем любым элементам,
+// находящимся под симлинком (GNU tar при распаковке отклоняет такие записи, но белый
+// список не должен зависеть от поведения соседнего ПО); заодно ограничиваем множество
+// отслеживаемых ссылок, чтобы патологический архив не забил память мириадами симлинков.
 const MAX_TRACKED_SYMLINK_MEMBERS = 100 * 1000;
 
 /**
- * 校验归档成员路径是否合法（必须位于 `.dsh/` 之下且不含 `..` / `.` / 空段）。
- * @param {string} memberPath 归档内成员名
- * @param {string} who 报错时的主语（如「归档成员」「归档硬链接目标」）
+ * Проверка допустимости пути элемента архива (обязан находиться под `.dsh/` и не содержать
+ * `..` / `.` / пустых сегментов).
+ * @param {string} memberPath имя элемента внутри архива
+ * @param {string} who кого касается сообщение об ошибке (например «элемент архива», «цель жёсткой ссылки архива»)
  */
 function assertSafeMemberPath(memberPath, who) {
   const clean = memberPath.replace(/\/+$/, '');
   if (clean !== ALLOWED_ARCHIVE_PREFIX && !clean.startsWith(ALLOWED_ARCHIVE_PREFIX + '/')) {
-    throw new Error(`${who}超出允许范围（仅允许 ${ALLOWED_ARCHIVE_PREFIX}/ 之下）: ${String(memberPath).slice(0, 120)}`);
+    throw new Error(`${who}: выходит за разрешённые пределы (допустимо только под ${ALLOWED_ARCHIVE_PREFIX}/): ${String(memberPath).slice(0, 120)}`);
   }
   const segs = clean.split('/');
   if (segs.some(s => s === '..' || s === '.' || s === '')) {
-    throw new Error(`${who}包含非法路径段: ${String(memberPath).slice(0, 120)}`);
+    throw new Error(`${who}: недопустимый сегмент пути: ${String(memberPath).slice(0, 120)}`);
   }
 }
 
 /**
- * 绝对软链目标是否受控：**先归一化再比对前缀**（否则 `/opt/../etc/passwd` 这类目标能用
- * `startsWith` 骗过白名单），允许指向本项目合法的依赖安装位置，也允许指向**本归档自身的根**
- * （`$DSH_HOME/.dsh`）——目标仍在被还原的树内，且剩余部分仍按成员路径校验。
- * @param {string} absPath 已归一化的绝对路径
+ * Контролируется ли абсолютная цель симлинка: **сначала нормализация, затем сравнение
+ * префиксов** (иначе цель вида `/opt/../etc/passwd` обманет белый список через `startsWith`).
+ * Разрешены легальные места установки зависимостей этого проекта, а также **собственный
+ * корень самого архива** (`$DSH_HOME/.dsh`) — цель всё равно остаётся внутри
+ * восстанавливаемого дерева, а остаток пути проверяется как обычный путь элемента.
+ * @param {string} absPath нормализованный абсолютный путь
  */
 function isAllowedAbsoluteLinkTarget(absPath) {
   if (!absPath.startsWith('/')) return false;
@@ -209,7 +234,7 @@ function isAllowedAbsoluteLinkTarget(absPath) {
     const rel = absPath.slice(root.length);
     if (!rel) return false;
     try {
-      assertSafeMemberPath(ALLOWED_ARCHIVE_PREFIX + '/' + rel, '归档链接目标');
+      assertSafeMemberPath(ALLOWED_ARCHIVE_PREFIX + '/' + rel, 'цель ссылки архива');
       return true;
     } catch {
       return false;
@@ -219,22 +244,27 @@ function isAllowedAbsoluteLinkTarget(absPath) {
 }
 
 /**
- * 符号链接目标是否受控。
- *  - 相对目标：
- *      1. 归一化后仍在 `.dsh/` 之内（归档内部相对引用）→ 放行；
- *      2. **Issue #9**：老快照里由 pnpm 为 `link:` 依赖生成的相对软链会"向上逃出归档根"
- *         （例：`.dsh/profiles/web/node_modules/dshmarket -> ../../../../../usr/local/lib/node_modules/dshmarket`）。
- *         它在真实还原落点上指向的正是白名单目录，与"写成绝对路径"**信任等级完全等价**，
- *         因此这里按真实落点解析成绝对路径后，套用与绝对目标同一套白名单（不新增任何信任面）。
- *  - 绝对目标：先归一化再比对前缀。
- * 注意：解析基准取 `ARCHIVE_ROOT_BASES`（当前 DSH home + 默认部署根），
- * 换算失败的相对目标（例如逃到 /etc）仍会被 `isAllowedAbsoluteLinkTarget` 拒绝 → 保持 fail-closed。
+ * Контролируется ли цель симлинка.
+ *  - Относительная цель:
+ *      1. после нормализации всё ещё внутри `.dsh/` (внутренняя ссылка архива) → пропускаем;
+ *      2. **Issue #9**: относительные симлинки, созданные pnpm для зависимостей `link:` в старых
+ *         снимках, «выползают вверх за корень архива»
+ *         (пример: `.dsh/profiles/web/node_modules/dshmarket -> ../../../../../usr/local/lib/node_modules/dshmarket`).
+ *         По реальному месту восстановления они указывают ровно на каталог из белого списка, то есть
+ *         по уровню доверия **полностью эквивалентны записи абсолютного пути**,
+ *         поэтому здесь цель превращается в абсолютный путь по реальному месту назначения и
+ *         проверяется тем же белым списком, что и абсолютные цели (новых зон доверия не появляется).
+ *  - Абсолютная цель: сначала нормализация, затем сравнение префиксов.
+ * Примечание: базой для разрешения служит `ARCHIVE_ROOT_BASES` (текущий DSH home + корень
+ * развёртывания по умолчанию); относительные цели, которые не разрешились (например, ушли
+ * в /etc), по-прежнему отклоняются `isAllowedAbsoluteLinkTarget` → сохраняется fail-closed.
  */
 function isAllowedSymlinkTarget(memberName, linkTarget) {
   if (!linkTarget.startsWith('/')) {
     const insideArchive = path.posix.normalize(path.posix.join(path.posix.dirname(memberName), linkTarget));
     if (insideArchive.startsWith(ALLOWED_ARCHIVE_PREFIX + '/')) return true;
-    // 逃出归档根的相对目标 → 按真实还原落点换算为绝对路径，再走同一套白名单
+    // Относительная цель, вылезшая за корень архива → пересчитываем в абсолютный путь
+    // по реальному месту восстановления и прогоняем через тот же белый список
     const memberDirInArchive = path.posix.dirname(memberName);
     for (const base of ARCHIVE_ROOT_BASES) {
       const memberDirAbs = path.posix.join(toPosix(path.posix.dirname(toPosix(base))), memberDirInArchive);
@@ -247,13 +277,15 @@ function isAllowedSymlinkTarget(memberName, linkTarget) {
 }
 
 /**
- * 从 `tar -tv` 的成员名正文里切出「名字 + 链接目标」。
+ * Вырезает из текста имени элемента в выводе `tar -tv` «имя + цель ссылки».
  *
- * ⚠️ 分隔符（` -> ` / ` link to ` / ` 连接到 `）是 tar 自己插入的普通文本，
- * 而成员名或目标本身**也可能包含同样的字符串**——此时单行文本无法无歧义切分。
- * 旧实现取「第一个」分隔符，会被 `.dsh/leak -> dummy -> /etc/passwd`
- * 这类构造欺骗（名字被截断、真正的绝对目标被当成相对路径放行）。
- * 因此这里改为：**出现多于一个分隔符就直接 fail-closed**（真实快照的成员名不含这些串）。
+ * ⚠️ Разделители (` -> ` / ` link to ` / ` 连接到 `) — обычный текст, который вставляет сам tar,
+ * но и само имя, и цель **могут содержать ту же строку** — тогда одну строку текста
+ * однозначно разрезать невозможно. Старая реализация брала «первый» разделитель и
+ * поддавалась на обман вида `.dsh/leak -> dummy -> /etc/passwd` (имя обрезалось, а настоящая
+ * абсолютная цель воспринималась как относительный путь и пропускалась).
+ * Поэтому здесь: **если разделителей больше одного — сразу fail-closed**
+ * (имена элементов настоящих снимков этих строк не содержат).
  */
 function splitLinkMember(rawName) {
   let count = 0;
@@ -277,27 +309,28 @@ function splitLinkMember(rawName) {
   };
 }
 
-/** 解析 `tar -tvzf` 的一行；非法成员直接抛错（fail-closed）。 */
+/** Разбор одной строки `tar -tvzf`; недопустимый элемент сразу приводит к ошибке (fail-closed). */
 function classifyArchiveMemberLine(rawLine) {
   const line = rawLine.replace(/\s+$/, '');
   if (!line) return null;
 
   const parts = line.trim().split(/\s+/);
   // `-rw-r--r-- owner/group size date time name`
-  if (parts.length < 6) throw new Error(`无法解析归档成员: ${line.slice(0, 120)}`);
+  if (parts.length < 6) throw new Error(`Не удалось разобрать элемент архива: ${line.slice(0, 120)}`);
 
   const typeChar = parts[0][0];
   const rawName = parts.slice(5).join(' ');
   const isLink = typeChar === 'l' || typeChar === 'h';
 
-  // 只有链接成员才做分隔符切分：普通成员名里若恰好含有 ` -> ` / ` link to `，
-  // 切分会把真实名字截断，从而可能**漏掉**名字后半段的 `..` 段。
+  // Разрез по разделителю выполняем только для элементов-ссылок: если у обычного имени
+  // случайно встречается ` -> ` / ` link to `, разрез обрежет настоящее имя и мы можем
+  // **пропустить** сегмент `..` во второй его половине.
   let name = rawName;
   let linkTarget = null;
   if (isLink) {
     const split = splitLinkMember(rawName);
     if (split.ambiguous) {
-      throw new Error(`归档链接成员含多个链接分隔符，无法无歧义解析: ${rawName.slice(0, 120)}`);
+      throw new Error(`Элемент-ссылка архива содержит несколько разделителей ссылки, разбор однозначно невозможен: ${rawName.slice(0, 120)}`);
     }
     name = split.name;
     linkTarget = split.linkTarget;
@@ -305,50 +338,60 @@ function classifyArchiveMemberLine(rawLine) {
 
   if (isLink) {
     if (!linkTarget) {
-      const kind = typeChar === 'h' ? '硬' : '符号';
-      throw new Error(`归档${kind}链接成员缺少目标（tar 输出格式无法识别）: ${name.slice(0, 120)}`);
+      const kind = typeChar === 'h' ? 'жёсткой' : 'символической';
+      throw new Error(`У ${kind} ссылки элемента архива отсутствует цель (формат вывода tar не распознан): ${name.slice(0, 120)}`);
     }
-    assertSafeMemberPath(name, '归档链接成员');
-    // 归档根目录本身必须是目录，绝不能是链接成员：否则解压后 `.dsh` 会变成一个指向别处的软链，
-    // 而 restoreBackup 随后的「把 gateway.config.json 拷进 staging」等步骤会顺着它写出去。
+    assertSafeMemberPath(name, 'элемент-ссылка архива');
+    // Сам корень архива обязан быть каталогом и никогда не быть ссылкой: иначе после
+    // распаковки `.dsh` превратится в симлинку куда-то в сторону, а последующие шаги
+    // restoreBackup вроде «копирования gateway.config.json в staging» запишут файл мимо дерева.
     if (name.replace(/\/+$/, '') === ALLOWED_ARCHIVE_PREFIX) {
-      throw new Error(`归档根目录 ${ALLOWED_ARCHIVE_PREFIX} 不得是链接成员: ${name.slice(0, 120)}`);
+      throw new Error(`Корень архива ${ALLOWED_ARCHIVE_PREFIX} не может быть элементом-ссылкой: ${name.slice(0, 120)}`);
     }
     if (typeChar === 'h') {
-      // 硬链接的目标是「归档内已存在的成员」，把它当作普通成员名同样校验：
-      // 若目标逃出 `.dsh/` 或含 `..`，解压时可能被引导到归档之外。
-      assertSafeMemberPath(linkTarget, '归档硬链接目标');
+      // Цель жёсткой ссылки — «уже существующий элемент архива», поэтому проверяем её
+      // как обычное имя элемента: если цель уходит за `.dsh/` или содержит `..`,
+      // при распаковке она может завести запись за пределы архива.
+      assertSafeMemberPath(linkTarget, 'цель жёсткой ссылки архива');
       return { type: 'hardlink', name, linkTarget };
     }
     if (!isAllowedSymlinkTarget(name, linkTarget)) {
-      throw new Error(`归档包含指向不允许位置的链接成员: ${name.slice(0, 60)} -> ${String(linkTarget).slice(0, 60)}`);
+      throw new Error(`Архив содержит элемент-ссылку, указывающий на недопустимое место: ${name.slice(0, 60)} -> ${String(linkTarget).slice(0, 60)}`);
     }
     return { type: 'symlink', name };
   }
 
   if (typeChar !== '-' && typeChar !== 'd') {
-    throw new Error(`归档包含不允许的成员类型 (${typeChar})，仅允许普通文件、目录与受控链接: ${name.slice(0, 120)}`);
+    throw new Error(`Архив содержит недопустимый тип элемента (${typeChar}); разрешены только обычные файлы, каталоги и контролируемые ссылки: ${name.slice(0, 120)}`);
   }
-  assertSafeMemberPath(name, '归档成员');
+  assertSafeMemberPath(name, 'элемент архива');
   return { type: typeChar === 'd' ? 'dir' : 'file', name };
 }
 
 /**
- * 归档成员白名单校验（在解压/转正之前调用）。
+ * Проверка белого списка для элементов архива (вызывается до распаковки / переименования в итоговое имя).
  *
- * 阻断：绝对路径、`..` 段、超出 `.dsh/` 前缀的成员（如 `.ssh/authorized_keys`、`.bashrc`），
- * 以及设备 / FIFO 等非普通文件成员（防止解压时写到目录外）。
- * 允许：普通文件 / 目录 / 符号链接（目标受限）/ 硬链接（目标必须仍是归档内的 `.dsh/` 成员）。
- * 失败即抛错，调用方不会执行任何解压动作（fail-closed）。
+ * Блокируются: абсолютные пути, сегменты `..`, элементы за префиксом `.dsh/`
+ * (например `.ssh/authorized_keys`, `.bashrc`), а также элементы-устройства / FIFO
+ * и прочее помимо обычных файлов (чтобы при распаковке ничего не записалось мимо каталога).
+ * Разрешаются: обычные файлы / каталоги / симлинки (цель ограничена) / жёсткие ссылки
+ * (цель обязана оставаться элементом `.dsh/` внутри архива).
+ * При любой ошибке выбрасывается исключение, вызывающая сторона не выполняет распаковку (fail-closed).
  *
- * 实现要点（Issue #8 修复）：
- *  1. **按行流式解析** `tar -tvzf` 的 stdout，不再把整份清单缓冲进内存，也不再设字节数硬上限；
- *     限制改为「成员数」，宽到不会误伤合法大快照（旧实现 8 MiB 上限会把 ≥5~6 万成员的正常快照判为损坏）。
- *  2. spawn 时强制 `LC_ALL=C`：GNU tar 对硬链接打印的是本地化文案（C: ` link to ` / zh_CN: ` 连接到 `），
- *     而旧代码只认符号链接的 ` -> `，导致**任何含硬链接的合法快照**都被误判为「链接成员缺少目标」。
- *  3. 报错文案不再把「规模超限」说成「文件已损坏」，并在错误里带上实际计数，便于排障。
+ * Ключевые моменты реализации (исправление Issue #8):
+ *  1. stdout команды `tar -tvzf` разбирается **построчно в потоке**: манифест целиком
+ *     в память больше не буферизуется, жёсткого лимита в байтах больше нет;
+ *     ограничение — по числу элементов и подобрано так, чтобы не отбраковывать
+ *     корректные большие снимки (старый лимит 8 MiB считал повреждёнными нормальные
+ *     снимки с числом элементов ≥50–60 тысяч).
+ *  2. При spawn жёстко задаётся `LC_ALL=C`: GNU tar печатает жёсткие ссылки локализованно
+ *     (C: ` link to ` / zh_CN: ` 连接到 `), а старый код распознавал только символическую
+ *     ссылку ` -> `, из-за чего **любой корректный снимок с жёсткими ссылками** ошибочно
+ *     считался «элементом-ссылкой без цели».
+ *  3. В тексте ошибки превышение масштаба больше не называется «файл повреждён», и в
+ *     сообщение добавлены фактические счётчики для удобства диагностики.
  *
- * @param {string} archivePath 归档路径
+ * @param {string} archivePath путь к архиву
  * @param {object} [opts] { maxMembers, maxListingBytes, timeoutMs }
  * @returns {Promise<{members:number, listingBytes:number, hardLinks:number, symLinks:number}>}
  */
@@ -372,7 +415,7 @@ function validateArchiveMembers(archivePath, opts = {}) {
     let stderr = '';
     let pending = '';
     const decoder = new StringDecoder('utf8');
-    // 符号链接成员名 → 用于「成员不得位于符号链接之下」的纵深防御
+    // Симлинк-имя элемента → для обороны в глубину «никакой элемент не может находиться под симлинком»
     const symlinkNames = new Set();
 
     const fail = (err) => {
@@ -390,7 +433,7 @@ function validateArchiveMembers(archivePath, opts = {}) {
     };
 
     timer = setTimeout(
-      () => fail(new Error(`归档校验超时（${Math.round(timeoutMs / 1000)}s）: ${path.basename(String(archivePath))}`)),
+      () => fail(new Error(`Проверка архива превысила время ожидания (${Math.round(timeoutMs / 1000)} c): ${path.basename(String(archivePath))}`)),
       timeoutMs
     );
     if (timer.unref) timer.unref();
@@ -401,29 +444,34 @@ function validateArchiveMembers(archivePath, opts = {}) {
       if (!cls) return;
       members += 1;
       if (members > maxMembers) {
-        // 这里是「规模」而不是「损坏」：文案必须让用户能分辨，并给出明确的自救路径
+        // Здесь речь о «масштабе», а не о «повреждении»: формулировка должна позволять
+        // пользователю это различать, плюс дан явный путь выхода из ситуации
         throw new Error(
-          `归档成员数超过上限（${members} > ${maxMembers}），已中止校验。` +
-          `该归档可能是合法但异常庞大的快照；如确认可信，请提高上限（环境变量 DSH_MAX_ARCHIVE_MEMBERS）或改用「仅配置」快照后重试。`
+          `Число элементов архива превысило предел (${members} > ${maxMembers}), проверка прервана. ` +
+          `Возможно, это корректный, но необычно большой снимок; если он вам доверен, поднимите предел ` +
+          `(переменная окружения DSH_MAX_ARCHIVE_MEMBERS) либо создайте снимок «только конфигурация» и повторите.`
         );
       }
 
-      // 纵深防御：任何成员的祖先路径都不能是符号链接成员。
-      // GNU tar 解压时会拒绝这种写法（"无法 open: 不是目录"），但白名单不该把安全性
-      // 完全外包给下游，否则一旦换成其它解压实现就会出现写入树外的窗口。
+      // Оборона в глубину: ни один из предков элемента не может быть симлинком.
+      // GNU tar при распаковке отклоняет такие записи («не удалось открыть: не каталог»),
+      // но белый список не должен целиком делегировать безопасность соседнему ПО —
+      // иначе при смене реализации распаковки появится окно для записи мимо дерева.
       if (symlinkNames.size > 0) {
         const segs = cls.name.split('/');
-        // 从 i=1 起算：连 `.dsh` 自身也比对一次（根成员是链接已被上面直接拒掉，这里是第二道保险）
+        // Начинаем с i=1: сам `.dsh` тоже проверяем (корень-ссылку мы уже отклонили выше,
+        // здесь это второй рубеж защиты)
         for (let i = 1; i < segs.length; i++) {
           if (symlinkNames.has(segs.slice(0, i).join('/'))) {
-            throw new Error(`归档成员位于符号链接之下（解压时可能写到归档之外）: ${cls.name.slice(0, 120)}`);
+            throw new Error(`Элемент архива находится под символической ссылкой (при распаковке возможна запись за пределы архива): ${cls.name.slice(0, 120)}`);
           }
         }
       }
 
       if (cls.type === 'hardlink') {
-        // 指向符号链接的硬链接会「继承」符号链接语义；不登记的话，
-        // `.dsh/sym`（软链）→ `.dsh/h4 link to .dsh/sym` → `.dsh/h4/evil` 会绕过后面的祖先检查。
+        // Жёсткая ссылка на симлинк «наследует» семантику симлинка; без регистрации цепочки
+        // `.dsh/sym` (симлинк) → `.dsh/h4 link to .dsh/sym` → `.dsh/h4/evil` обошла бы
+        // последующую проверку предков.
         const target = cls.linkTarget ? cls.linkTarget.replace(/\/+$/, '') : null;
         if (target && symlinkNames.has(target) && symlinkNames.size < MAX_TRACKED_SYMLINK_MEMBERS) {
           symlinkNames.add(cls.name.replace(/\/+$/, ''));
@@ -431,7 +479,7 @@ function validateArchiveMembers(archivePath, opts = {}) {
         hardLinks += 1;
       } else if (cls.type === 'symlink') {
         if (symlinkNames.size >= MAX_TRACKED_SYMLINK_MEMBERS) {
-          throw new Error(`归档符号链接成员过多（> ${MAX_TRACKED_SYMLINK_MEMBERS}），无法安全校验`);
+          throw new Error(`В архиве слишком много символьных ссылок (> ${MAX_TRACKED_SYMLINK_MEMBERS}), безопасная проверка невозможна`);
         }
         symlinkNames.add(cls.name.replace(/\/+$/, ''));
         symLinks += 1;
@@ -443,7 +491,7 @@ function validateArchiveMembers(archivePath, opts = {}) {
       listingBytes += chunk.length;
       if (listingBytes > maxListingBytes) {
         return fail(new Error(
-          `归档清单输出异常增大（已读 ${listingBytes} 字节 > ${maxListingBytes} 字节兜底上限），已中止校验`
+          `Вывод списка архива аномально вырос (прочитано ${listingBytes} байт > запасного предела ${maxListingBytes} байт), проверка прервана`
         ));
       }
       pending += decoder.write(chunk);
@@ -452,7 +500,7 @@ function validateArchiveMembers(archivePath, opts = {}) {
         const line = pending.slice(0, nl);
         pending = pending.slice(nl + 1);
         if (line.length > MAX_LISTING_LINE_BYTES) {
-          return fail(new Error(`归档成员行异常过长（${line.length} 字节），无法安全解析`));
+          return fail(new Error(`Аномально длинная строка элемента архива (${line.length} байт), безопасный разбор невозможен`));
         }
         try {
           handleLine(line);
@@ -461,17 +509,18 @@ function validateArchiveMembers(archivePath, opts = {}) {
         }
       }
       if (pending.length > MAX_LISTING_LINE_BYTES) {
-        return fail(new Error(`归档成员行异常过长（>${MAX_LISTING_LINE_BYTES} 字节），无法安全解析`));
+        return fail(new Error(`Аномально длинная строка элемента архива (>${MAX_LISTING_LINE_BYTES} байт), безопасный разбор невозможен`));
       }
     });
 
-    // stderr 只保留前 8 KiB 用于报错，避免坏归档吐垃圾把内存打满
+    // Из stderr для сообщения об ошибке сохраняются только первые 8 КиБ, чтобы битый
+    // архив, сыплющий мусор, не забил память
     child.stderr.on('data', (chunk) => {
       if (stderr.length >= 8192) return;
       stderr += chunk.toString('utf8').slice(0, 8192 - stderr.length);
     });
 
-    child.on('error', (err) => fail(new Error('无法启动 tar 校验归档: ' + err.message)));
+    child.on('error', (err) => fail(new Error('Не удалось запустить tar для проверки архива: ' + err.message)));
 
     child.on('close', (code) => {
       if (settled) return;
@@ -484,27 +533,32 @@ function validateArchiveMembers(archivePath, opts = {}) {
         }
       }
       if (code !== 0) {
-        return fail(new Error('归档文件损坏或不是合法的 tar.gz 文件: ' + (stderr.trim() || `tar 退出码 ${code}`)));
+        return fail(new Error('Файл архива повреждён или не является корректным tar.gz: ' + (stderr.trim() || `код завершения tar ${code}`)));
       }
-      if (members === 0) return fail(new Error('归档内容为空'));
+      if (members === 0) return fail(new Error('Архив пуст'));
       succeed({ members, listingBytes, hardLinks, symLinks });
     });
   });
 }
 
 /**
- * Issue #9：还原时**自动**修复"逃出归档根"的相对软链（老版本快照兼容，用户无需任何额外操作）。
+ * Issue #9: **автоматически** чинит относительные симлинки, «выползающие за корень архива»
+ * (совместимость со старыми снимками, от пользователя ничего не требуется).
  *
- * 老快照里 pnpm 为 `link:` 依赖生成的是**相对**软链，例如
+ * В старых снимках pnpm создаёт для зависимостей `link:` **относительные** симлинки, например
  *   .dsh/profiles/web/node_modules/dshmarket -> ../../../../../usr/local/lib/node_modules/dshmarket
- * 它只在「DSH home 恰好是 /root/.dsh 这种两层深度」时解析正确；换部署路径或再次打包就会漂移。
- * 这里在 staging 沙箱内把它**原地改写为等价绝对软链**（仅在解析结果命中既有白名单时），
- * 使还原后的树与目录深度无关 —— 换镜像 / 换挂载路径都能正常解析。
+ * корректно они разрешаются только если DSH home имеет ровно двухуровневую глубину вроде
+ * /root/.dsh; при смене пути развёртывания или повторной упаковке ссылки «плывут».
+ * Здесь внутри песочницы staging такой симлинок **на месте переписывается в эквивалентный
+ * абсолютный** (только если разрешённая цель попадает в существующий белый список),
+ * чтобы восстановленное дерево не зависело от глубины каталогов — смена образа или точки
+ * монтирования не ломает разрешение ссылок.
  *
- * 安全性：只改写 `isAllowedAbsoluteLinkTarget()` 放行的目标，其余一律保持原样；
- * 遍历不跟随软链（Dirent 对软链不会判定为目录），因此不存在遍历逃逸。
+ * Безопасность: переписываются только цели, которые пропускает `isAllowedAbsoluteLinkTarget()`,
+ * остальные остаются как есть; обход не следует за симлинками (Dirent для симлинка не считается
+ * каталогом), поэтому обхода границ невозможен.
  *
- * @param {string} stagedDsh staging 目录里的 `.dsh` 绝对路径
+ * @param {string} stagedDsh абсолютный путь к `.dsh` внутри каталога staging
  * @returns {{repaired:number, kept:number, samples:string[]}}
  */
 function repairEscapingRelativeLinks(stagedDsh) {
@@ -519,10 +573,10 @@ function repairEscapingRelativeLinks(stagedDsh) {
       if (entry.isSymbolicLink()) {
         let target = null;
         try { target = fs.readlinkSync(p); } catch { continue; }
-        if (!target || target.startsWith('/')) continue; // 绝对目标由校验层白名单负责，无需改写
+        if (!target || target.startsWith('/')) continue; // за абсолютные цели отвечает белый список на этапе проверки, переписывать не нужно
         const memberName = ALLOWED_ARCHIVE_PREFIX + '/' + toPosix(path.relative(stagedDsh, p));
         const insideArchive = path.posix.normalize(path.posix.join(path.posix.dirname(memberName), target));
-        if (insideArchive.startsWith(ALLOWED_ARCHIVE_PREFIX + '/')) continue; // 归档内部相对引用，无需改写
+        if (insideArchive.startsWith(ALLOWED_ARCHIVE_PREFIX + '/')) continue; // внутренняя относительная ссылка архива, переписывать не нужно
         const memberDirInArchive = path.posix.dirname(memberName);
         let resolved = null;
         for (const base of ARCHIVE_ROOT_BASES) {
@@ -530,7 +584,7 @@ function repairEscapingRelativeLinks(stagedDsh) {
             path.posix.join(toPosix(path.posix.dirname(toPosix(base))), memberDirInArchive), target);
           if (isAllowedAbsoluteLinkTarget(candidate)) { resolved = candidate; break; }
         }
-        if (!resolved) { report.kept += 1; continue; } // 非白名单目标：保持原样（校验层本就会拒包）
+        if (!resolved) { report.kept += 1; continue; } // цель не из белого списка: оставляем как есть (этап проверки всё равно отклонит архив)
         try {
           fs.unlinkSync(p);
           fs.symlinkSync(resolved, p);
@@ -538,7 +592,7 @@ function repairEscapingRelativeLinks(stagedDsh) {
           if (report.samples.length < 20) report.samples.push(`${memberName} -> ${resolved}`);
         } catch (e) {
           report.kept += 1;
-          console.warn(`[backup-service] 相对软链改写失败（保持原样）: ${memberName}: ${e.message}`);
+          console.warn(`[backup-service] Не удалось переписать относительный симлинок (оставлен как есть): ${memberName}: ${e.message}`);
         }
       } else if (entry.isDirectory()) {
         stack.push(p);
@@ -549,13 +603,13 @@ function repairEscapingRelativeLinks(stagedDsh) {
 }
 
 /**
- * 异步非阻塞创建配置快照
- * @param {string|object} nameOrOpts - 快照备注名或参数对象 { name, type }
- * @param {string} [backupType='full'] - 备份类型: 'full' (完整备份) 或 'config' (仅配置无会话)
+ * Асинхронное неблокирующее создание снимка конфигурации
+ * @param {string|object} nameOrOpts - имя-заметка снимка или объект параметров { name, type }
+ * @param {string} [backupType='full'] - тип резервной копии: 'full' (полная) или 'config' (только конфигурация, без сессий)
  */
 async function createBackup(nameOrOpts = '', backupType = 'full') {
   if (activeTask) {
-    throw new Error(`当前正在执行 ${activeTask.label} 操作，请稍候再试`);
+    throw new Error(`Сейчас выполняется операция «${activeTask.label}», повторите позже`);
   }
 
   let name = '';
@@ -577,16 +631,17 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
   const finalPath = path.join(SNAPSHOTS_DIR, filename);
   const tmpPath = path.join(SNAPSHOTS_DIR, `.${filename}.tmp`);
 
-  const taskDesc = isConfigOnly ? '仅配置快照(无会话)' : '完整快照';
-  activeTask = { type: 'backup', label: `创建${taskDesc}`, startedAt: Date.now() };
+  const taskDesc = isConfigOnly ? 'снимок «только конфигурация» (без сессий)' : 'полный снимок';
+  activeTask = { type: 'backup', label: `создание: ${taskDesc}`, startedAt: Date.now() };
 
-  console.log(`[backup-service] 开始异步创建${taskDesc}: ${filename}...`);
+  console.log(`[backup-service] Начинаем асинхронное создание ${taskDesc}: ${filename}...`);
 
   try {
-    // 排除庞大且不影响配置的临时与缓存目录，极大提升打包速度
+    // Исключаем объёмные временные и кэшируемые каталоги, не влияющие на конфигурацию,
+    // — упаковка заметно ускоряется
     const isMultiThread = hasPigz();
     if (isMultiThread) {
-      console.log('[backup-service] 检测到 pigz，已启用全核心多线程并行压缩加速');
+      console.log('[backup-service] Обнаружен pigz, включено многопоточное сжатие по всем ядрам');
     }
 
     const tarArgs = [
@@ -597,9 +652,13 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
       '--exclude=.dsh/gateway.config.json'
     ];
 
-    // 仅配置模式：完全排除所有数据类条目（对话会话、附件、工作区索引与存储、插件数据、日志与缓存）
-    // 统一复用 DATA_ENTRIES 常量；此处将历史仅排除 session_projcache* 修正为排除整个 storages，
-    // 修正历史口径以彻底杜绝 config 快照携带 storages/workspace.json 冲掉现网会话索引的问题；full 快照打包内容保持不变。
+    // Режим «только конфигурация»: полностью исключаем все каталоги данных
+    // (сессии диалогов, вложения, индексы и хранилища рабочих областей, данные плагинов,
+    // журналы и кэш). Используем общий константный список DATA_ENTRIES; здесь историческое
+    // исключение только session_projcache* исправлено на исключение всего storages —
+    // так устранена старая неточность, из-за которой снимок config мог унести
+    // storages/workspace.json и затереть индекс сессий рабочего окружения; содержимое
+    // снимка full не менялось.
     if (isConfigOnly) {
       for (const entry of DATA_ENTRIES) {
         tarArgs.push(`--exclude=.dsh/${entry}`);
@@ -616,25 +675,26 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
 
     const res = await runTarAsync(tarArgs);
 
-    // tar 非零退出码说明归档不完整（读错误 / 权限跳过等），绝不能当作有效快照转正
+    // Ненулевой код завершения tar означает неполный архив (ошибки чтения / пропуски по правам
+    // и т.п.) — ни в коем случае нельзя превращать его в корректный снимок
     if (res.code !== 0) {
       try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
-      throw new Error(`tar 打包失败 (exit=${res.code}): ${String(res.stderr || '').slice(0, 300)}`);
+      throw new Error(`Не удалось упаковать tar (exit=${res.code}): ${String(res.stderr || '').slice(0, 300)}`);
     }
 
     if (!fs.existsSync(tmpPath)) {
-      throw new Error('快照文件未成功生成: ' + (res.stderr || 'tar 执行失败'));
+      throw new Error('Файл снимка не был создан: ' + (res.stderr || 'tar завершился с ошибкой'));
     }
 
     const stat = fs.statSync(tmpPath);
     if (stat.size === 0) {
       try { fs.unlinkSync(tmpPath); } catch {}
-      throw new Error('生成的快照文件大小为 0，已被清理');
+      throw new Error('Созданный файл снимка имеет размер 0 байт и был удалён');
     }
 
-    // 原子重命名
+    // Атомарное переименование
     fs.renameSync(tmpPath, finalPath);
-    console.log(`[backup-service] ${taskDesc}创建成功: ${filename} (${(stat.size / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`[backup-service] ${taskDesc} создан: ${filename} (${(stat.size / 1024 / 1024).toFixed(2)} МБ)`);
 
     const dshVersion = getCurrentDshVersion();
     const projectVersion = getCurrentProjectVersion();
@@ -656,7 +716,7 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
         }
       });
     } catch (e) {
-      console.warn('[backup-service] 写入快照元数据 sidecar 失败:', e.message);
+      console.warn('[backup-service] Не удалось записать sidecar метаданных снимка:', e.message);
     }
 
     return {
@@ -664,7 +724,7 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
       snapshot: {
         filename,
         type: isConfigOnly ? 'config' : 'full',
-        typeLabel: isConfigOnly ? '仅配置 (无会话)' : '完整备份',
+        typeLabel: isConfigOnly ? 'Только конфигурация (без сессий)' : 'Полная резервная копия',
         sizeBytes: stat.size,
         sizeFormatted: `${(stat.size / 1024 / 1024).toFixed(2)} MB`,
         createdAt: stat.mtime.toISOString(),
@@ -675,7 +735,7 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
     };
   } catch (err) {
     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
-    console.error(`[backup-service] ${taskDesc}创建失败:`, err.message);
+    console.error(`[backup-service] Не удалось создать ${taskDesc}:`, err.message);
     throw err;
   } finally {
     activeTask = null;
@@ -683,44 +743,50 @@ async function createBackup(nameOrOpts = '', backupType = 'full') {
 }
 
 /**
- * 异步非阻塞恢复配置快照
- * @param {string} filename 快照文件名
- * @param {object} dshManager DSH 进程管理器
- * @param {object} [opts] 还原选项 { mode: 'full' | 'config-only' }
+ * Асинхронное неблокирующее восстановление снимка конфигурации
+ * @param {string} filename имя файла снимка
+ * @param {object} dshManager менеджер процессов DSH
+ * @param {object} [opts] параметры восстановления { mode: 'full' | 'config-only' }
  *
- * Issue #9：
- * 1. 恢复范围可选：mode 为 'full'（整包替换，默认保持 100% 向后兼容）或 'config-only'（仅恢复配置并保留现网会话/附件/数据）。
- * 2. 还原**自动**兼容老快照 —— 老版本（0.1.x 时代）里 pnpm 为 `link:` 依赖生成的
- *    相对软链在归档视图下会"逃出 `.dsh/` 根"（校验层已按真实还原落点放行）；这里再自动把它们
- *    改写为等价绝对软链后再切换，使还原结果与部署路径深度无关（换镜像 / 换挂载路径都能正常解析）。
- * 3. 失败精确逆向回滚：在 config-only 下禁止 clearDir 全清以保护原地保留的数据条目，只清理从 staging
- *    搬入的条目再回搬 rollbackRoot。
+ * Issue #9:
+ * 1. Выбор объёма восстановления: mode 'full' (полная замена, по умолчанию — 100 % обратная
+ *    совместимость) или 'config-only' (восстанавливается только конфигурация, действующие
+ *    сессии/вложения/данные сохраняются).
+ * 2. Восстановление **автоматически** совместимо со старыми снимками — в старых версиях
+ *    (эпоха 0.1.x) относительные симлинки, созданные pnpm для зависимостей `link:`, в виде
+ *    архива «выползают за корень `.dsh/`» (этап проверки уже пропускает их по реальному месту
+ *    восстановления); здесь они дополнительно автоматически переписываются в эквивалентные
+ *    абсолютные симлинки до переключения, чтобы результат не зависел от глубины развёртывания
+ *    (смена образа / точки монтирования не ломает ссылки).
+ * 3. Точный обратный откат при сбое: в режиме config-only запрещена тотальная очистка
+ *    clearDir, чтобы сохранить оставленные на месте каталоги данных; удаляются только
+ *    элементы, перенесённые из staging, затем они возвращаются из rollbackRoot.
  */
 async function restoreBackup(filename, dshManager, opts = {}) {
   if (activeTask) {
-    throw new Error(`当前正在执行 ${activeTask.label} 操作，请稍候再试`);
+    throw new Error(`Сейчас выполняется операция «${activeTask.label}», повторите позже`);
   }
 
   const mode = (opts && opts.mode) ? opts.mode : 'full';
   if (mode !== 'full' && mode !== 'config-only') {
-    throw new Error(`非法还原模式: ${mode} (仅支持 'full' 或 'config-only')`);
+    throw new Error(`Недопустимый режим восстановления: ${mode} (поддерживаются только 'full' и 'config-only')`);
   }
 
   const safeFilename = path.basename(filename || '');
   if (!safeFilename.endsWith('.tar.gz') || safeFilename.includes('..')) {
-    throw new Error('非法快照文件名');
+    throw new Error('Недопустимое имя файла снимка');
   }
 
   const snapshotPath = path.join(SNAPSHOTS_DIR, safeFilename);
   if (!fs.existsSync(snapshotPath)) {
-    throw new Error('快照文件不存在: ' + safeFilename);
+    throw new Error('Файл снимка не найден: ' + safeFilename);
   }
 
-  activeTask = { type: 'restore', label: `恢复快照(${mode === 'config-only' ? '仅配置' : '全量'})`, startedAt: Date.now() };
-  console.log(`[backup-service] 开始安全还原快照: ${safeFilename} (模式: ${mode})...`);
+  activeTask = { type: 'restore', label: `восстановление снимка (${mode === 'config-only' ? 'только конфигурация' : 'полное'})`, startedAt: Date.now() };
+  console.log(`[backup-service] Начинаем безопасное восстановление снимка: ${safeFilename} (режим: ${mode})...`);
 
-  let rollbackRoot = null; // 还原前的配置回滚点（供失败时回滚）
-  let stagedItems = [];    // 记录从 staging 搬入的相对路径，供精确逆向回滚
+  let rollbackRoot = null; // точка отката конфигурации до восстановления (для отмены при сбое)
+  let stagedItems = [];    // относительные пути, перенесённые из staging — для точного обратного отката
   const isPreserved = (relPath) => {
     if (relPath === '.restore-staging' || relPath === '.restore-rollback') return true;
     if (mode === 'config-only') {
@@ -800,8 +866,9 @@ async function restoreBackup(filename, dshManager, opts = {}) {
 
   const rollback = () => {
     if (!rollbackRoot || !fs.existsSync(rollbackRoot)) return;
-    console.warn('[backup-service] 正在精确逆向回滚到还原前的配置...');
-    // 1. 只清理从 staging 搬入到 DSH_DIR 的条目，绝对不碰任何 preserved 保护项
+    console.warn('[backup-service] Выполняется точный обратный откат к конфигурации до восстановления...');
+    // 1. Удаляем только элементы, перенесённые из staging в DSH_DIR; ни в коем случае
+    //    не трогаем ничего из сохранённого (preserved)
     const sortedStaged = [...stagedItems].sort((a, b) => b.rel.length - a.rel.length);
     for (const item of sortedStaged) {
       if (isPreserved(item.rel)) continue;
@@ -817,16 +884,18 @@ async function restoreBackup(filename, dshManager, opts = {}) {
         try { fs.rmSync(targetPath, { force: true }); } catch {}
       }
     }
-    // 2. 将 rollbackRoot 里的旧配置条目搬回现网
+    // 2. Возвращаем из rollbackRoot старые элементы конфигурации в рабочее окружение
     moveChildren(rollbackRoot, DSH_DIR, () => false);
     try { fs.rmSync(rollbackRoot, { recursive: true, force: true }); } catch {}
   };
 
   try {
-    // 1. 预先校验快照完整性 + 成员白名单，防损坏/恶意归档破坏现有环境
+    // 1. Заранее проверяем целостность снимка и белый список элементов, чтобы битый
+    //    или вредоносный архив не разрушил текущее окружение
     await validateArchiveMembers(snapshotPath);
 
-    // 2. 优雅停止 DSH 并彻底清理可能占用端口的外部孤儿进程
+    // 2. Корректно останавливаем DSH и полностью убираем внешние «сироты», возможные
+    //    владельцы порта
     if (dshManager && typeof dshManager.stop === 'function') {
       await dshManager.stop();
     }
@@ -845,9 +914,11 @@ async function restoreBackup(filename, dshManager, opts = {}) {
       }
     } catch {}
 
-    // 3. 解压到独立 staging 目录（完全不触碰现网），校验通过后再原子切换
-    // 注意：/root/.dsh 是挂载卷，跨设备 rename 会 EXDEV，
-    // 因此 staging 与回滚点都必须放在该卷内部（同设备），并在切换时跳过这两个名字。
+    // 3. Распаковываем в отдельный каталог staging (рабочее окружение не трогаем вовсе),
+    //    после успешной проверки выполняем атомарное переключение.
+    //    Обратите внимание: /root/.dsh — смонтированный том, rename между устройствами
+    //    даст EXDEV, поэтому staging и точка отката обязаны находиться внутри этого тома
+    //    (на том же устройстве), а при переключении эти два имени пропускаются.
     const stagingRoot = path.join(DSH_DIR, '.restore-staging');
     rollbackRoot = path.join(DSH_DIR, '.restore-rollback');
     fs.rmSync(stagingRoot, { recursive: true, force: true });
@@ -861,8 +932,8 @@ async function restoreBackup(filename, dshManager, opts = {}) {
       extractArgs.push('-z');
     }
 
-    // config-only 模式解压阶段排除数据类目录与 profiles/*/node_modules
-    // 严禁尾部斜杠，实测带斜杠会导致 GNU tar 排除失效
+    // В режиме config-only на этапе распаковки исключаются каталоги данных и profiles/*/node_modules
+    // Завершающий слэш запрещён: на практике с ним исключение GNU tar не срабатывает
     if (mode === 'config-only') {
       for (const entry of DATA_ENTRIES) {
         extractArgs.push(`--exclude=.dsh/${entry}`);
@@ -874,19 +945,23 @@ async function restoreBackup(filename, dshManager, opts = {}) {
     const extractRes = await runTarAsync(extractArgs);
     if (extractRes.code !== 0) {
       fs.rmSync(stagingRoot, { recursive: true, force: true });
-      throw new Error('tar 解压到 staging 失败（现网未受影响）: ' + (extractRes.stderr || '未知错误'));
+      throw new Error('Не удалось распаковать tar в staging (рабочее окружение не пострадало): ' + (extractRes.stderr || 'неизвестная ошибка'));
     }
 
     const stagedDsh = path.join(stagingRoot, '.dsh');
     if (!fs.existsSync(stagedDsh)) {
       fs.rmSync(stagingRoot, { recursive: true, force: true });
-      throw new Error('快照内容异常：未找到 .dsh 目录，已中止（现网未受影响）');
+      throw new Error('Некорректное содержимое снимка: каталог .dsh не найден, работа прервана (рабочее окружение не пострадало)');
     }
 
-    // 3.0 沙箱清扫（第二道防线）：config-only 模式下若 staging 里仍存在 DATA_ENTRIES 或 node_modules，强行 rmSync 清理
+    // 3.0 Уборка песочницы (второй рубеж защиты): если в режиме config-only в staging всё ещё
+    //     есть DATA_ENTRIES или node_modules — принудительно удаляем их через rmSync
     if (mode === 'config-only') {
-      // 策略：不向全新环境引入快照中的旧 storages/workspace.json。
-      // 理由：在 config-only 模式下会话数据被完全排除，旧 workspace.json 中记录的 sessionIds 等索引在没有对应会话文件时会成为死索引，由 DSH 自行初始化空白的 workspace.json 更加安全干净。
+      // Политика: не переносить в новое окружение старый storages/workspace.json из снимка.
+      // Обоснование: в режиме config-only данные сессий полностью исключаются, поэтому
+      // индексы вида sessionIds из старого workspace.json без соответствующих файлов сессий
+      // превратились бы в «мёртвые» ссылки; безопаснее и чище, чтобы DSH сам инициализировал
+      // пустой workspace.json.
       for (const entry of DATA_ENTRIES) {
         const p = path.join(stagedDsh, entry);
         if (fs.existsSync(p)) {
@@ -908,48 +983,57 @@ async function restoreBackup(filename, dshManager, opts = {}) {
       }
     }
 
-    // 快照刻意排除了网关自有的 gateway.config.json（含 authToken）与 .session_secret，这里从现网带过去
+    // Снимок намеренно не содержит собственные gateway.config.json шлюза (содержит authToken)
+    // и .session_secret — переносим их из текущего рабочего окружения
     for (const keep of ['gateway.config.json', '.session_secret']) {
       const cur = path.join(DSH_DIR, keep);
       if (fs.existsSync(cur)) { try { fs.copyFileSync(cur, path.join(stagedDsh, keep)); } catch {} }
     }
 
-    // 3.1 Issue #9：自动把"逃出归档根"的相对软链改写为等价绝对软链（仅限白名单目标）。
-    //     全程在 staging 内、原子切换之前完成，现网完全不受影响；用户无需任何额外操作。
+    // 3.1 Issue #9: автоматически переписываем относительные симлинки, «выползающие за корень
+    //     архива», в эквивалентные абсолютные (только цели из белого списка).
+    //     Всё происходит внутри staging до атомарного переключения — рабочее окружение не
+    //     затрагивается вовсе; от пользователя никаких действий не требуется.
     const linkRepair = repairEscapingRelativeLinks(stagedDsh);
     if (linkRepair.repaired > 0) {
-      console.log(`[backup-service] 已自动修复老快照中的相对软链 ${linkRepair.repaired} 条（保持原样 ${linkRepair.kept} 条）`);
+      console.log(`[backup-service] Автоматически исправлено относительных симлинков в старом снимке: ${linkRepair.repaired} (оставлено как есть: ${linkRepair.kept})`);
       for (const s of linkRepair.samples) console.log(`[backup-service]   · ${s}`);
     }
 
-    // 记录 staging 中的所有条目，供切换或探活失败时精确逆向回滚
+    // Записываем все элементы из staging — для точного обратного отката при переключении
+    // или неудачной проверке готовности
     stagedItems = listAllRelPaths(stagedDsh);
 
-    // 4. 原子切换：注意 /root/.dsh 是 Docker 卷挂载点，整体 rename 会 EBUSY，
-    //    因此改为"逐子项搬移"——现网内容先搬到回滚点（config-only 时数据目录和 node_modules 原地保留），再把 staging 内容搬入。
+    // 4. Атомарное переключение: учтите, /root/.dsh — точка монтирования тома Docker,
+    //    поэтому целиком rename даст EBUSY; вместо этого выполняем «перенос поэлементно» —
+    //    содержимое рабочего окружения сначала уезжает в точку отката (в режиме config-only
+    //    каталоги данных и node_modules остаются на месте), затем переезжает содержимое staging.
     try {
-      moveChildren(DSH_DIR, rollbackRoot, isPreserved); // 现网 → 回滚点 (保留项跳过不搬)
-      moveChildren(stagedDsh, DSH_DIR, () => false);     // staging → 现网
-      console.log(`[backup-service] 配置已原子切换（旧配置备份于 ${rollbackRoot}，成功后自动清理）`);
+      moveChildren(DSH_DIR, rollbackRoot, isPreserved); // рабочее окружение → точка отката (сохранённое не переносим)
+      moveChildren(stagedDsh, DSH_DIR, () => false);     // staging → рабочее окружение
+      console.log(`[backup-service] Конфигурация переключена атомарно (старая сохранена в ${rollbackRoot} и будет удалена после успеха)`);
     } catch (switchErr) {
       try {
         rollback();
       } catch (rb) {
-        console.error('[backup-service] 切换失败后的即时回滚异常:', rb.message);
+        console.error('[backup-service] Ошибка немедленного отката после неудачного переключения:', rb.message);
       }
-      throw new Error('配置切换失败，已回滚到原配置: ' + switchErr.message);
+      throw new Error('Не удалось переключить конфигурацию, выполнен откат к прежней: ' + switchErr.message);
     } finally {
       fs.rmSync(stagingRoot, { recursive: true, force: true });
     }
 
     const webProfileDir = path.join(DSH_DIR, 'profiles', 'web');
 
-    // 5. 若解压后 node_modules 为空（轻量清单备份），自动依据 package.json 补全
-    // 仅当切换后现网 profiles/web/node_modules 缺失时才走 pnpm install（config-only 原地保留了 node_modules，不会误触发）
+    // 5. Если после распаковки node_modules пуст (лёгкий манифест резервной копии) —
+    //    автоматически достраиваем зависимости по package.json.
+    //    Переход к pnpm install выполняется только если после переключения в рабочем
+    //    окружении нет profiles/web/node_modules (в config-only node_modules сохранён на месте,
+    //    поэтому ложное срабатывание исключено)
     const targetNodeModules = path.join(webProfileDir, 'node_modules');
     const targetPkgJson = path.join(webProfileDir, 'package.json');
     if (fs.existsSync(targetPkgJson) && (!fs.existsSync(targetNodeModules) || fs.readdirSync(targetNodeModules).length === 0)) {
-      console.log('[backup-service] 检测到快照未包含完整的 node_modules，正在通过 pnpm 自动补全依赖...');
+      console.log('[backup-service] Обнаружен неполный node_modules в снимке, автоматически достраиваем зависимости через pnpm...');
       await new Promise(resolve => {
         const pnpmInstall = spawn('pnpm', ['install', '--no-frozen-lockfile'], {
           cwd: webProfileDir,
@@ -960,7 +1044,7 @@ async function restoreBackup(filename, dshManager, opts = {}) {
       });
     }
 
-    // 6. 执行权限自愈与补丁
+    // 6. Восстановление прав доступа и применение патчей
     try {
       if (fs.existsSync(DSH_DIR)) fs.chmodSync(DSH_DIR, 0o700);
       const credPath = path.join(DSH_DIR, '.credentials.yaml');
@@ -980,17 +1064,17 @@ async function restoreBackup(filename, dshManager, opts = {}) {
       });
     }
 
-    // 7. 重新拉起 DSH 并真实验证就绪状态
+    // 7. Поднимаем DSH заново и по-настоящему проверяем готовность
     let dshReady = false;
     if (dshManager && typeof dshManager.boot === 'function') {
       const bootRes = await dshManager.boot();
       dshReady = bootRes.ok === true;
       if (!dshReady) {
-        throw new Error('快照解压完成，但 DSH 启动超时或未能成功就绪，请在终端查看日志');
+        throw new Error('Распаковка снимка завершена, но DSH не успел запуститься или не стал готовым, подробности — в журнале в терминале');
       }
     }
 
-    // 成功：清理回滚点
+    // Успех: удаляем точку отката
     try { fs.rmSync(rollbackRoot, { recursive: true, force: true }); } catch {}
 
     const preservedCount = mode === 'config-only'
@@ -999,26 +1083,27 @@ async function restoreBackup(filename, dshManager, opts = {}) {
       : 0;
 
     if (mode === 'config-only') {
-      console.log(`[backup-service] 快照 ${safeFilename} 还原完成 (模式: ${mode}，已保留 ${preservedCount} 项数据/依赖目录)，DSH 服务就绪状态: ${dshReady}`);
+      console.log(`[backup-service] Снимок ${safeFilename} восстановлен (режим: ${mode}, сохранено каталогов данных/зависимостей: ${preservedCount}), готовность службы DSH: ${dshReady}`);
     } else {
-      console.log(`[backup-service] 快照 ${safeFilename} 还原完成 (模式: ${mode})，DSH 服务就绪状态: ${dshReady}`);
+      console.log(`[backup-service] Снимок ${safeFilename} восстановлен (режим: ${mode}), готовность службы DSH: ${dshReady}`);
     }
 
     return { ok: true, filename: safeFilename, mode, dshReady, repairedLinks: linkRepair.repaired };
   } catch (err) {
-    // 失败：若已切换过且回滚点仍在，尽力恢复还原前的配置并重新拉起
+    // Неудача: если переключение уже выполнялось и точка отката ещё существует —
+    // стараемся вернуть конфигурацию до восстановления и снова поднять службу
     try {
       if (rollbackRoot && fs.existsSync(rollbackRoot)) {
         rollback();
         if (dshManager && typeof dshManager.boot === 'function') {
           await dshManager.boot().catch(() => {});
         }
-        console.log('[backup-service] 已回滚到还原前的配置');
+        console.log('[backup-service] Выполнен откат к конфигурации до восстановления');
       }
     } catch (rbErr) {
-      console.error('[backup-service] 回滚失败:', rbErr.message);
+      console.error('[backup-service] Откат не удался:', rbErr.message);
     }
-    console.error('[backup-service] 快照还原异常:', err.message);
+    console.error('[backup-service] Ошибка восстановления снимка:', err.message);
     throw err;
   } finally {
     activeTask = null;
@@ -1026,13 +1111,16 @@ async function restoreBackup(filename, dshManager, opts = {}) {
 }
 
 /**
- * 异步流式接收导入快照文件 (.tar.gz)
+ * Асинхронный потоковый приём импортируемого файла снимка (.tar.gz)
  */
 function importBackupStream(req, rawFilename) {
-  // 反模式修复：原 `new Promise(async executor)` 中任何抛出都会变成未处理的 rejection，
-  // 导致该 Promise 永不 settle。改为「同步 executor + 异步实现函数」，异常统一走 reject。
+  // Исправление антипаттерна: любое исключение внутри прежнего `new Promise(async executor)`
+  // превращалось в необработанный отказ, из-за чего Promise никогда не завершался.
+  // Теперь — «синхронный executor + асинхронная функция реализации», исключения единообразно
+  // уходят в reject.
   return new Promise((resolve, reject) => {
-    // 同理：只用 catch 兜住实现函数抛出的异常，不采用其返回值（实现函数会自行 resolve/reject）
+    // Аналогично: catch перехватывает исключения только функции реализации, её возвращаемое
+    // значение не используется (сама функция делает resolve/reject)
     Promise.resolve()
       .then(() => importBackupStreamImpl(req, rawFilename, resolve, reject))
       .catch(reject);
@@ -1041,7 +1129,7 @@ function importBackupStream(req, rawFilename) {
 
 async function importBackupStreamImpl(req, rawFilename, resolve, reject) {
     if (activeTask) {
-      return reject(new Error(`当前正在执行 ${activeTask.label} 操作，请稍候再试`));
+      return reject(new Error(`Сейчас выполняется операция «${activeTask.label}», повторите позже`));
     }
 
     const origName = path.basename(rawFilename || 'imported-snapshot.tar.gz');
@@ -1051,16 +1139,17 @@ async function importBackupStreamImpl(req, rawFilename, resolve, reject) {
     const finalPath = path.join(SNAPSHOTS_DIR, filename);
     const tmpPath = path.join(SNAPSHOTS_DIR, `.${filename}.tmp`);
 
-    activeTask = { type: 'import', label: '导入快照', startedAt: Date.now() };
-    console.log(`[backup-service] 接收流式上传导入快照: ${filename}...`);
+    activeTask = { type: 'import', label: 'импорт снимка', startedAt: Date.now() };
+    console.log(`[backup-service] Принимаем потоковую загрузку импортируемого снимка: ${filename}...`);
 
     const outStream = fs.createWriteStream(tmpPath);
-    // 磁盘写满 / 权限变化时 WriteStream 会 emit 'error'，无监听即为未捕获异常 → 整个网关退出
+    // При переполнении диска / изменении прав WriteStream излучает 'error'; без слушателя
+    // это необработанное исключение → завершается весь шлюз
     outStream.on('error', (e) => {
       aborted = true;
       try { req.destroy(); } catch {}
       cleanup();
-      reject(new Error('写入快照文件失败: ' + e.message));
+      reject(new Error('Не удалось записать файл снимка: ' + e.message));
     });
     let totalBytes = 0;
     let headerBytes = Buffer.alloc(0);
@@ -1076,16 +1165,16 @@ async function importBackupStreamImpl(req, rawFilename, resolve, reject) {
       if (aborted) return;
       totalBytes += chunk.length;
 
-      // 检查大小上限
+      // Проверка лимита размера
       if (totalBytes > MAX_UPLOAD_BYTES) {
         aborted = true;
         req.destroy();
         outStream.destroy();
         cleanup();
-        return reject(new Error('上传文件超过大小限制 (最大 300MB)'));
+        return reject(new Error('Размер загруженного файла превышает лимит (максимум 300 МБ)'));
       }
 
-      // 快速检查 Gzip 魔数 (1f 8b)
+      // Быстрая проверка магии Gzip (1f 8b)
       if (!headerChecked) {
         headerBytes = Buffer.concat([headerBytes, chunk]);
         if (headerBytes.length >= 2) {
@@ -1095,7 +1184,7 @@ async function importBackupStreamImpl(req, rawFilename, resolve, reject) {
             req.destroy();
             outStream.destroy();
             cleanup();
-            return reject(new Error('无效的文件格式，仅支持 .tar.gz 压缩归档'));
+            return reject(new Error('Некорректный формат файла, поддерживается только сжатый архив .tar.gz'));
           }
         }
       }
@@ -1117,18 +1206,19 @@ async function importBackupStreamImpl(req, rawFilename, resolve, reject) {
         try {
           if (totalBytes < 100) {
             cleanup();
-            return reject(new Error('上传文件为空或数据不完整'));
+            return reject(new Error('Загруженный файл пуст или данные неполны'));
           }
 
-          // 归档完整性 + 成员白名单二次校验（不合法则丢弃，不转正）
+          // Повторная проверка целостности архива и белого списка элементов
+          // (некорректный файл отбрасывается и не превращается в снимок)
           await validateArchiveMembers(tmpPath);
 
-          // 原子更名转正
+          // Атомарное переименование в итоговое имя
           fs.renameSync(tmpPath, finalPath);
           const stat = fs.statSync(finalPath);
-          console.log(`[backup-service] 成功导入快照: ${filename} (${(stat.size / 1024 / 1024).toFixed(2)} MB)`);
+          console.log(`[backup-service] Снимок успешно импортирован: ${filename} (${(stat.size / 1024 / 1024).toFixed(2)} МБ)`);
 
-          // 异步推断并写入元数据 sidecar（不阻塞上传响应）
+          // Асинхронно выводим и записываем sidecar метаданных (не блокирует ответ на загрузку)
           inspectArchive(finalPath, { filename, snapshotsDir: SNAPSHOTS_DIR }).catch(() => {});
 
           resolve({
@@ -1173,7 +1263,8 @@ function listBackups() {
             }
           }
         } catch {}
-        // 优先使用 sidecar 元数据记录的真实类型；仅在 sidecar 缺失时按文件名弱提示兜底
+        // Предпочитаем реальный тип из метаданных sidecar; подсказка по имени файла —
+        // только запасной вариант, если sidecar отсутствует
         if (!backupType) {
           backupType = (filename.startsWith('dsh-config-') || filename.includes('-config-') || filename.includes('_config_'))
             ? 'config'
@@ -1183,7 +1274,7 @@ function listBackups() {
         return {
           filename,
           type: isConfig ? 'config' : 'full',
-          typeLabel: isConfig ? '仅配置 (无会话)' : '完整备份',
+          typeLabel: isConfig ? 'Только конфигурация (без сессий)' : 'Полная резервная копия',
           sizeBytes: stat.size,
           sizeFormatted: `${(stat.size / 1024 / 1024).toFixed(2)} MB`,
           createdAt: stat.mtime.toISOString(),
@@ -1207,9 +1298,11 @@ function listBackups() {
 }
 
 /**
- * 流式扫描快照归档成员，判定是否包含会话目录 (.dsh/sessions) 与附件目录 (.dsh/attachments)
- * 当两者均判定存在时立即提前终止 tar 进程，尽可能降低大归档检视耗时与 I/O 消耗。
- * @param {string} archivePath 归档绝对路径
+ * Потоковое сканирование элементов архива снимка: определяется наличие каталога сессий
+ * (.dsh/sessions) и каталога вложений (.dsh/attachments). Как только оба подтверждены,
+ * процесс tar немедленно завершается досрочно — так осмотр больших архивов требует
+ * меньше времени и меньше нагружает диск.
+ * @param {string} archivePath абсолютный путь к архиву
  * @returns {Promise<{ hasSessions: boolean, hasAttachments: boolean }>}
  */
 function scanArchiveContents(archivePath) {
@@ -1264,9 +1357,10 @@ function scanArchiveContents(archivePath) {
 }
 
 /**
- * 统计当前系统运行目录 (DSH_DIR/sessions) 下的会话数量
- * 遵循真实结构：/root/.dsh/sessions/<workspaceId>/<sessionId> 或直接存储的 session 目录
- * @param {string} sessionsDir sessions 根目录绝对路径
+ * Подсчёт числа сессий в текущем каталоге выполнения службы (DSH_DIR/sessions)
+ * Следуем реальной структуре: /root/.dsh/sessions/<workspaceId>/<sessionId>
+ * либо каталог сессии, хранящийся напрямую
+ * @param {string} sessionsDir абсолютный путь к корневому каталогу sessions
  * @returns {number}
  */
 function countCurrentSessions(sessionsDir) {
@@ -1276,12 +1370,12 @@ function countCurrentSessions(sessionsDir) {
     const entries = fs.readdirSync(sessionsDir, { withFileTypes: true });
     for (const ent of entries) {
       if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
-      // 若直接以 session- 开头，计为单个会话
+      // Начинается с session- — считаем одной сессией
       if (ent.name.startsWith('session-')) {
         count++;
         continue;
       }
-      // 否则为 workspace 目录，遍历统计内部会话子目录
+      // Иначе это каталог рабочей области — обходим и считаем вложенные каталоги сессий
       const subDir = path.join(sessionsDir, ent.name);
       try {
         const subEntries = fs.readdirSync(subDir, { withFileTypes: true });
@@ -1296,25 +1390,27 @@ function countCurrentSessions(sessionsDir) {
 }
 
 /**
- * 只读探测快照属性（供恢复范围选择弹窗决策）
- * 返回快照是否含会话/附件、基于内容的快照类型、以及当前环境会话数
- * @param {string} filename 快照文件名
+ * Только чтение: осмотр свойств снимка (для диалога выбора объёма восстановления)
+ * Возвращаются наличие сессий/вложений в снимке, тип снимка по содержимому
+ * и число сессий в текущем окружении
+ * @param {string} filename имя файла снимка
  */
 async function inspectSnapshot(filename) {
   const safeFilename = path.basename(filename || '');
   if (!safeFilename.endsWith('.tar.gz') || safeFilename.includes('..')) {
-    return { ok: false, error: '非法快照文件名' };
+    return { ok: false, error: 'Недопустимое имя файла снимка' };
   }
   const filePath = path.join(SNAPSHOTS_DIR, safeFilename);
   if (!fs.existsSync(filePath)) {
-    return { ok: false, error: '快照文件不存在: ' + safeFilename };
+    return { ok: false, error: 'Файл снимка не найден: ' + safeFilename };
   }
 
   const { hasSessions, hasAttachments } = await scanArchiveContents(filePath);
   const backupType = hasSessions ? 'full' : 'config';
   const sessionCount = countCurrentSessions(path.join(DSH_DIR, 'sessions'));
 
-  // 顺带打标或更新 sidecar，使后续 listBackups 也能 O(1) 准确感知推断出的 backupType
+  // Заодно помечаем или обновляем sidecar, чтобы последующий listBackups тоже мог за O(1)
+  // точно знать выведенный backupType
   try {
     const sc = readSidecar(SNAPSHOTS_DIR, safeFilename);
     const stat = fs.statSync(filePath);
@@ -1354,7 +1450,7 @@ function deleteBackup(filename) {
   try {
     const safeFilename = path.basename(filename || '');
     if (!safeFilename.endsWith('.tar.gz') || safeFilename.includes('..')) {
-      return { ok: false, error: '非法文件名' };
+      return { ok: false, error: 'Недопустимое имя файла' };
     }
     const filePath = path.join(SNAPSHOTS_DIR, safeFilename);
     if (fs.existsSync(filePath)) {
@@ -1362,7 +1458,7 @@ function deleteBackup(filename) {
       try { removeSidecar(SNAPSHOTS_DIR, safeFilename); } catch {}
       return { ok: true };
     }
-    return { ok: false, error: '快照文件不存在' };
+    return { ok: false, error: 'Файл снимка не найден' };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -1387,7 +1483,8 @@ module.exports = {
   getActiveTask,
   isBusy,
   validateArchiveMembers,
-  // 供回归测试直接做单元级断言（解析单行 / 单条路径 / 老快照相对软链自动修复）
+  // Для регрессионных тестов: поуровневые проверки (разбор одной строки / одного пути
+  // и автоматический ремонт относительных симлинков в старых снимках)
   classifyArchiveMemberLine,
   assertSafeMemberPath,
   repairEscapingRelativeLinks,

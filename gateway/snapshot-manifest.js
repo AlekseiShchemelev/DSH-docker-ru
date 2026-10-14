@@ -1,18 +1,24 @@
 'use strict';
 /**
- * snapshot-manifest.js — 快照版本元数据（Snapshot Manifest）参考实现
+ * snapshot-manifest.js — эталонная реализация манифеста версии снимка (Snapshot Manifest)
  * ---------------------------------------------------------------------------
- * 目标：让每一个配置快照都自带「它是哪个 DSH 引擎版本 / 哪一代配置模型下产生的」
- * 这一事实，从而在还原前即可完成版本兼容性判定，而不必先解压几百 MB 归档。
+ * Цель: чтобы каждый снимок конфигурации сам нес в себе факт «под какой версией DSH-движка /
+ * в каком поколении модели конфигурации он был создан», что позволяет определить совместимость
+ * версий до восстановления, не распаковывая предварительно архив в несколько сотен МБ.
  *
- * 设计要点（详见 doc/design/snapshot-version-manifest.md）：
- *  1. 元数据作为普通文件成员 `.dsh/.dsh-meta/snapshot.json` 打进归档，位于 `.dsh/` 之下，
- *     因此现有 validateArchiveMembers() 白名单无需放宽即可通过（fail-closed 不变）。
- *  2. 该成员被放在归档**首位**，`tar -xzOf --occurrence=1` 可近乎 O(1) 读取。
- *  3. 同时落一份隐藏 sidecar `.<filename>.meta.json`，listBackups() 免解压即可列出。
- *  4. 对无元数据的历史旧快照，按结构（settings.yaml vs cordis.patch.yml）智能推断。
+ * Ключевые проектные решения (подробнее — в doc/design/snapshot-version-manifest.md):
+ *  1. Метаданные упаковываются в архив как обычный файл-участник `.dsh/.dsh-meta/snapshot.json`
+ *     под каталогом `.dsh/`, поэтому существующий белый список validateArchiveMembers()
+ *     не приходится расширять (принцип fail-closed сохраняется).
+ *  2. Этот участник помещается в архив **первым**, что позволяет читать его почти за O(1)
+ *     через `tar -xzOf --occurrence=1`.
+ *  3. Дописывается также скрытый sidecar `.<filename>.meta.json`, который listBackups()
+ *     может перечислять без распаковки архива.
+ *  4. Для старых снимков без метаданных поколение умно выводится по структуре
+ *     (settings.yaml против cordis.patch.yml).
  *
- * 本模块为纯逻辑 + 最小 tar 依赖，便于单元测试；不 require backup-service，避免循环依赖。
+ * Модуль содержит чистую логику и минимальную зависимость от tar; удобен для юнит-тестов;
+ * не требует backup-service, чтобы избежать циклической зависимости.
  */
 
 const fs = require('fs');
@@ -20,30 +26,30 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
-// ── 常量 ──────────────────────────────────────────────────────────────────
-/** Manifest JSON 自身的格式版本（字段增删时 +1；与 DSH 版本无关） */
+// ── Константы ─────────────────────────────────────────────────────────────
+/** Версия формата самого JSON-манифеста (+1 при добавлении/удалении полей; не связана с версией DSH) */
 const MANIFEST_SCHEMA_VERSION = 1;
-/** 归档内成员路径（位于 .dsh/ 之下，白名单天然放行） */
+/** Путь участника внутри архива (под .dsh/ — белый список пропускает естественно) */
 const MANIFEST_MEMBER = '.dsh/.dsh-meta/snapshot.json';
-/** 归档内专属目录（archive-owned，live 树不应长期保留） */
+/** Служебный каталог внутри архива (принадлежит архиву; не должен долго храниться в живом дереве) */
 const MANIFEST_DIR_IN_DSH = '.dsh-meta';
-/** sidecar 命名：隐藏文件，天然被 listBackups 的 `!f.startsWith('.')` 过滤 */
+/** Именование sidecar: скрытый файл, естественно отфильтровывается listBackups через `!f.startsWith('.')` */
 const SIDECAR_SUFFIX = '.meta.json';
 const SIDECAR_PREFIX = '.';
 
-/** 配置模型「世代」——版本兼容判定的核心轴 */
+/** «Поколение» модели конфигурации — основная ось оценки совместимости версий */
 const CONFIG_SCHEMA = Object.freeze({
-  SETTINGS_FILE: 1, // <= 0.1.6.x：$DSH_HOME/.dsh/settings.yaml（dsh-settings-file 后端）
-  PATCH_LAYER: 2    // >= 0.1.7.x：profile cordis.patch.yml + Home 级 cordis.patch.yml
+  SETTINGS_FILE: 1, // <= 0.1.6.x: $DSH_HOME/.dsh/settings.yaml (бэкенд dsh-settings-file)
+  PATCH_LAYER: 2    // >= 0.1.7.x: profile cordis.patch.yml + cordis.patch.yml уровня Home
 });
 const CONFIG_MODEL_LABEL = Object.freeze({
   1: 'settings-file',
   2: 'patch-layer'
 });
-/** 世代切换的分水岭版本（官方 0.1.7-alpha.1 引入 Settings 子系统 / Home patch 层） */
+/** Версия-водораздел смены поколений (в официальном 0.1.7-alpha.1 введена подсистема Settings / слой Home patch) */
 const PATCH_LAYER_EPOCH = '0.1.7-alpha.1';
 
-// ── SemVer（自包含，语义与 version-service.js 保持一致） ────────────────────
+// ── SemVer (самодостаточная реализация, семантика совпадает с version-service.js) ─────────
 function parseSemver(v = '') {
   const clean = String(v).replace(/^v/, '').trim();
   const [main, pre] = clean.split('-');
@@ -68,7 +74,7 @@ function sameMajorMinor(a, b) {
   const p2 = parseSemver(b);
   return p1.major === p2.major && p1.minor === p2.minor;
 }
-/** 由引擎版本推断配置模型世代 */
+/** Вывод поколения модели конфигурации по версии движка */
 function configSchemaForDshVersion(dshVersion) {
   if (!isValidSemver(dshVersion)) return null;
   return compareSemver(dshVersion, PATCH_LAYER_EPOCH) >= 0
@@ -76,7 +82,7 @@ function configSchemaForDshVersion(dshVersion) {
     : CONFIG_SCHEMA.SETTINGS_FILE;
 }
 
-// ── 极小 tar 封装（异步、带超时与输出上限，避免阻塞事件循环 / 内存打满） ──────
+// ── Минимальная обёртка над tar (асинхронная, с таймаутом и ограничением вывода, чтобы не блокировать цикл событий / не забивать память) ──────
 function runTarAsync(args, options = {}) {
   const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 60 * 1000;
   const maxOutputBytes = Number(options.maxOutputBytes) > 0 ? Number(options.maxOutputBytes) : 8 * 1024 * 1024;
@@ -90,7 +96,7 @@ function runTarAsync(args, options = {}) {
       if (settled) return;
       settled = true;
       try { child.kill('SIGKILL'); } catch {}
-      reject(new Error(`tar 超时(${Math.round(timeoutMs / 1000)}s): tar ${args.join(' ')}`));
+      reject(new Error(`Превышен таймаут tar (${Math.round(timeoutMs / 1000)} с): tar ${args.join(' ')}`));
     }, timeoutMs);
     if (timer.unref) timer.unref();
     const onData = (chunk, isErr) => {
@@ -100,7 +106,7 @@ function runTarAsync(args, options = {}) {
         settled = true;
         clearTimeout(timer);
         try { child.kill('SIGKILL'); } catch {}
-        reject(new Error('tar 输出超限（可能是损坏/异常归档）'));
+        reject(new Error('Превышен лимит вывода tar (возможно, повреждённый или аномальный архив)'));
         return;
       }
       if (isErr) stderr += chunk.toString('utf8');
@@ -113,7 +119,7 @@ function runTarAsync(args, options = {}) {
   });
 }
 
-/** 读取归档内的 manifest 成员（manifest 位于首位时近乎 O(1)） */
+/** Чтение участника-манифеста из архива (почти за O(1), если манифест расположен первым) */
 async function readManifestFromArchive(archivePath) {
   const res = await runTarAsync(
     ['-xzOf', archivePath, '--occurrence=1', MANIFEST_MEMBER],
@@ -127,14 +133,14 @@ async function readManifestFromArchive(archivePath) {
   }
 }
 
-/** 列出归档成员（仅用于旧快照推断 / 诊断，成本较高，务必配合 sidecar 缓存） */
+/** Перечисление участников архива (только для вывода о старых снимках / диагностики; дорого — обязательно использовать кэш sidecar) */
 async function listMembers(archivePath) {
   const res = await runTarAsync(['-tzf', archivePath], { timeoutMs: 300 * 1000, maxOutputBytes: 64 * 1024 * 1024 });
-  if (res.code !== 0) throw new Error('无法列出归档成员: ' + (res.stderr || '未知错误'));
+  if (res.code !== 0) throw new Error('Не удалось перечислить участники архива: ' + (res.stderr || 'неизвестная ошибка'));
   return res.stdout.split('\n').map(s => s.replace(/\s+$/, '')).filter(Boolean);
 }
 
-/** 从归档中抽取单个成员到内存（用于读 profiles/web/package.json 等小文件） */
+/** Извлечение одного участника архива в память (для чтения небольших файлов вроде profiles/web/package.json) */
 async function readMemberFromArchive(archivePath, member) {
   const res = await runTarAsync(
     ['-xzOf', archivePath, '--occurrence=1', member],
@@ -143,9 +149,10 @@ async function readMemberFromArchive(archivePath, member) {
   return res.code === 0 ? res.stdout : null;
 }
 
-// ── Manifest 构建 ─────────────────────────────────────────────────────────
+// ── Сборка манифеста ─────────────────────────────────────────────────────────
 /**
- * 规范化 JSON（键排序、去空白），用于稳定 hash：同一逻辑内容 → 同一指纹。
+ * Канонический JSON (сортировка ключей, удаление лишних пробелов) для стабильного хеша:
+ * одно и то же логическое содержимое → один и тот же отпечаток.
  */
 function canonicalJson(obj) {
   const walk = v => {
@@ -165,7 +172,7 @@ function sha256Hex(input) {
 }
 
 /**
- * 组装 manifest（不含自指纹；由 finalizeManifest 补齐）。
+ * Сборка манифеста (без собственного отпечатка; его добавляет finalizeManifest).
  * @param {object} ctx
  */
 function buildManifest(ctx = {}) {
@@ -177,42 +184,42 @@ function buildManifest(ctx = {}) {
   const projectVersion = ctx.projectVersion || null;
 
   return {
-    // —— 身份与来源 ——
+    // —— Идентичность и происхождение ——
     manifestVersion: MANIFEST_SCHEMA_VERSION,
     generator: 'deepseek-harness-docker/gateway/backup-service',
-    generatorVersion: projectVersion,                 // 套件（项目）版本
-    dockerSuiteVersion: projectVersion,               // 显式别名，便于前端/文档直读
-    imageRevision: ctx.imageRevision || null,         // 如 proj0.1.8-dsh0.1.7-rc.1
-    // —— 版本轴 ——
-    dshVersion,                                        // 产生该快照时实际运行的 DSH 引擎版本
+    generatorVersion: projectVersion,                 // версия комплекта (проекта)
+    dockerSuiteVersion: projectVersion,               // явный псевдоним для удобного чтения из фронтенда/документации
+    imageRevision: ctx.imageRevision || null,         // например proj0.1.8-dsh0.1.7-rc.1
+    // —— Ось версий ——
+    dshVersion,                                        // версия DSH-движка, реально работавшая в момент создания снимка
     dshVersionSource: ctx.dshVersionSource || 'unknown', // package.json|probe|cli|fallback|injected|unknown
-    schemaVersion,                                     // 配置模型世代（1=settings-file, 2=patch-layer）
+    schemaVersion,                                     // поколение модели конфигурации (1=settings-file, 2=patch-layer)
     configModel: CONFIG_MODEL_LABEL[schemaVersion] || 'unknown',
-    // —— 归档属性 ——
+    // —— Свойства архива ——
     backupType: ctx.backupType === 'config' ? 'config' : 'full',
     createdAt: now.toISOString(),
     createdAtEpochMs: now.getTime(),
     name: ctx.name || '',
-    // —— 兼容区间（快照产生时刻的供应链声明，作为「历史事实」留档） ——
+    // —— Диапазон совместимости (заявление цепочки поставок на момент создания снимка, сохраняется как «исторический факт») ——
     compatibilityRange: ctx.compatibilityRange || null,
-    // —— 内容指纹（用于快速判断「里面有没有某个配置文件」） ——
+    // —— Отпечаток содержимого (для быстрой проверки «есть ли там определённый файл конфигурации») ——
     contents: ctx.contents || null,
-    // —— 宿主环境（跨机还原排障） ——
+    // —— Окружение хоста (диагностика при восстановлении на другой машине) ——
     host: ctx.host || null,
-    // —— 归档统计（可选，创建后回填到 sidecar） ——
+    // —— Статистика архива (необязательно, заполняется в sidecar после создания) ——
     archive: ctx.archive || null,
-    // —— 完整性 ——
+    // —— Целостность ——
     filesHash: {
       algorithm: 'sha256',
-      manifestSelfHash: null,   // finalize 时补齐
-      configTreeHash: null,     // 可选：配置树摘要（异步计算）
+      manifestSelfHash: null,   // заполняется в finalize
+      configTreeHash: null,     // необязательно: сводка дерева конфигурации (вычисляется асинхронно)
       fileCount: ctx.fileCount ?? null,
       totalBytes: ctx.totalBytes ?? null
     }
   };
 }
 
-/** 计算并写入 manifest 自指纹（覆盖除 manifestSelfHash 之外的全部字段） */
+/** Вычисление и запись собственного отпечатка манифеста (перекрывает все поля, кроме manifestSelfHash) */
 function finalizeManifest(manifest) {
   const clone = JSON.parse(JSON.stringify(manifest));
   clone.filesHash.manifestSelfHash = null;
@@ -221,18 +228,18 @@ function finalizeManifest(manifest) {
   return manifest;
 }
 
-/** 校验 manifest 自指纹（损坏/被篡改检测） */
+/** Проверка собственного отпечатка манифеста (обнаружение повреждения/подделки) */
 function verifyManifest(manifest) {
-  if (!manifest || typeof manifest !== 'object') return { ok: false, reason: 'manifest 缺失或非对象' };
+  if (!manifest || typeof manifest !== 'object') return { ok: false, reason: 'манифест отсутствует или не является объектом' };
   const expect = manifest.filesHash && manifest.filesHash.manifestSelfHash;
   const clone = JSON.parse(JSON.stringify(manifest));
   clone.filesHash.manifestSelfHash = null;
   const actual = sha256Hex(canonicalJson(clone));
-  if (!expect) return { ok: false, reason: '缺少 manifestSelfHash' };
-  return expect === actual ? { ok: true } : { ok: false, reason: 'manifestSelfHash 不匹配（内容被改动）' };
+  if (!expect) return { ok: false, reason: 'отсутствует manifestSelfHash' };
+  return expect === actual ? { ok: true } : { ok: false, reason: 'manifestSelfHash не совпадает (содержимое изменено)' };
 }
 
-// ── sidecar 缓存（listBackups 免解压的关键） ────────────────────────────────
+// ── Кэш sidecar (ключ к работе listBackups без распаковки) ────────────────────────
 function sidecarPath(snapshotsDir, filename) {
   return path.join(snapshotsDir, `${SIDECAR_PREFIX}${filename}${SIDECAR_SUFFIX}`);
 }
@@ -270,17 +277,18 @@ function removeSidecar(snapshotsDir, filename) {
   }
 }
 
-/** sidecar 是否仍然对应当前归档文件（大小 + mtime 双重比对，防止文件被替换后缓存失真） */
+/** Соответствует ли sidecar всё ещё текущему файлу архива (двойное сравнение размера + mtime, чтобы кэш не устаревал после замены файла) */
 function sidecarIsFresh(sidecar, stat) {
   if (!sidecar || !sidecar.archive) return false;
   return Number(sidecar.archive.sizeBytes) === Number(stat.size)
     && Number(sidecar.archive.mtimeMs) === Math.floor(stat.mtimeMs);
 }
 
-// ── 旧快照版本推断 ─────────────────────────────────────────────────────────
+// ── Вывод версии для старых снимков ─────────────────────────────────────────────────
 /**
- * 依据归档成员结构推断快照的版本与世代。
- * 这是「存量旧快照」向后兼容的核心：无需元数据也能给出可用结论 + 置信度。
+ * Вывод версии и поколения снимка по структуре его участников.
+ * Это ядро обратной совместимости для «существующих старых снимков»:
+ * вывод доступен даже без метаданных, с указанием достоверности.
  */
 function inferFromMembers(members, filename = '') {
   const set = new Set(members.map(m => m.replace(/\/+$/, '')));
@@ -298,24 +306,25 @@ function inferFromMembers(members, filename = '') {
   let schemaVersion = null;
   let confidence = 'low';
 
-  // 信号 1（最强）：cordis.patch.yml / settings.yaml.imported 是 0.1.7+ 独有产物
+  // Признак 1 (самый сильный): cordis.patch.yml / settings.yaml.imported — продукты, характерные только для 0.1.7+
   if (hasHomePatch || hasSettingsImported) {
     schemaVersion = CONFIG_SCHEMA.PATCH_LAYER;
     confidence = 'high';
-    signals.push(hasSettingsImported ? '存在 settings.yaml.imported（0.1.7+ 一次性迁移产物）'
-      : '存在 Home 级 cordis.patch.yml（0.1.7+ 补丁层）');
+    signals.push(hasSettingsImported ? 'присутствует settings.yaml.imported (одноразовый продукт миграции из 0.1.7+)'
+      : 'присутствует cordis.patch.yml уровня Home (слой патчей из 0.1.7+)');
   } else if (hasSettingsYaml) {
     schemaVersion = CONFIG_SCHEMA.SETTINGS_FILE;
     confidence = 'high';
-    signals.push('存在 settings.yaml 且无 cordis.patch.yml（0.1.6 及以前 settings-file 模型）');
+    signals.push('присутствует settings.yaml и отсутствует cordis.patch.yml (модель settings-file из 0.1.6 и раньше)');
   } else if (hasProfilesDir) {
-    // 无强标记：按 profiles 目录结构 + 文件名兜底
+    // Нет сильных признаков: используем структуру каталога profiles/ и имя файла как слабую подсказку
     schemaVersion = null;
     confidence = 'low';
-    signals.push('仅见 profiles/ 目录，无法判定世代');
+    signals.push('обнаружен только каталог profiles/ — поколение определить нельзя');
   }
 
-  // 快照类型判定：基于内容事实优先（含会话为 full，无会话为 config）；文件名仅在无成员时作兜底弱提示
+  // Определение типа снимка: в первую очередь по фактическому содержимому (есть сессии — full, нет сессий — config);
+  // имя файла служит лишь слабой подсказкой, если участников нет вовсе
   const backupType = (members && members.length > 0)
     ? (hasSessions ? 'full' : 'config')
     : (/(^|[-_])config([-_]|\.)/.test(filename) ? 'config' : 'full');
@@ -327,17 +336,17 @@ function inferFromMembers(members, filename = '') {
     backupType,
     schemaVersion,
     configModel: CONFIG_MODEL_LABEL[schemaVersion] || 'unknown',
-    dshVersion: null,                    // 结构推断只能给世代，给不出精确版本
+    dshVersion: null,                    // структурный вывод даёт только поколение, но не точную версию
     dshVersionRange: schemaVersion === CONFIG_SCHEMA.PATCH_LAYER ? `>=${PATCH_LAYER_EPOCH}`
       : schemaVersion === CONFIG_SCHEMA.SETTINGS_FILE ? `<${PATCH_LAYER_EPOCH}` : null,
     contents: { hasSettingsYaml, hasSettingsImported, hasCordisPatchYml: hasHomePatch, hasProfilesDir, hasSessions, hasCredentials }
   };
 }
 
-// ── 归档检视（listBackups / inspect API 共用） ──────────────────────────────
+// ── Инспекция архива (общая для listBackups / API инспекции) ──────────────────────────────
 /**
- * 读取快照元数据：sidecar 优先 → 归档内 manifest → 结构推断。
- * 结果会被写入 sidecar，使后续调用 O(1)。
+ * Чтение метаданных снимка: sidecar → манифест внутри архива → структурный вывод.
+ * Результат записывается в sidecar, чтобы последующие вызовы работали за O(1).
  * @returns {Promise<object>} { filename, meta, metaSource, confidence, verified, archive }
  */
 async function inspectArchive(archivePath, opts = {}) {
@@ -346,7 +355,7 @@ async function inspectArchive(archivePath, opts = {}) {
   const stat = fs.statSync(archivePath);
   const archive = { sizeBytes: stat.size, mtimeMs: Math.floor(stat.mtimeMs) };
 
-  // 1) sidecar 命中（且新鲜）
+  // 1) попадание в sidecar (и он актуален)
   if (!opts.force) {
     const sc = readSidecar(snapshotsDir, filename);
     if (sidecarIsFresh(sc, stat) && sc.meta) {
@@ -354,7 +363,7 @@ async function inspectArchive(archivePath, opts = {}) {
     }
   }
 
-  // 2) 归档内 manifest
+  // 2) манифест внутри архива
   let meta = null;
   let metaSource = 'none';
   let confidence = 'none';
@@ -368,9 +377,9 @@ async function inspectArchive(archivePath, opts = {}) {
       const v = verifyManifest(inline);
       verified = v.ok;
     }
-  } catch { /* 归档损坏时退化为推断 */ }
+  } catch { /* при повреждении архива откатываемся к выводу по структуре */ }
 
-  // 3) 结构推断（历史旧快照）
+  // 3) структурный вывод (старые снимки)
   if (!meta) {
     try {
       const members = await listMembers(archivePath);
@@ -398,14 +407,14 @@ async function inspectArchive(archivePath, opts = {}) {
   return { filename, ...payload, fromCache: false };
 }
 
-// ── 版本兼容性判定 ─────────────────────────────────────────────────────────
+// ── Оценка совместимости версий ─────────────────────────────────────────────────
 /**
- * 判定「把该快照还原到当前系统」的风险等级。
+ * Определение уровня риска «восстановить этот снимок в текущую систему».
  *
- * @param {object} snapshotMeta  快照 manifest（可为推断结果）
+ * @param {object} snapshotMeta  манифест снимка (может быть результатом вывода)
  * @param {object} current       { dshVersion, schemaVersion, projectVersion }
- * @param {object} [opts]        { rules } version.json 的 compatibility.rules（单一数据源）
- * @returns {object} verdict
+ * @param {object} [opts]        { rules } compatibility.rules из version.json (единый источник данных)
+ * @returns {object} вердикт
  */
 function assessCompatibility(snapshotMeta, current, opts = {}) {
   const snapVer = snapshotMeta && snapshotMeta.dshVersion;
@@ -421,17 +430,17 @@ function assessCompatibility(snapshotMeta, current, opts = {}) {
     if ((w[lv] || 0) > (w[level] || 0)) level = lv;
   };
 
-  // 1) 版本号缺失 → 未知，必须显式确认
+  // 1) версия отсутствует → неизвестно, требуется явное подтверждение
   if (!isValidSemver(snapVer) || !isValidSemver(curVer)) {
     code = 'UNKNOWN_VERSION';
     bump('unknown');
     messages.push({
       level: 'unknown',
-      title: '无法确定快照 DSH 版本',
+      title: 'Не удалось определить версию DSH снимка',
       message: snapshotMeta && snapshotMeta.inferred
-        ? `该快照不含版本元数据，仅按结构推断（置信度 ${snapshotMeta.inference?.confidence || 'low'}）。` +
-          `${snapshotMeta.inference?.dshVersionRange ? `推断适用区间：${snapshotMeta.inference.dshVersionRange}。` : ''}请确认后再还原。`
-        : `快照或当前系统的 DSH 版本无法解析（快照=${snapVer || '未知'}，当前=${curVer || '未知'}）。`,
+        ? `В снимке нет метаданных версии, выполнен только структурный вывод (достоверность ${snapshotMeta.inference?.confidence || 'low'}).` +
+          `${snapshotMeta.inference?.dshVersionRange ? ` Выведенный применимый диапазон: ${snapshotMeta.inference.dshVersionRange}.` : ''} Подтвердите перед восстановлением.`
+        : `Не удалось разобрать версию DSH снимка или текущей системы (снимок=${snapVer || 'неизвестно'}, текущая=${curVer || 'неизвестно'}).`,
       action: 'acknowledge'
     });
   } else {
@@ -441,64 +450,64 @@ function assessCompatibility(snapshotMeta, current, opts = {}) {
 
     if (cmp === 0) {
       code = 'EXACT_MATCH';
-      messages.push({ level: 'ok', title: '版本完全一致', message: `快照与当前系统同为 v${curVer}，还原风险最低。` });
+      messages.push({ level: 'ok', title: 'Версии полностью совпадают', message: `Снимок и текущая система имеют одинаковую версию v${curVer} — риск восстановления минимален.` });
     } else if (sp.major === cp.major && sp.minor === cp.minor) {
       code = 'PATCH_DIFF';
       bump('info');
-      messages.push({ level: 'info', title: '同主次版本（补丁差异）', message: `快照 v${snapVer} 与当前 v${curVer} 属同一主次版本，配置模型一致，通常可直接还原。` });
+      messages.push({ level: 'info', title: 'Одна major.minor-версия (различия только в патчах)', message: `Снимок v${snapVer} и текущая v${curVer} относятся к одной major.minor-версии, модель конфигурации совпадает — обычно можно восстанавливать напрямую.` });
     } else if (sp.major === cp.major) {
-      // 同主版本、次版本不同：跨世代风险由 schema 轴进一步升级
+      // одна major-версия, разные minor: риск перехода между поколениями дополнительно повышается по оси schema
       code = cmp < 0 ? 'MINOR_DOWNGRADE' : 'MINOR_UPGRADE';
       bump('warning');
       messages.push({
         level: 'warning',
-        title: cmp < 0 ? '跨次版本降级' : '跨次版本升级',
-        message: `快照 v${snapVer} 与当前 v${curVer} 次版本不同${cmp < 0 ? '（降级）' : '（升级）'}，可能存在配置字段增删，还原后请复核设置。`
+        title: cmp < 0 ? 'Понижение minor-версии' : 'Повышение minor-версии',
+        message: `Снимок v${snapVer} и текущая v${curVer} различаются minor-версией${cmp < 0 ? ' (понижение)' : ' (повышение)'} — возможны добавления/удаления полей конфигурации; после восстановления проверьте настройки.`
       });
     } else {
       code = 'MAJOR_DIFF';
       bump('danger');
       messages.push({
         level: 'danger',
-        title: '主版本不一致',
-        message: `快照 v${snapVer} 与当前 v${curVer} 主版本不同，官方底层架构/协议可能已重构，还原后配置未必被识别。`
+        title: 'Major-версии не совпадают',
+        message: `Снимок v${snapVer} и текущая v${curVer} различаются major-версией — базовая архитектура/протокол официально могли быть переработаны, конфигурация после восстановления может не распознаваться.`
       });
     }
   }
 
-  // 2) 配置模型世代轴（比版本号更贴近「配置能否被读取」）
+  // 2) ось поколения модели конфигурации (ближе к вопросу «прочитается ли конфигурация», чем номер версии)
   if (snapSchema != null && curSchema != null && snapSchema !== curSchema) {
     code = code === 'UNKNOWN_VERSION' ? code : 'SCHEMA_ERA_CROSS';
     if (snapSchema > curSchema) {
-      // 新世代快照 → 旧世代系统：cordis.patch.yml 会被忽略 → 配置丢失
+      // снимок нового поколения → система старого поколения: cordis.patch.yml будет проигнорирован → потеря конфигурации
       bump('danger');
       messages.push({
         level: 'danger',
-        title: '配置模型不兼容（新→旧）',
-        message: `快照使用 ${CONFIG_MODEL_LABEL[snapSchema]}（${snapSchema}）模型，当前系统为 ${CONFIG_MODEL_LABEL[curSchema]}（${curSchema}）模型；` +
-          `旧引擎不识别 cordis.patch.yml，还原后补丁层配置将失效。建议升级 DSH 至 >= ${PATCH_LAYER_EPOCH} 后再还原。`
+        title: 'Модели конфигурации несовместимы (новая → старая)',
+        message: `Снимок использует модель ${CONFIG_MODEL_LABEL[snapSchema]} (${snapSchema}), текущая система — ${CONFIG_MODEL_LABEL[curSchema]} (${curSchema}); ` +
+          `старый движок не распознаёт cordis.patch.yml, после восстановления конфигурация слоя патчей станет неактуальной. Рекомендуется повысить DSH до >= ${PATCH_LAYER_EPOCH} перед восстановлением.`
       });
     } else {
-      // 旧世代快照 → 新世代系统：settings.yaml 会被一次性导入并改名
+      // снимок старого поколения → система нового поколения: settings.yaml будет одноразово импортирован и переименован
       bump('warning');
       messages.push({
         level: 'warning',
-        title: '配置模型跨代（旧→新，一次性导入）',
-        message: `快照为 ${CONFIG_MODEL_LABEL[snapSchema]}（${snapSchema}）模型，当前为 ${CONFIG_MODEL_LABEL[curSchema]}（${curSchema}）模型；` +
-          `旧 settings.yaml 会在 DSH 启动时被导入一次并改名为 settings.yaml.imported，导入后以补丁层为权威。`
+        title: 'Переход между поколениями модели конфигурации (старая → новая, одноразовый импорт)',
+        message: `Снимок относится к модели ${CONFIG_MODEL_LABEL[snapSchema]} (${snapSchema}), текущая — ${CONFIG_MODEL_LABEL[curSchema]} (${curSchema}); ` +
+          `старый settings.yaml будет импортирован один раз при запуске DSH и переименован в settings.yaml.imported, после импорта авторитетным становится слой патчей.`
       });
     }
   }
 
-  // 3) 复用 version.json 的官方兼容规则（单一数据源，避免规则漂移）
+  // 3) переиспользование официальных правил совместимости из version.json (единый источник данных, чтобы правила не расходились)
   const rules = Array.isArray(opts.rules) ? opts.rules : [];
   if (isValidSemver(snapVer)) {
     const sev = { danger: 3, warning: 2, info: 1 };
     for (const rule of [...rules].sort((a, b) => (sev[b.level] || 0) - (sev[a.level] || 0))) {
       if (matchSemverPattern(snapVer, rule.pattern)) {
         bump(rule.level === 'danger' ? 'danger' : rule.level === 'warning' ? 'warning' : 'info');
-        messages.push({ level: rule.level || 'warning', title: rule.title || '版本兼容性提示', message: rule.message || '', action: rule.action || '' });
-        break; // 命中最高危规则即止
+        messages.push({ level: rule.level || 'warning', title: rule.title || 'Подсказка о совместимости версии', message: rule.message || '', action: rule.action || '' });
+        break; // останавливаемся на первом (наиболее опасном) совпавшем правиле
       }
     }
   }
@@ -528,11 +537,11 @@ function matchSemverPattern(ver, pattern) {
   return compareSemver(ver, p) === 0;
 }
 
-// ── 单文件配置的版本标识（gateway.config.json / cordis.patch.yml） ──────────
+// ── Идентификатор версии для одиночных файлов конфигурации (gateway.config.json / cordis.patch.yml) ──────────
 const YAML_STAMP_BEGIN = '# >>> dsh-snapshot-meta (auto-generated, do not edit) >>>';
 const YAML_STAMP_END = '# <<< dsh-snapshot-meta <<<';
 
-/** 生成要写入配置文件的版本戳（精简版，避免污染配置语义） */
+/** Генерация версионного штампа для записи в файл конфигурации (сокращённая версия, чтобы не засорять семантику конфигурации) */
 function buildFileStamp(ctx = {}) {
   return {
     dshVersion: ctx.dshVersion || null,
@@ -544,20 +553,21 @@ function buildFileStamp(ctx = {}) {
   };
 }
 
-/** 给 JSON 配置对象打戳（幂等：覆盖旧的 _snapshotMeta） */
+/** Наложение штампа на объект JSON-конфигурации (идемпотентно: перезаписывает старый _snapshotMeta) */
 function stampJsonConfig(obj, stamp) {
   if (!obj || typeof obj !== 'object') return obj;
-  return { ...obj, _snapshotMeta: { ...buildFileStamp(stamp), note: 'DSH 套件写入的版本标识，供备份/还原兼容性判定使用' } };
+  return { ...obj, _snapshotMeta: { ...buildFileStamp(stamp), note: 'Идентификатор версии, записанный комплектом DSH; используется для оценки совместимости при резервном копировании/восстановлении' } };
 }
 
-/** 读取 JSON 配置里的版本戳 */
+/** Чтение версионного штампа из JSON-конфигурации */
 function readJsonStamp(obj) {
   return obj && typeof obj === 'object' && obj._snapshotMeta ? obj._snapshotMeta : null;
 }
 
 /**
- * 给 YAML 文本打戳：以**注释块**形式置于文件头部。
- * 注释不参与 YAML 解析，因此不改变任何配置语义；幂等（先删旧块再写新块）。
+ * Наложение штампа на текст YAML: в виде **блока комментариев** в начале файла.
+ * Комментарии не участвуют в разборе YAML, поэтому семантика конфигурации не меняется;
+ * операция идемпотентна (старый блок удаляется перед записью нового).
  */
 function stampYamlText(text, stamp) {
   const body = String(text ?? '').replace(/\r\n/g, '\n');
@@ -592,7 +602,7 @@ function escapeRe(s) {
 }
 
 module.exports = {
-  // 常量
+  // константы
   MANIFEST_SCHEMA_VERSION,
   MANIFEST_MEMBER,
   MANIFEST_DIR_IN_DSH,
@@ -611,7 +621,7 @@ module.exports = {
   readManifestFromArchive,
   listMembers,
   readMemberFromArchive,
-  // manifest
+  // манифест
   canonicalJson,
   sha256Hex,
   buildManifest,
@@ -623,12 +633,12 @@ module.exports = {
   writeSidecarAtomic,
   removeSidecar,
   sidecarIsFresh,
-  // 推断 / 检视
+  // вывод / инспекция
   inferFromMembers,
   inspectArchive,
-  // 兼容判定
+  // оценка совместимости
   assessCompatibility,
-  // 配置戳
+  // штампы конфигурации
   buildFileStamp,
   stampJsonConfig,
   readJsonStamp,

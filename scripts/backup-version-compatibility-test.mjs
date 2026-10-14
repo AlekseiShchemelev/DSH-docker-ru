@@ -1,14 +1,14 @@
 /**
  * backup-version-compatibility-test.mjs
  * 
- * DSH 配置快照与版本兼容性全场景端到端自动化验证套件
+ * Полный комплекс сквозной автоматической проверки совместимости конфигурационных снимков DSH с версиями
  * 
- * 覆盖用例：
- * 1. 测试用例 1：带版本标记的完整快照创建，验证元数据正确注入归档与外部元数据文件；
- * 2. 测试用例 2：无版本标记的旧版快照兼容性智能推断测试；
- * 3. 测试用例 3：跨版本还原版本对比 API 检查；
- * 4. 测试用例 4：故意构造损坏/对抗元数据测试防御性容错；
- * 5. 测试用例 5：模拟探活失败触发原子回滚，验证原版本配置与网关凭据 100% 完整保留。
+ * Покрытые кейсы:
+ * 1. Тест 1: создание полного снимка с версионной меткой, проверка корректной инъекции метаданных в архив и внешний файл метаданных;
+ * 2. Тест 2: проверка интеллектуального вывода совместимости старых снимков без версионной метки;
+ * 3. Тест 3: проверка API сравнения версий при восстановлении между версиями;
+ * 4. Тест 4: умышленно сконструированные повреждённые/враждебные метаданные — проверка оборонительной устойчивости;
+ * 5. Тест 5: имитация сбоя проверки активности с запуском атомарного отката, проверка 100% сохранности конфигурации прежней версии и учётных данных шлюза.
  */
 
 import { createRequire } from 'node:module';
@@ -22,11 +22,11 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-// 引入现有安全工具
+// Подключение существующих утилит безопасности
 const { isValidVersion } = require(path.join(here, '../gateway/dsh-version.js'));
 const { validateArchiveMembers } = require(path.join(here, '../gateway/backup-service.js'));
 
-// 测试临时工作区
+// Временное рабочее пространство теста
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-compat-test-'));
 let passCount = 0;
 let failCount = 0;
@@ -56,46 +56,46 @@ function calcSha256(contentOrPath) {
 }
 
 // =========================================================================
-// 【核心设计实现组件：元数据管理器、指纹推断引擎与兼容性评估器】
+// 【Ключевые компоненты реализации: менеджер метаданных, движок вывода по отпечатку и оценщик совместимости】
 // =========================================================================
 
 /**
- * 元数据安全解析器（防原型污染、防超大文件、严格字段校验）
+ * Безопасный парсер метаданных (защита от прототипной инъекции, защита от сверхбольших файлов, строгая проверка полей)
  */
 function parseSafeMetadata(rawString) {
   if (!rawString || typeof rawString !== 'string') {
-    throw new Error('元数据内容为空或非字符串');
+    throw new Error('Содержимое метаданных пустое или не строка');
   }
   if (rawString.length > 512 * 1024) {
-    throw new Error('元数据文件大小超出安全上限 (512KB)');
+    throw new Error('Размер файла метаданных превышает безопасный предел (512KB)');
   }
 
   let parsed;
   try {
     parsed = JSON.parse(rawString, (key, value) => {
       if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
-        return undefined; // 消除原型污染
+        return undefined; // устранение прототипной инъекции
       }
       return value;
     });
   } catch (err) {
-    throw new Error(`元数据 JSON 格式解析损坏: ${err.message}`);
+    throw new Error(`Формат JSON метаданных повреждён: ${err.message}`);
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('元数据根节点必须为合法 JSON 对象');
+    throw new Error('Корневой узел метаданных должен быть корректным объектом JSON');
   }
 
-  // 严格版本号与字段清洗
+  // Строгая очистка номера версии и полей
   if (parsed.dshVersion && !isValidVersion(parsed.dshVersion)) {
-    throw new Error(`元数据中包含非法的 DSH 版本号: ${String(parsed.dshVersion).slice(0, 32)}`);
+    throw new Error(`Метаданные содержат недопустимый номер версии DSH: ${String(parsed.dshVersion).slice(0, 32)}`);
   }
 
   return parsed;
 }
 
 /**
- * 内容特征指纹分类器：基于文件物理结构智能推断真实 DSH 版本
+ * Классификатор по отпечатку содержимого: интеллектуальный вывод реальной версии DSH по физической структуре файлов
  */
 function inferSnapshotStructure(dshDir) {
   const hasCordisPatch = fs.existsSync(path.join(dshDir, 'cordis.patch.yml'));
@@ -108,7 +108,7 @@ function inferSnapshotStructure(dshDir) {
       inferredDshVersion: '>=0.1.7',
       structureType: 'cordis-patch',
       confidence: 'high',
-      notes: '检测到 cordis 补丁层或 profile 结构，符合 DSH 0.1.7+ 现代架构'
+      notes: 'Обнаружен слой патчей cordis или структура профилей, соответствует современной архитектуре DSH 0.1.7+'
     };
   }
 
@@ -117,7 +117,7 @@ function inferSnapshotStructure(dshDir) {
       inferredDshVersion: '<=0.1.6',
       structureType: 'legacy-settings-yaml',
       confidence: 'high',
-      notes: '检测到仅存在旧版 settings.yaml，属于 DSH 0.1.6 之前架构'
+      notes: 'Обнаружен только старый settings.yaml, относится к архитектуре до DSH 0.1.6'
     };
   }
 
@@ -125,32 +125,32 @@ function inferSnapshotStructure(dshDir) {
     inferredDshVersion: 'unknown',
     structureType: 'minimal-or-empty',
     confidence: 'low',
-    notes: '未能识别明确的配置结构特征'
+    notes: 'Не удалось распознать явные признаки структуры конфигурации'
   };
 }
 
 /**
- * 跨版本兼容性评估引擎
+ * Движок оценки совместимости между версиями
  */
 function evaluateRestoreCompatibility(snapshotDshVer, systemDshVer) {
   if (!snapshotDshVer || snapshotDshVer === 'unknown') {
     return {
       status: 'warning',
       action: 'prompt-user',
-      message: '快照未标记明确版本，且无法从文件结构精确推断，建议还原前备份当前环境。'
+      message: 'Снимок не имеет явной версии, и её невозможно точно вывести из структуры файлов; рекомендуется сделать резервную копию текущего окружения перед восстановлением.'
     };
   }
 
-  // 架构断代拒绝 (例如 >=0.2.0)
+  // Отказ по разрыву архитектурных поколений (например, >=0.2.0)
   if (snapshotDshVer.startsWith('0.2.') || snapshotDshVer.startsWith('0.3.')) {
     return {
       status: 'blocked',
       action: 'reject',
-      message: `快照版本 (${snapshotDshVer}) 属于跨大版本架构重构，当前容器环境无法兼容，请重建容器。`
+      message: `Версия снимка (${snapshotDshVer}) относится к архитектурной перестройке между крупными версиями, текущее окружение контейнера несовместимо; пересоздайте контейнер.`
     };
   }
 
-  // 0.1.7 体系与 <=0.1.6 体系比对
+  // Сравнение системы 0.1.7 с системой <=0.1.6
   const isSnapLegacy = snapshotDshVer.includes('0.1.5') || snapshotDshVer.includes('0.1.6') || snapshotDshVer === '<=0.1.6';
   const isSysModern = systemDshVer.includes('0.1.7') || systemDshVer.includes('0.1.8');
 
@@ -158,7 +158,7 @@ function evaluateRestoreCompatibility(snapshotDshVer, systemDshVer) {
     return {
       status: 'upgrade_compatible',
       action: 'auto-migrate-settings',
-      message: `快照为旧版 (${snapshotDshVer})，还原后 DSH 将自动把 settings.yaml 导入迁移至补丁层并更名为 settings.yaml.imported。`
+      message: `Снимок старый (${snapshotDshVer}), после восстановления DSH автоматически мигрирует импорт settings.yaml в слой патчей и переименует его в settings.yaml.imported.`
     };
   }
 
@@ -169,37 +169,37 @@ function evaluateRestoreCompatibility(snapshotDshVer, systemDshVer) {
     return {
       status: 'danger',
       action: 'warn-downgrade',
-      message: `严重警告：试图将 0.1.7+ 高版本快照还原到低版本系统 (${systemDshVer})！低版本无法解析 cordis.patch.yml 补丁且无法读取 V4 会话数据。`
+      message: `Серьёзное предупреждение: попытка восстановить снимок высокой версии 0.1.7+ на систему низкой версии (${systemDshVer})! Низкая версия не может разобрать патчи cordis.patch.yml и не может прочитать данные сессий V4.`
     };
   }
 
   return {
     status: 'compatible',
     action: 'allow',
-    message: `快照版本 (${snapshotDshVer}) 与当前系统 (${systemDshVer}) 完全兼容。`
+    message: `Версия снимка (${snapshotDshVer}) полностью совместима с текущей системой (${systemDshVer}).`
   };
 }
 
 // =========================================================================
-// 【测试执行流程】
+// 【Процесс выполнения тестов】
 // =========================================================================
 
 async function runAllTests() {
   console.log('======================================================================');
-  console.log('🚀 开始执行 DSH 配置快照与版本兼容性自动化验证测试套件');
+  console.log('🚀 Запуск автоматизированного набора проверки совместимости конфигурационных снимков DSH с версиями');
   console.log('======================================================================\n');
 
   // -------------------------------------------------------------------------
-  // 用例 1：带版本标记的完整快照创建
+  // Тест 1: создание полного снимка с версионной меткой
   // -------------------------------------------------------------------------
-  console.log('📌 【测试用例 1】：带版本标记的完整快照创建与双重元数据注入');
+  console.log('📌 【Тест 1】: создание полного снимка с версионной меткой и двойная инъекция метаданных');
   {
     const mockDsh = path.join(TEST_ROOT, 'case1-dsh', '.dsh');
     fs.mkdirSync(path.join(mockDsh, 'profiles', 'web'), { recursive: true });
     fs.writeFileSync(path.join(mockDsh, 'cordis.patch.yml'), 'services:\n  dshmarket: true\n');
     fs.writeFileSync(path.join(mockDsh, 'profiles', 'web.json'), '{"plugins":{}}\n');
     
-    // 敏感文件（必须在打包时被排除）
+    // Чувствительные файлы (обязательно исключаются при упаковке)
     fs.writeFileSync(path.join(mockDsh, 'gateway.config.json'), '{"authToken":"secret-token-123"}\n');
     fs.writeFileSync(path.join(mockDsh, '.session_secret'), 'mock-session-secret-data\n');
 
@@ -216,13 +216,13 @@ async function runAllTests() {
       }
     };
 
-    // 内部注入元数据
+    // Внутренняя инъекция метаданных
     fs.writeFileSync(path.join(mockDsh, '.snapshot-meta.json'), JSON.stringify(meta, null, 2));
 
     const archiveTar = path.join(TEST_ROOT, 'case1-snapshot.tar.gz');
     const sidecarMeta = path.join(TEST_ROOT, 'case1-snapshot.meta.json');
 
-    // 打包并严格排除敏感网关文件
+    // Упаковка со строгим исключением чувствительных файлов шлюза
     const tarRes = runTar([
       '-czf', archiveTar,
       '--exclude=.dsh/gateway.config.json',
@@ -231,9 +231,9 @@ async function runAllTests() {
       '.dsh'
     ], TEST_ROOT);
 
-    assert(tarRes.status === 0, '快照归档 tar.gz 成功生成');
+    assert(tarRes.status === 0, 'архив снимка tar.gz успешно создан');
 
-    // 写入外部 sidecar
+    // Запись внешнего sidecar-файла
     const sidecarData = {
       ...meta,
       archiveChecksum: calcSha256(archiveTar),
@@ -241,23 +241,23 @@ async function runAllTests() {
     };
     fs.writeFileSync(sidecarMeta, JSON.stringify(sidecarData, null, 2));
 
-    assert(fs.existsSync(sidecarMeta), '外部元数据 sidecar 文件 (.meta.json) 正确落地');
+    assert(fs.existsSync(sidecarMeta), 'внешний sidecar-файл метаданных (.meta.json) корректно размещён');
 
-    // 校验归档内部成员
+    // Проверка членов внутри архива
     const inspectRes = runTar(['-tzf', archiveTar], TEST_ROOT);
     const members = inspectRes.stdout.split('\n');
 
-    assert(members.includes('.dsh/.snapshot-meta.json'), '归档内部正确嵌入 .dsh/.snapshot-meta.json 元数据文件');
-    assert(!members.includes('.dsh/gateway.config.json'), '归档内部严格排除了 gateway.config.json 敏感文件');
-    assert(!members.includes('.dsh/.session_secret'), '归档内部严格排除了 .session_secret 签名密钥');
+    assert(members.includes('.dsh/.snapshot-meta.json'), 'внутрь архива корректно встроен файл метаданных .dsh/.snapshot-meta.json');
+    assert(!members.includes('.dsh/gateway.config.json'), 'из архива строго исключён чувствительный файл gateway.config.json');
+    assert(!members.includes('.dsh/.session_secret'), 'из архива строго исключён ключ подписи .session_secret');
   }
 
   console.log('\n----------------------------------------------------------------------');
 
   // -------------------------------------------------------------------------
-  // 用例 2：无版本标记的旧版快照兼容性智能推断测试
+  // Тест 2: проверка интеллектуального вывода совместимости старых снимков без версионной метки
   // -------------------------------------------------------------------------
-  console.log('📌 【测试用例 2】：无版本标记的旧版快照兼容性智能推断');
+  console.log('📌 【Тест 2】: интеллектуальный вывод совместимости старого снимка без версионной метки');
   {
     const legacyDsh = path.join(TEST_ROOT, 'case2-legacy', '.dsh');
     fs.mkdirSync(legacyDsh, { recursive: true });
@@ -266,118 +266,118 @@ async function runAllTests() {
     const legacyTar = path.join(TEST_ROOT, 'case2-legacy.tar.gz');
     runTar(['-czf', legacyTar, '-C', path.dirname(legacyDsh), '.dsh'], TEST_ROOT);
 
-    // 模拟解压到 staging 探测
+    // Имитация распаковки в staging для обнаружения
     const stagingDir = path.join(TEST_ROOT, 'case2-staging');
     fs.mkdirSync(stagingDir, { recursive: true });
     runTar(['-xzf', legacyTar, '-C', stagingDir], TEST_ROOT);
 
     const stagedDsh = path.join(stagingDir, '.dsh');
     const hasMeta = fs.existsSync(path.join(stagedDsh, '.snapshot-meta.json'));
-    assert(!hasMeta, '确认旧版快照确实无内置 .snapshot-meta.json 标记');
+    assert(!hasMeta, 'подтверждено, что в старом снимке действительно нет встроенного маркера .snapshot-meta.json');
 
     const inference = inferSnapshotStructure(stagedDsh);
-    assert(inference.inferredDshVersion === '<=0.1.6', `智能推断版本准确: ${inference.inferredDshVersion}`);
-    assert(inference.structureType === 'legacy-settings-yaml', `结构模型准确识别: ${inference.structureType}`);
+    assert(inference.inferredDshVersion === '<=0.1.6', `выведенная версия точна: ${inference.inferredDshVersion}`);
+    assert(inference.structureType === 'legacy-settings-yaml', `модель структуры корректно распознана: ${inference.structureType}`);
   }
 
   console.log('\n----------------------------------------------------------------------');
 
   // -------------------------------------------------------------------------
-  // 用例 3：跨版本还原版本对比 API 检查
+  // Тест 3: проверка API сравнения версий при восстановлении между версиями
   // -------------------------------------------------------------------------
-  console.log('📌 【测试用例 3】：跨版本还原版本对比与兼容性决策矩阵');
+  console.log('📌 【Тест 3】: сравнение версий при восстановлении между версиями и матрица решений совместимости');
   {
-    // 3.1 同版本还原
+    // 3.1 Восстановление той же версии
     const resSame = evaluateRestoreCompatibility('0.1.7-rc.2', '0.1.7-rc.2');
-    assert(resSame.status === 'compatible', '同版本还原研判为 compatible 放行');
+    assert(resSame.status === 'compatible', 'восстановление той же версии оценено как compatible и разрешено');
 
-    // 3.2 0.1.5 旧版向 0.1.7 新版升级还原
+    // 3.2 Восстановление со старой версии 0.1.5 на новую 0.1.7 (апгрейд)
     const resUpgrade = evaluateRestoreCompatibility('0.1.5-rc.1', '0.1.7-rc.2');
-    assert(resUpgrade.status === 'upgrade_compatible', '旧版向新版还原提示升级迁移 (upgrade_compatible)');
-    assert(resUpgrade.action === 'auto-migrate-settings', '正确指定配置导入迁移策略');
+    assert(resUpgrade.status === 'upgrade_compatible', 'восстановление со старой версии на новую сообщает о миграционном апгрейде (upgrade_compatible)');
+    assert(resUpgrade.action === 'auto-migrate-settings', 'корректно задана стратегия миграционного импорта конфигурации');
 
-    // 3.3 0.1.7 新版向 0.1.5 旧版降级还原（高危）
+    // 3.3 Восстановление с новой версии 0.1.7 на старую 0.1.5 (даунгрейд, высокий риск)
     const resDowngrade = evaluateRestoreCompatibility('0.1.7-rc.2', '0.1.5-rc.1');
-    assert(resDowngrade.status === 'danger', '高版本向低版本降级还原触发 danger 警告');
+    assert(resDowngrade.status === 'danger', 'даунгрейд с высокой версии на низкую вызывает предупреждение danger');
 
-    // 3.4 跨大版本重构还原 (0.2.0 -> 0.1.7)
+    // 3.4 Восстановление через крупную версионную перестройку (0.2.0 -> 0.1.7)
     const resBlock = evaluateRestoreCompatibility('0.2.0', '0.1.7-rc.2');
-    assert(resBlock.status === 'blocked', '跨大版本底层不兼容被严格阻断 (blocked)');
+    assert(resBlock.status === 'blocked', 'фундаментальная несовместимость между крупными версиями строго заблокирована (blocked)');
   }
 
   console.log('\n----------------------------------------------------------------------');
 
   // -------------------------------------------------------------------------
-  // 用例 4：故意构造损坏/对抗元数据测试防御性容错
+  // Тест 4: умышленно сконструированные повреждённые/враждебные метаданные — проверка оборонительной устойчивости
   // -------------------------------------------------------------------------
-  console.log('📌 【测试用例 4】：防御性容错（畸形/对抗元数据与内容冲突）');
+  console.log('📌 【Тест 4】: оборонительная устойчивость (некорректные/враждебные метаданные и конфликт содержимого)');
   {
-    // 4.1 畸形语法 JSON
+    // 4.1 Некорректный синтаксис JSON
     try {
       parseSafeMetadata('{ invalid_json: ');
-      assert(false, '畸形 JSON 应该被抛错拒绝');
+      assert(false, 'некорректный JSON должен быть отклонён исключением');
     } catch (e) {
-      assert(e.message.includes('JSON 格式解析损坏'), '畸形 JSON 被成功捕获并拦截');
+      assert(e.message.includes('Формат JSON метаданных повреждён'), 'некорректный JSON успешно пойман и перехвачен');
     }
 
-    // 4.2 原型污染对抗
+    // 4.2 Противодействие прототипной инъекции
     const evilProtoPayload = '{"__proto__": {"isAdmin": true}, "dshVersion": "0.1.7"}';
     const parsedObj = parseSafeMetadata(evilProtoPayload);
     const testEmpty = {};
-    assert(testEmpty.isAdmin === undefined, '原型污染攻击被彻底阻断');
-    assert(parsedObj.dshVersion === '0.1.7', '合法字段正常提取');
+    assert(testEmpty.isAdmin === undefined, 'атака прототипной инъекции полностью заблокирована');
+    assert(parsedObj.dshVersion === '0.1.7', 'легитимное поле извлекается в обычном режиме');
 
-    // 4.3 恶意注入版本号（路径遍历/Shell特殊符号）
+    // 4.3 Вредоносная инъекция в номер версии (обход пути/спецсимволы shell)
     try {
       parseSafeMetadata('{"dshVersion": "../../etc/passwd"}');
-      assert(false, '路径穿越版本号应被拒绝');
+      assert(false, 'номер версии с обходом пути должен быть отклонён');
     } catch (e) {
-      assert(e.message.includes('非法的 DSH 版本号'), '非法路径版本号被 isValidVersion 强校验成功拦截');
+      assert(e.message.includes('недопустимый номер версии DSH'), 'недопустимый путь в версии успешно перехвачен строгой проверкой isValidVersion');
     }
 
-    // 4.4 元数据与实际内容冲突冲突决策（元数据谎报 0.1.7，内容实为 0.1.5）
+    // 4.4 Разрешение конфликта между метаданными и фактическим содержимым (метаданные заявляют 0.1.7, содержимое на деле 0.1.5)
     const fakeDir = path.join(TEST_ROOT, 'case4-fake', '.dsh');
     fs.mkdirSync(fakeDir, { recursive: true });
-    fs.writeFileSync(path.join(fakeDir, 'settings.yaml'), 'a: 1\n'); // 仅有 0.1.5 文件
+    fs.writeFileSync(path.join(fakeDir, 'settings.yaml'), 'a: 1\n'); // есть только файл 0.1.5
     const claimedVer = '0.1.7';
     const struct = inferSnapshotStructure(fakeDir);
     
-    assert(struct.inferredDshVersion !== claimedVer, '检测到元数据声称版本与文件结构特征不匹配');
-    // 内容权威纠偏：以实际结构为主
+    assert(struct.inferredDshVersion !== claimedVer, 'обнаружено несоответствие между заявленной в метаданных версией и признаками структуры файлов');
+    // Коррекция по авторитету содержимого: приоритет фактической структуры
     const finalEffectiveVer = struct.inferredDshVersion === '<=0.1.6' ? '0.1.5' : claimedVer;
-    assert(finalEffectiveVer === '0.1.5', '纠偏决策器成功采纳「内容即真理」原则重写有效评估版本');
+    assert(finalEffectiveVer === '0.1.5', 'корректор успешно применил принцип «содержимое — истина» и переписал оценочную версию');
   }
 
   console.log('\n----------------------------------------------------------------------');
 
   // -------------------------------------------------------------------------
-  // 用例 5：模拟探活失败触发自动回滚，验证原版本配置完整保留
+  // Тест 5: имитация сбоя проверки активности с запуском атомарного отката, проверка сохранности конфигурации прежней версии
   // -------------------------------------------------------------------------
-  console.log('📌 【测试用例 5】：模拟探活失败触发原子回滚验证');
+  console.log('📌 【Тест 5】: проверка атомарного отката при имитации сбоя проверки активности');
   {
-    // 建立现网生产目录 (/root/.dsh 模拟)
+    // Создание продакшн-каталога (/root/.dsh в имитации)
     const liveDir = path.join(TEST_ROOT, 'case5-live-dsh');
     fs.mkdirSync(path.join(liveDir, 'profiles'), { recursive: true });
     fs.writeFileSync(path.join(liveDir, 'canary-live-token.txt'), 'LIVE_STATE_ORIGINAL_DATA_V1');
     fs.writeFileSync(path.join(liveDir, 'gateway.config.json'), '{"authToken":"keep-my-current-token-999"}\n');
     fs.writeFileSync(path.join(liveDir, '.session_secret'), 'original-crypto-session-secret\n');
 
-    // 制作坏版本快照（模拟有坏插件或启动超时的快照）
+    // Подготовка снимка плохой версии (имитация снимка с плохим плагином или таймаутом запуска)
     const badSource = path.join(TEST_ROOT, 'case5-bad-source', '.dsh');
     fs.mkdirSync(badSource, { recursive: true });
     fs.writeFileSync(path.join(badSource, 'corrupt-setting.txt'), 'BAD_STATE_V2');
     const badTar = path.join(TEST_ROOT, 'case5-bad.tar.gz');
     runTar(['-czf', badTar, '-C', path.dirname(badSource), '.dsh'], TEST_ROOT);
 
-    // 模拟原子恢复事务执行过程
+    // Имитация выполнения атомарной транзакции восстановления
     const stagingDir = path.join(liveDir, '.restore-staging');
     const rollbackDir = path.join(liveDir, '.restore-rollback');
     fs.mkdirSync(stagingDir, { recursive: true });
 
-    // 1. 解压到 staging
+    // 1. Распаковка в staging
     runTar(['-xzf', badTar, '-C', stagingDir], TEST_ROOT);
 
-    // 2. 穿透保留现网网关口令与 session_secret
+    // 2. Сквозное сохранение учётных данных шлюза и session_secret
     const stagedDsh = path.join(stagingDir, '.dsh');
     for (const file of ['gateway.config.json', '.session_secret']) {
       const src = path.join(liveDir, file);
@@ -386,7 +386,7 @@ async function runAllTests() {
       }
     }
 
-    // 3. 执行原子置换（现网移至 rollback，staging 移入现网）
+    // 3. Атомарная подмена (актуальное в rollback, staging в актуальное)
     const SKIP = new Set(['.restore-staging', '.restore-rollback']);
     fs.mkdirSync(rollbackDir, { recursive: true });
     for (const item of fs.readdirSync(liveDir)) {
@@ -399,16 +399,16 @@ async function runAllTests() {
     }
     fs.rmSync(stagingDir, { recursive: true, force: true });
 
-    assert(fs.existsSync(path.join(liveDir, 'corrupt-setting.txt')), '新坏版本已临时就位');
-    assert(!fs.existsSync(path.join(liveDir, 'canary-live-token.txt')), '原版本文件已移入回滚区');
+    assert(fs.existsSync(path.join(liveDir, 'corrupt-setting.txt')), 'новая плохая версия временно размещена');
+    assert(!fs.existsSync(path.join(liveDir, 'canary-live-token.txt')), 'файлы прежней версии перемещены в область отката');
 
-    // 4. 模拟启动就绪探活失败（Healthcheck Timeout）
-    const mockHealthcheck = () => false; // 模拟超时不就绪
+    // 4. Имитация сбоя проверки готовности после запуска (Healthcheck Timeout)
+    const mockHealthcheck = () => false; // имитация таймаута неготовности
     const isReady = mockHealthcheck();
 
     if (!isReady) {
-      console.log('   ⚠️ 模拟探活检测到 DSH 启动超时崩溃，正在触发原子灾难回滚...');
-      // 执行回滚
+      console.log('   ⚠️ Проверка активности обнаружила таймаут запуска DSH, запускается атомарный аварийный откат...');
+      // Выполнение отката
       for (const item of fs.readdirSync(liveDir)) {
         if (SKIP.has(item)) continue;
         fs.rmSync(path.join(liveDir, item), { recursive: true, force: true });
@@ -419,26 +419,26 @@ async function runAllTests() {
       fs.rmSync(rollbackDir, { recursive: true, force: true });
     }
 
-    // 5. 验证原状态 100% 恢复
+    // 5. Проверка 100% восстановления прежнего состояния
     const canaryRestored = fs.existsSync(path.join(liveDir, 'canary-live-token.txt')) &&
       fs.readFileSync(path.join(liveDir, 'canary-live-token.txt'), 'utf8') === 'LIVE_STATE_ORIGINAL_DATA_V1';
-    assert(canaryRestored, '原环境特征金丝雀文件 100% 完整复原');
+    assert(canaryRestored, 'канареечный файл признаков прежнего окружения восстановлен на 100%');
 
     const badRemoved = !fs.existsSync(path.join(liveDir, 'corrupt-setting.txt'));
-    assert(badRemoved, '导致故障的新版本文件已彻底从现网清除');
+    assert(badRemoved, 'файлы новой версии, вызвавшей сбой, полностью удалены из актуального окружения');
 
-    // 6. 验证网关口令与 session_secret 完好无损
+    // 6. Проверка целостности учётных данных шлюза и session_secret
     const tokenPreserved = JSON.parse(fs.readFileSync(path.join(liveDir, 'gateway.config.json'), 'utf8')).authToken === 'keep-my-current-token-999';
     const secretPreserved = fs.readFileSync(path.join(liveDir, '.session_secret'), 'utf8') === 'original-crypto-session-secret\n';
-    assert(tokenPreserved, '现网网关管理口令 (authToken) 穿透保留完好无损');
-    assert(secretPreserved, '现网 Cookie 签名密钥 (.session_secret) 穿透保留完好无损');
+    assert(tokenPreserved, 'учётные данные администрирования шлюза (authToken) сквозным образом сохранены без повреждений');
+    assert(secretPreserved, 'ключ подписи cookie (.session_secret) сквозным образом сохранён без повреждений');
   }
 
-  // 清理临时测试环境
+  // Очистка временного тестового окружения
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 
   console.log('\n======================================================================');
-  console.log(`🏁 自动化测试套件执行完毕: 通过 ${passCount} 项 / 失败 ${failCount} 项`);
+  console.log(`🏁 Выполнение автоматизированного набора тестов завершено: пройдено ${passCount} / провалено ${failCount}`);
   console.log('======================================================================');
 
   if (failCount > 0) {
@@ -447,6 +447,6 @@ async function runAllTests() {
 }
 
 runAllTests().catch(err => {
-  console.error('测试运行异常:', err);
+  console.error('Исключение при выполнении теста:', err);
   process.exit(1);
 });

@@ -1,10 +1,10 @@
 /**
- * S4 回归测试：patch-dsh-client.mjs 的"必需补丁未命中即失败"行为。
- * 用法: node scripts/patch-required-test.mjs
+ * S4 регрессионный тест: поведение «обязательный патч не применён → FATAL» в patch-dsh-client.mjs.
+ * Запуск: node scripts/patch-required-test.mjs
  *
- * 在沙箱目录里伪造一份最小 DSH 目录结构，验证：
- *   A. 锚点齐全 → 退出码 0，且标记全部命中
- *   B. 破坏 auth 锚点 → 退出码非 0，且打印 [FATAL]
+ * В каталоге-песочнице создаётся минимальная структура DSH, проверяется:
+ *   A. все якоря на месте → код выхода 0 и все маркеры применены
+ *   B. сломан якорь auth → код выхода не 0, и печатается [FATAL]
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -20,9 +20,9 @@ let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { console.log('   ✔ ' + m); pass++; } else { console.log('   ❌ ' + m); fail++; } };
 
 const LOOPBACK_SNIPPET = 'const x = isLoopbackHostname(pageLocation.hostname);';
-// 0.2.1-alpha.1 及更早签名
+// Сигнатура 0.2.1-alpha.1 и раньше
 const AUTH_SNIPPET = 'class C {\n\tisAuthenticated(request) {\n\t\treturn false;\n\t}\n}\n';
-// 0.2.1-alpha.2 起签名：新增 secure 参数（锚点必须兼容新旧两种形态）
+// Сигнатура с 0.2.1-alpha.2: добавлен параметр secure (якорь обязан быть совместим и со старым, и с новым видом)
 const AUTH_SNIPPET_NEW = 'class C {\n\tisAuthenticated(request, secure = false) {\n\t\treturn false;\n\t}\n}\n';
 const COMBO_SNIPPET = 'class R {\n\tbundleResource(method, url) {\n\t\tconst resourceUrl = url;\n\t\tconst response = this.responses.get(resourceUrl) ?? this.previousBatchResponses.get(resourceUrl) ?? this.chunkResponse(requestUrl);\n\t\treturn response;\n\t}\n}\n';
 
@@ -45,49 +45,50 @@ function runPatch(base) {
   return spawnSync('node', [SCRIPT], {
     env: {
       ...process.env,
-      // 只扫描沙箱目录，避免环境里其它（可能已打过补丁的）DSH 副本干扰判定
+      // Сканируем только каталог-песочницу, чтобы другие копии DSH из окружения
+      // (возможно уже пропатченные) не мешали оценке
       DSH_PATCH_ONLY_DIR: path.join(base, 'lib/node_modules/@deepseek-ai')
     },
     encoding: 'utf8'
   });
 }
 
-console.log('\n=== A. 锚点齐全 → 应成功 ===');
+console.log('\n=== A. Все якоря на месте → должен быть успех ===');
 const good = makeSandbox('good');
 const rA = runPatch(good);
-ok(rA.status === 0, `退出码为 0（实际 ${rA.status}）`);
-ok(/全部必需补丁已生效/.test(rA.stdout || ''), '输出包含"全部必需补丁已生效"');
-ok(/已应用=\[[^\]]*auth-bypass/.test(rA.stdout || ''), 'auth-bypass 被标记为已应用');
-ok(/已应用=\[[^\]]*combo-fallback/.test(rA.stdout || ''), 'combo-fallback 被标记为已应用');
-ok(/已应用=\[[^\]]*client-loopback/.test(rA.stdout || ''), 'client-loopback 被标记为已应用');
+ok(rA.status === 0, `код выхода 0 (факт ${rA.status})`);
+ok(/Все обязательные патчи применены/.test(rA.stdout || ''), 'вывод содержит «Все обязательные патчи применены»');
+ok(/применено=\[[^\]]*auth-bypass/.test(rA.stdout || ''), 'auth-bypass помечен применённым');
+ok(/применено=\[[^\]]*combo-fallback/.test(rA.stdout || ''), 'combo-fallback помечен применённым');
+ok(/применено=\[[^\]]*client-loopback/.test(rA.stdout || ''), 'client-loopback помечен применённым');
 
-console.log('\n=== B. 破坏 auth 锚点 → 应 FATAL 非零退出 ===');
+console.log('\n=== B. Сломан якорь auth → FATAL и ненулевой выход ===');
 const bad = makeSandbox('bad', { breakAuth: true });
 const rB = runPatch(bad);
 const rBOut = (rB.stdout || '') + (rB.stderr || '');
-ok(rB.status !== 0, `退出码非 0（实际 ${rB.status}）`);
-ok(/\[FATAL\]/.test(rBOut), '输出包含 [FATAL]');
-ok(/auth-bypass/.test(rBOut), '指出未命中的补丁名 auth-bypass');
+ok(rB.status !== 0, `код выхода не 0 (факт ${rB.status})`);
+ok(/\[FATAL\]/.test(rBOut), 'вывод содержит [FATAL]');
+ok(/auth-bypass/.test(rBOut), 'указано имя неприменённого патча auth-bypass');
 
-console.log('\n=== C. 0.2.1-alpha.2 新签名 isAuthenticated(request, secure = false) → 应成功 ===');
+console.log('\n=== C. Новая сигнатура 0.2.1-alpha.2 isAuthenticated(request, secure = false) → должен быть успех ===');
 const newer = makeSandbox('newer', { authSnippet: AUTH_SNIPPET_NEW });
 const rC = runPatch(newer);
-ok(rC.status === 0, `退出码为 0（实际 ${rC.status}）`);
-ok(/全部必需补丁已生效/.test(rC.stdout || ''), '输出包含"全部必需补丁已生效"');
-ok(/已应用=\[[^\]]*auth-bypass/.test(rC.stdout || ''), 'auth-bypass 被标记为已应用（新签名命中）');
+ok(rC.status === 0, `код выхода 0 (факт ${rC.status})`);
+ok(/Все обязательные патчи применены/.test(rC.stdout || ''), 'вывод содержит «Все обязательные патчи применены»');
+ok(/применено=\[[^\]]*auth-bypass/.test(rC.stdout || ''), 'auth-bypass помечен применённым (новая сигнатура)');
 
-console.log('\n=== D. 版本横幅跟随被扫描的树（R4：不得读环境里其它 DSH） ===');
+console.log('\n=== D. Версия в баннере следует за сканируемым деревом (R4: не читать другой DSH из окружения) ===');
 const vtree = makeSandbox('vtree', { dshVersion: '9.9.9-probe' });
 const rD = runPatch(vtree);
 const rDOut = (rD.stdout || '') + (rD.stderr || '');
-ok(rD.status === 0, `退出码为 0（实际 ${rD.status}）`);
-ok(/DSH 版本: 9\.9\.9-probe/.test(rDOut), '横幅显示被扫描树的版本 9.9.9-probe（而非 /usr/local 的旧版本）');
-ok(/来源: .*vtree/.test(rDOut), '横幅标注版本来源为沙箱树');
-ok(/全部必需补丁已生效/.test(rDOut), '必需补丁仍全部命中');
+ok(rD.status === 0, `код выхода 0 (факт ${rD.status})`);
+ok(/DSH версия: 9\.9\.9-probe/.test(rDOut), 'баннер показывает версию сканируемого дерева 9.9.9-probe (а не старую версию из /usr/local)');
+ok(/Источник: .*vtree/.test(rDOut), 'баннер указывает источник версии — каталог-песочницу');
+ok(/Все обязательные патчи применены/.test(rDOut), 'обязательные патчи по-прежнему все применены');
 
 fs.rmSync(good, { recursive: true, force: true });
 fs.rmSync(bad, { recursive: true, force: true });
 fs.rmSync(newer, { recursive: true, force: true });
 fs.rmSync(vtree, { recursive: true, force: true });
-console.log(`\n===== 汇总: 通过 ${pass} / 失败 ${fail} =====`);
+console.log(`\n===== Итог: пройдено ${pass} / провалено ${fail} =====`);
 process.exit(fail ? 1 : 0);

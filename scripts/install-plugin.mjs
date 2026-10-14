@@ -11,31 +11,34 @@ const targetLink = path.join(linkDir, 'dsh-browser-desktop');
 const pluginSource = '/app/plugins/dsh-browser-desktop';
 const stateFile = `${process.env.DSH_HOME || '/root'}/.dsh/plugins-state.json`;
 
-// ── P6：与 DSH 共享 profile 写锁 ─────────────────────────────────────────
-// 官方 0.1.7 的原生插件管理器/设置编辑器在改 profile 前会取
-// `profiles/web/package.json.lock`（wx 独占）。容器启动/版本切换时本脚本也会改
-// 同一个 package.json；不加锁就会与 DSH 的并发写互相覆盖（丢更新）。
-// 这里让每处「读 package.json → 改 → 写」都在同一把锁内完成。
+// ── P6: разделяем с DSH write-lock профиля ─────────────────────────────────────────
+// Официальный нативный менеджер плагинов/редактор настроек 0.1.7 перед изменением
+// `profiles/web/package.json` берёт `package.json.lock` (wx — эксклюзивно). При старте
+// контейнера/смене версии этот скрипт тоже правит тот же package.json; без lock
+// будет взаимная перезапись с конкурентной записью DSH (потеря обновлений).
+// Здесь каждое «читать package.json → изменить → записать» выполняется в одном lock.
 const require = createRequire(import.meta.url);
 const { withProfileLock, assertProfileLockHeld } = require('./profile-lock.cjs');
 const { removePatchEntries, assertPatchSafe } = require('./patch-yaml.cjs');
 const { pruneStaleBundles, resolvePruneConfig } = require('./stale-bundles.cjs');
 
 /**
- * 在 profile 写锁内完成一次「读 package.json → 由 mutate 修改 → 需要时写回」。
- * @param {(pkg: any) => boolean} mutate 返回 true 表示需要写回
+ * Выполняет один цикл «читать package.json → mutate → записать при необходимости» внутри
+ * write-lock профиля.
+ * @param {(pkg: any) => boolean} mutate возвращает true, если нужна запись
  * @returns {Promise<boolean>}
  */
 async function writeProfile(mutate) {
   return withProfileLock(profileDir, async () => {
     assertProfileLockHeld(profileDir);
-    // 与既有语义一致：profile 文件不存在时不凭空创建（初始化由 ensureProfilePackage 负责）
+    // Прежняя семантика сохраняется: если файла profile нет — с нуля не создаём
+    // (инициализацией занимается ensureProfilePackage)
     if (!fs.existsSync(pkgPath)) return false;
     let pkg;
     try {
       pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
     } catch (e) {
-      console.warn('[install-plugin] 读取 package.json 失败，跳过本次写入:', e.message);
+      console.warn('[install-plugin] Ошибка чтения package.json, пропускаем эту запись:', e.message);
       return false;
     }
     const changed = mutate(pkg);
@@ -45,8 +48,9 @@ async function writeProfile(mutate) {
 }
 
 /**
- * 原子写文件（轻微项）：先写临时文件再 rename，避免写盘中断留下半截 JSON/YAML
- * 让 DSH 下次启动解析失败。rename 在同目录内是原子操作。
+ * Атомарная запись файла (незначительное): сначала во временный файл, затем rename —
+ * чтобы обрыв записи не оставил обрезанный JSON/YAML, из-за которого DSH не разберёт
+ * файл при следующем старте. rename в той же директории атомарен.
  */
 function atomicWrite(file, data) {
   const tmp = `${file}.tmp-${process.pid}`;
@@ -62,9 +66,9 @@ function atomicWrite(file, data) {
 fs.mkdirSync(linkDir, { recursive: true });
 
 /**
- * 安全判断路径是否已存在（含悬空软链）。
- * 注意：不能用 `fs.existsSync(p) || fs.lstatSync(p).isSymbolicLink()`——
- * 当 p 完全不存在时 lstatSync 会抛 ENOENT，导致插件注册流程中断。
+ * Безопасно определяет, существует ли путь (включая «висячие» symlink).
+ * Внимание: нельзя использовать `fs.existsSync(p) || fs.lstatSync(p).isSymbolicLink()` —
+ * при полностью отсутствующем p lstatSync бросает ENOENT и прерывает регистрацию плагина.
  */
 function pathExists(p) {
   try {
@@ -75,7 +79,7 @@ function pathExists(p) {
   }
 }
 
-/** 删除已存在的文件/软链（含悬空软链），不存在则静默跳过 */
+/** Удаляет существующий файл/симлинк (включая «висячий»); если нет — молча пропускает */
 function removeIfExists(p) {
   try {
     fs.unlinkSync(p);
@@ -83,16 +87,16 @@ function removeIfExists(p) {
 }
 
 /**
- * 确保 profile 的 package.json 存在。
- * 全新容器首次启动时 DSH 尚未生成该文件，若此处不做初始化，下方
- * `if (fs.existsSync(pkgPath))` 的依赖/bundle 注册会被整段跳过，
- * 导致 dsh-browser-desktop 永远不会被注册进 profile（AI 工具与提示词全缺失）。
+ * Гарантирует наличие package.json профиля.
+ * При первом старте свежего контейнера DSH ещё не создал файл; если здесь не проинициализировать,
+ * блоки регистрации зависимостей/bundles ниже (`if (fs.existsSync(pkgPath))`) будут пропущены целиком,
+ * и dsh-browser-desktop так и не зарегистрируется в профиле (инструменты ИИ и промпт полностью пропадут).
  */
 async function ensureProfilePackage() {
   try {
     await withProfileLock(profileDir, async () => {
       assertProfileLockHeld(profileDir);
-      // 锁内再判一次：避免与并发的另一个写者抢着初始化
+      // Проверяем ещё раз уже внутри lock: не вступить в гонку инициализации с другим писателем
       if (fs.existsSync(pkgPath)) return;
       fs.mkdirSync(profileDir, { recursive: true });
       const initial = {
@@ -102,10 +106,10 @@ async function ensureProfilePackage() {
         dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } }
       };
       atomicWrite(pkgPath, JSON.stringify(initial, null, 2) + '\n');
-      console.log('[install-plugin] 已初始化 Web Profile package.json (全新容器首次启动)');
+      console.log('[install-plugin] Инициализирован package.json Web Profile (первый старт свежего контейнера)');
     }, { label: 'install-plugin:init' });
   } catch (e) {
-    console.warn('[install-plugin] 初始化 profile package.json 失败:', e.message);
+    console.warn('[install-plugin] Ошибка инициализации package.json профиля:', e.message);
   }
 }
 
@@ -116,13 +120,14 @@ function readPluginState() {
       return {
         disabled: Array.isArray(data.disabled) ? data.disabled : [],
         uninstalled: Array.isArray(data.uninstalled) ? data.uninstalled : [],
-        // known：我们"见过/装配过"的插件清单。用于区分"从未装配过"（应默认启用）
-        // 与"被外部卸载"（应保持卸载）——见 reconcileManagedState()
+        // known: список плагинов, которые мы «видели/собирали». Позволяет отличать
+        // «ни разу не собирался» (по умолчанию включён) от «удалён извне» (остаётся
+        // удалённым) — см. reconcileManagedState()
         known: Array.isArray(data.known) ? data.known : []
       };
     }
   } catch (e) {
-    console.warn('[install-plugin] 读取 plugins-state.json 警告:', e.message);
+    console.warn('[install-plugin] Предупреждение при чтении plugins-state.json:', e.message);
   }
   return { disabled: [], uninstalled: [], known: [] };
 }
@@ -137,24 +142,28 @@ function writePluginState(state) {
       updatedAt: new Date().toISOString()
     }, null, 2) + '\n');
   } catch (e) {
-    console.warn('[install-plugin] 写入 plugins-state.json 警告:', e.message);
+    console.warn('[install-plugin] Предупреждение при записи plugins-state.json:', e.message);
   }
 }
 
 /**
- * 与 profile manifest 对齐"外部写者"（DSH 原生插件管理器 / 设置页）的插件状态。
+ * Выравнивает состояние плагинов с «внешними писателями» (нативный менеджер плагинов
+ * DSH / страница настроек) по manifest профиля.
  *
- * 为什么需要（P6 的语义面）：官方原生插件管理器启停插件时**只改 bundles**，
- * 不会写我们的 plugins-state.json。若不识别，容器重启时本脚本会把"依赖仍在、
- * 但已被移出 bundles"的插件当成"从未装配"而自动装回去，等于静默回退用户的停用决定。
+ * Зачем это нужно (смысловая сторона P6): нативный менеджер, включая/отключая плагин,
+ * **меняет только bundles** и не пишет наш plugins-state.json. Не распознай мы это —
+ * при перезапуске контейнера скрипт посчитает плагин с «зависимостью на месте, но вынутой
+ * из bundles» «ни разу не собранным» и автоматически вернёт его, молча откатив решение
+ * пользователя об отключении.
  *
- * 规则（manifest 是唯一事实来源）：
- *   dependencies 有 + bundles 有  → 启用：清除我们的 disabled / uninstalled 标记
- *   dependencies 有 + bundles 无  → 停用：写入 disabled 标记（不再自动装配）
- *   dependencies 无 + bundles 无 + known 中有 → 卸载：写入 uninstalled 标记
- *   dependencies 无 + bundles 无 + known 中无 → 从未装配：维持默认（走正常自动装配）
+ * Правила (manifest — единственный источник истины):
+ *   dependencies есть + bundles есть      → включён: снимаем наши disabled / uninstalled
+ *   dependencies есть + bundles нет       → отключён: ставим disabled (больше не собираем)
+ *   dependencies нет + bundles нет + в known → удалён: ставим uninstalled
+ *   dependencies нет + bundles нет + нет в known → никогда не собирался: оставляем по умолчанию
+ *     (штатная автоматическая сборка)
  *
- * @param {string[]} names 受本脚本管理的插件名
+ * @param {string[]} names имена плагинов, которыми управляет этот скрипт
  */
 function reconcileManagedState(names) {
   try {
@@ -168,24 +177,25 @@ function reconcileManagedState(names) {
     const uninstalled = new Set(state.uninstalled);
     let changed = false;
 
-    // 1) 记录"见过/装配过"的插件（首次运行会用现有 manifest 播种；之后需持久化才能识别外部卸载）
+    // 1) Запоминаем «виденные/собранные» плагины (первый запуск сеет их из текущего manifest;
+    //    для распознавания будущих внешних удалений это должно сохраняться)
     for (const n of [...deps, ...bundles]) {
       if (!known.has(n)) { known.add(n); changed = true; }
     }
 
-    // 2) 按 manifest 对齐受管插件的启停/卸载标记
+    // 2) Выравниваем флаги включения/удаления управляемых плагинов по manifest
     const notes = [];
     for (const n of names) {
       const present = deps.includes(n);
       const bundled = bundles.includes(n);
       if (present && bundled) {
-        if (disabled.delete(n)) { changed = true; notes.push(`${n}=启用`); }
-        if (uninstalled.delete(n)) { changed = true; notes.push(`${n}=重新安装`); }
+        if (disabled.delete(n)) { changed = true; notes.push(`${n}=включён`); }
+        if (uninstalled.delete(n)) { changed = true; notes.push(`${n}=переустановлен`); }
       } else if (present && !bundled) {
-        if (!disabled.has(n)) { disabled.add(n); changed = true; notes.push(`${n}=停用(外部)`); }
+        if (!disabled.has(n)) { disabled.add(n); changed = true; notes.push(`${n}=отключён (внешне)`); }
         if (uninstalled.delete(n)) changed = true;
       } else if (!present && !bundled && known.has(n)) {
-        if (!uninstalled.has(n)) { uninstalled.add(n); changed = true; notes.push(`${n}=卸载(外部)`); }
+        if (!uninstalled.has(n)) { uninstalled.add(n); changed = true; notes.push(`${n}=удалён (внешне)`); }
         if (disabled.delete(n)) changed = true;
       }
     }
@@ -196,11 +206,11 @@ function reconcileManagedState(names) {
       pluginState.uninstalled = [...uninstalled];
       pluginState.known = [...known];
       if (notes.length > 0) {
-        console.log(`[install-plugin] 已对齐外部（DSH 原生插件管理器）的插件状态: ${notes.join(', ')}`);
+        console.log(`[install-plugin] Состояние плагинов выровнено с внешним (нативный менеджер DSH): ${notes.join(', ')}`);
       }
     }
   } catch (e) {
-    console.warn('[install-plugin] 对齐外部插件状态失败:', e.message);
+    console.warn('[install-plugin] Ошибка выравнивания внешнего состояния плагинов:', e.message);
   }
 }
 
@@ -208,8 +218,9 @@ await ensureProfilePackage();
 
 const pluginState = readPluginState();
 
-// 如果不存在 plugins-state.json 但存在已有的 package.json，说明已有运行历史
-// 自动推断现有已停用的插件，避免镜像升级时覆盖用户现有的禁用偏好
+// Если plugins-state.json нет, но package.json уже существует — значит, была история запусков.
+// Автоматически выводим уже отключённые плагины, чтобы при апгрейде образа не перекрыть
+// существующие предпочтения пользователя по отключению
 if (!fs.existsSync(stateFile) && fs.existsSync(pkgPath)) {
   try {
     const existingPkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
@@ -228,8 +239,10 @@ if (!fs.existsSync(stateFile) && fs.existsSync(pkgPath)) {
   } catch {}
 }
 
-// 0. 全局依赖自动补齐：将 DSH 内置的 @deepseek-ai/* 兄弟包链接至全局 /usr/local/lib/node_modules/@deepseek-ai
-// 彻底解决 dshmarket 等第三方插件因无法在上一级目录找到 @deepseek-ai/schemastery 等库而启动崩溃的问题
+// 0. Автодополнение глобальных зависимостей: линкуем встроенные братские пакеты DSH
+// @deepseek-ai/* к глобальному /usr/local/lib/node_modules/@deepseek-ai
+// Полностью решает проблему, при которой сторонние плагины вроде dshmarket не могли найти
+// в родительском каталоге библиотеки вида @deepseek-ai/schemastery и падали при старте.
 const dshCoreModules = [
   '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai',
   '/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
@@ -254,11 +267,11 @@ if (dshCoreModules && globalScopeDir) {
       } catch {}
     }
   } catch (e) {
-    console.warn('[install-plugin] 补齐全局 @deepseek-ai 依赖失败:', e.message);
+    console.warn('[install-plugin] Ошибка дополнения глобальных зависимостей @deepseek-ai:', e.message);
   }
 }
 
-// 1. 建立插件依赖软链接 (schemastery)
+// 1. Создаём симлинк файла зависимости плагина (schemastery)
 const possibleSchemasterySources = [
   '/usr/local/lib/node_modules/@deepseek-ai/schemastery',
   '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery',
@@ -273,21 +286,23 @@ for (const src of possibleSchemasterySources) {
     try {
       if (pathExists(linkPath)) fs.unlinkSync(linkPath);
       fs.symlinkSync(src, linkPath);
-      console.log('[install-plugin] 建立 schemastery 依赖软链接成功');
+      console.log('[install-plugin] Симлинк зависимости schemastery создан');
     } catch {}
     break;
   }
 }
 
-// 2. 自动注册并配置 @dsh-custom/dsh-browser-desktop (尊重用户持久化偏好)
+// 2. Автоматически регистрируем и настраиваем @dsh-custom/dsh-browser-desktop
+//    (уважая сохранённые предпочтения пользователя)
 const browserDesktopName = '@dsh-custom/dsh-browser-desktop';
-// P6：先与 manifest 对齐（识别"被 DSH 原生插件管理器停用"），再决定是否装配
+// P6: сначала выравниваемся с manifest (распознаём «отключено нативным менеджером DSH»),
+// затем решаем, собирать ли
 reconcileManagedState([browserDesktopName]);
 const isBrowserDesktopUninstalled = pluginState.uninstalled.includes(browserDesktopName);
 const isBrowserDesktopDisabled = pluginState.disabled.includes(browserDesktopName);
 
 if (isBrowserDesktopUninstalled) {
-  console.log('[install-plugin] 用户已明确卸载 dsh-browser-desktop，跳过装配');
+  console.log('[install-plugin] Пользователь явно удалил dsh-browser-desktop, сборку пропускаем');
   try {
     if (pathExists(targetLink)) removeIfExists(targetLink);
   } catch {}
@@ -309,9 +324,9 @@ if (isBrowserDesktopUninstalled) {
   try {
     if (pathExists(targetLink)) removeIfExists(targetLink);
     fs.symlinkSync(pluginSource, targetLink);
-    console.log('[install-plugin] 建立插件目录软链接成功:', targetLink);
+    console.log('[install-plugin] Симлинк каталога плагина создан:', targetLink);
   } catch (e) {
-    console.warn('[install-plugin] 建立软链接失败:', e.message);
+    console.warn('[install-plugin] Ошибка создания симлинка:', e.message);
   }
 
   try {
@@ -326,45 +341,49 @@ if (isBrowserDesktopUninstalled) {
         if (pkg.dsh.profile.bundles.includes(browserDesktopName)) {
           pkg.dsh.profile.bundles = pkg.dsh.profile.bundles.filter(b => b !== browserDesktopName);
         }
-        console.log('[install-plugin] 用户已显式禁用 dsh-browser-desktop，保持停用状态 (不加入 bundles)');
+        console.log('[install-plugin] Пользователь явно отключил dsh-browser-desktop, остаёмся отключёнными (в bundles не добавляем)');
       } else {
         if (!pkg.dsh.profile.bundles.includes(browserDesktopName)) {
           pkg.dsh.profile.bundles.push(browserDesktopName);
         }
-        console.log('[install-plugin] 注册 bundle 依赖到 package.json 成功');
+        console.log('[install-plugin] Регистрация bundle-зависимости в package.json успешна');
       }
       return true;
     });
   } catch (e) {
-    console.warn('[install-plugin] 更新 package.json 失败:', e.message);
+    console.warn('[install-plugin] Ошибка обновления package.json:', e.message);
   }
 }
 
-// 3. 清除 cordis.patch.yml 中的重复 insert 项（外科手术式删除 + 安全闸，绝不误伤相邻插件/设置条目）
+// 3. Убираем дублирующие insert-записи в cordis.patch.yml (хирургическое удаление + предохранитель,
+//    никогда не задеваются соседние плагины/записи настроек)
 if (fs.existsSync(patchPath)) {
   try {
     await withProfileLock(profileDir, async () => {
       assertProfileLockHeld(profileDir);
       const before = fs.readFileSync(patchPath, 'utf8');
-      // 本插件一律通过 bundles 加载；patch 里任何关于它的条目都是历史遗留（仅注入过期的 config）
+      // Наш плагин загружается всегда через bundles; любая запись о нём в patch — исторический
+      // остаток (вносил устаревший config)
       if (!before.includes('dsh-browser-desktop')) return;
       const r = removePatchEntries(before, (block) => block.includes('dsh-browser-desktop'));
       if (r.removed === 0) return;
       let res = r.text.trim();
-      // 过滤后若为空，必须写成合法的空 YAML 序列 '[]'。
-      // 写空文件（仅换行）会让 DSH 的 cordis patch 加载器解析失败 → DSH 启动即退出 (code=1)。
+      // Если после фильтрации пусто — обязательно записываем корректную пустую последовательность '[]'.
+      // Запись пустого файла (только перевод строки) сломает разбор патча cordis у DSH → при старте
+      // DSH выйдет с кодом 1.
       if (!res) res = '[]';
-      // 安全闸：该文件同时是 DSH 设置权威（含 llm-pi-ai 模型配置），绝不吞掉非本插件条目
+      // Предохранитель: этот файл — авторитет настроек DSH (включая конфиг моделей llm-pi-ai),
+      // чужие записи не трогаем никогда
       assertPatchSafe({ before, after: res, removedIds: r.removedIds });
       atomicWrite(patchPath, res + '\n');
-      console.log('[install-plugin] 已清理 cordis.patch.yml 中本插件的遗留条目（配置权威在 Admin）');
+      console.log('[install-plugin] Убраны исторические записи этого плагина из cordis.patch.yml (авторитет конфигурации — в Admin)');
     }, { label: 'install-plugin:patch-cleanup' });
   } catch (e) {
-    console.warn('[install-plugin] 处理 cordis.patch.yml 失败（未写入）:', e.message);
+    console.warn('[install-plugin] Ошибка обработки cordis.patch.yml (не записано):', e.message);
   }
 }
 
-// 4. 自动在 DSH 存储库中初始化默认工作区
+// 4. Автоматически инициализируем рабочую область по умолчанию в хранилище DSH
 const wsStoragePath = `${process.env.DSH_HOME || '/root'}/.dsh/storages/workspace.json`;
 const defaultWsPath = process.env.DSH_WORKSPACE || '/workspace';
 fs.mkdirSync(`${process.env.DSH_HOME || '/root'}/.dsh/storages`, { recursive: true });
@@ -397,18 +416,19 @@ try {
       }
     };
     atomicWrite(wsStoragePath, JSON.stringify(wsData, null, 2) + '\n');
-    console.log('[install-plugin] 成功为 DSH 注册初始默认工作区:', defaultWsPath);
+    console.log('[install-plugin] Для DSH зарегистрирована начальная рабочая область по умолчанию:', defaultWsPath);
   }
 } catch (e) {
-  console.warn('[install-plugin] 初始化默认工作区失败:', e.message);
+  console.warn('[install-plugin] Ошибка инициализации рабочей области по умолчанию:', e.message);
 }
 
-// 5. 自动清理已废弃下线的历史内置插件 (如已无实际意义的 @dsh-custom/dsh-settings-config-path)
+// 5. Автоочистка снятых исторических встроенных плагинов (например, потерявшего смысл
+//    @dsh-custom/dsh-settings-config-path)
 try {
   const legacyLink = path.join(linkDir, 'dsh-settings-config-path');
   if (pathExists(legacyLink)) {
     removeIfExists(legacyLink);
-    console.log('[install-plugin] 成功移除已废弃插件软链: dsh-settings-config-path');
+    console.log('[install-plugin] Удалён симлинк снятого плагина: dsh-settings-config-path');
   }
 } catch {}
 
@@ -425,14 +445,16 @@ try {
       changed = true;
     }
     if (changed) {
-      console.log('[install-plugin] 成功从 package.json 依赖与 bundles 中清理已下线插件 @dsh-custom/dsh-settings-config-path');
+      console.log('[install-plugin] Снятый плагин @dsh-custom/dsh-settings-config-path вычищен из зависимостей и bundles package.json');
     }
     return changed;
   });
 } catch {}
 
-// 6. 自动识别并装配已预装的 Market 插件 (从 plugins.market.list 动态同步，并完全尊重用户禁用/卸载偏好)
-// 预装插件的物理安装根目录（可用 DSH_MARKET_PLUGIN_ROOT 覆盖，便于测试与二次打包）
+// 6. Автообнаружение и сборка предустановленных Market-плагинов (динамическая синхронизация
+//    с plugins.market.list, полностью уважаем предпочтения пользователя по отключению/удалению)
+// Корневой каталог физической установки плагинов (можно переопределить через
+// DSH_MARKET_PLUGIN_ROOT, удобно для тестов и повторной упаковки)
 const MARKET_ROOT = process.env.DSH_MARKET_PLUGIN_ROOT || '/usr/local/lib/node_modules';
 const marketPlugins = [
   { id: 'dshmarket', name: 'dshmarket', path: path.join(MARKET_ROOT, 'dshmarket') },
@@ -457,16 +479,17 @@ if (fs.existsSync(listFile)) {
   } catch {}
 }
 
-// P6：与 manifest 对齐（识别外部停用/卸载），再决定是否装配
+// P6: выравниваемся с manifest (распознаём внешнее отключение/удаление), затем собираем
 reconcileManagedState(marketPlugins.map((p) => p.name));
 
 for (const p of marketPlugins) {
   const isMarketUninstalled = pluginState.uninstalled.includes(p.name);
   const isMarketDisabled = pluginState.disabled.includes(p.name);
 
-  // 若用户已显式卸载，保持卸载状态，清理残留软链接与引用，绝对不重新装配！
+  // Если пользователь явно удалил — сохраняем удалённым, вычищаем остаточные симлинки и ссылки,
+  // ни в коем случае не собираем заново!
   if (isMarketUninstalled) {
-    console.log(`[install-plugin] 用户已明确卸载 ${p.name}，保持卸载状态 (跳过装配)`);
+    console.log(`[install-plugin] Пользователь явно удалил ${p.name}, остаёмся удалёнными (сборку пропускаем)`);
     const targetLnk = path.join(profileDir, 'node_modules', p.name);
     try {
       if (pathExists(targetLnk)) removeIfExists(targetLnk);
@@ -496,7 +519,8 @@ for (const p of marketPlugins) {
       if (pathExists(targetLnk)) removeIfExists(targetLnk);
       fs.symlinkSync(p.path, targetLnk);
 
-      // 确保插件内部 node_modules/@deepseek-ai 指向全局依赖 (pathExists 可安全处理悬空软链)
+      // Гарантируем, что внутренние node_modules/@deepseek-ai плагина указывают на глобальные
+      // зависимости (pathExists безопасно переживает «висячие» симлинки)
       const peerLinkDir = path.join(p.path, 'node_modules/@deepseek-ai');
       try {
         if (pathExists(peerLinkDir)) {
@@ -519,20 +543,20 @@ for (const p of marketPlugins) {
           if (pkg.dsh.profile.bundles.includes(p.name)) {
             pkg.dsh.profile.bundles = pkg.dsh.profile.bundles.filter(b => b !== p.name);
           }
-          console.log(`[install-plugin] 用户已显式禁用 ${p.name}，保持停用状态 (不加入 bundles)`);
+          console.log(`[install-plugin] Пользователь явно отключил ${p.name}, остаёмся отключёнными (в bundles не добавляем)`);
         } else {
           if (!pkg.dsh.profile.bundles.includes(p.name)) {
             pkg.dsh.profile.bundles.push(p.name);
           }
-          console.log(`[install-plugin] 自动装配预装 Market 插件: ${p.name}`);
+          console.log(`[install-plugin] Автосборка предустановленного Market-плагина: ${p.name}`);
         }
         return true;
       });
     } catch (e) {
-      console.warn(`[install-plugin] 自动装配 Market 插件失败 (${p.name}):`, e.message);
+      console.warn(`[install-plugin] Ошибка автосборки Market-плагина (${p.name}):`, e.message);
     }
   } else {
-    // 插件未安装（纯净基础镜像），清理 package.json 中残留的 bundle 引用
+    // Плагин не установлен (чистый базовый образ) — вычищаем остаточные bundle-ссылки из package.json
     try {
       await writeProfile((pkg) => {
         let changed = false;
@@ -545,7 +569,7 @@ for (const p of marketPlugins) {
           changed = true;
         }
         if (changed) {
-          console.log(`[install-plugin] 基础镜像已自动清理未装配插件引用: ${p.name}`);
+          console.log(`[install-plugin] Базовый образ автоматически вычистил ссылки на несобранный плагин: ${p.name}`);
         }
         return changed;
       });
@@ -553,26 +577,32 @@ for (const p of marketPlugins) {
   }
 }
 
-// 6.1 收尾对齐：把本次装配过的插件记入 known（日后才能区分"从未装配"与"被外部卸载"）
+// 6.1 Финальное выравнивание: собранные плагины записываем в known (чтобы в будущем отличать
+//     «ни разу не собирался» от «удалён извне»)
 reconcileManagedState([...marketPlugins.map((p) => p.name), browserDesktopName]);
 
-// 6.2 自动清理无法解析的 profile bundle 幽灵条目。
-//     背景：官方 0.1.7 起合并/下线了若干 bundle 包（如
-//     `@deepseek-ai/dsh-experimental-agent-team-web-profile` 被并入
-//     `@deepseek-ai/dsh-experimental-agent-team-profile`）。镜像升级后，profile 的
-//     `dsh.profile.bundles` 会残留已不存在的包名，DSH 每次加载都打印
-//     `skipping profile bundle "..." : cannot resolve ...` 并在 UI 提示。
-//     策略来源（优先级）：环境变量 DSH_PRUNE_STALE_BUNDLES > 管理后台持久化配置
-//     `$DSH_HOME/.dsh/gateway.config.json#pruneStaleBundles` > 默认 known（保守）。
-//     默认「保守模式」仅清理已知被上游下线的 bundle（stale-bundles.cjs 的清单 + 额外清单），
-//     只删「确实无法解析且未在依赖字段声明」的条目，绝不误删并发写者/用户意图。
-//     注意：本脚本在容器启动阶段执行一次，管理后台改动需重启容器后生效。
+// 6.2 Автоочистка неразрешимых ghost-записей bundle в профиле.
+//     Предыстория: официально с 0.1.7 было объединено/снято несколько bundle-пакетов (например,
+//     `@deepseek-ai/dsh-experimental-agent-team-web-profile` влит в
+//     `@deepseek-ai/dsh-experimental-agent-team-profile`). После апгрейда образа в
+//     `dsh.profile.bundles` профиля остаются имена несуществующих пакетов, и DSH при каждой
+//     загрузке печатает `skipping profile bundle "..." : cannot resolve ...` и показывает
+//     подсказку в UI.
+//     Источник политики (приоритет): переменная окружения DSH_PRUNE_STALE_BUNDLES >
+//     сохранённая конфигурация панели `$DSH_HOME/.dsh/gateway.config.json#pruneStaleBundles` >
+//     по умолчанию known (консервативно).
+//     «Консервативный режим» по умолчанию чистит только известные снятые апстримом bundle
+//     (список из stale-bundles.cjs + доп. список), причём только «точно неразрешимые и не
+//     объявленные в полях зависимостей» — никогда не трогая конкурентных писателей и замыслы
+//     пользователя.
+//     Внимание: этот скрипт выполняется один раз на этапе старта контейнера; изменение в панели
+//     управления вступает в силу после перезапуска контейнера.
 function readGatewayConfig() {
   const file = process.env.GATEWAY_CONFIG_FILE || path.join(process.env.DSH_HOME || '/root', '.dsh', 'gateway.config.json');
   try {
     if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (e) {
-    console.warn('[install-plugin] 读取网关配置失败（忽略，回落默认策略）:', e.message);
+    console.warn('[install-plugin] Ошибка чтения конфигурации шлюза (игнорируется, откат к политике по умолчанию):', e.message);
   }
   return {};
 }
@@ -586,23 +616,28 @@ if (pruneCfg.mode !== 'off') {
         extraNames: pruneCfg.extraNames
       });
       if (pruned.length > 0) {
-        console.log(`[install-plugin] 已自动清理无法解析的 profile bundle 幽灵条目 (模式: ${pruneCfg.mode}): ${pruned.join(', ')}`);
+        console.log(`[install-plugin] Вычищены неразрешимые ghost-записи bundle профиля (режим: ${pruneCfg.mode}): ${pruned.join(', ')}`);
       }
       if (declared.length > 0) {
-        console.log(`[install-plugin] 以下 bundle 已在 dependencies 声明但尚未安装，保留未清理: ${declared.join(', ')}（可执行 dsh plugin --profile web install 安装）`);
+        console.log(`[install-plugin] Следующие bundle объявлены в dependencies, но пока не установлены — оставлены без очистки: ${declared.join(', ')} (можно установить командой dsh plugin --profile web install)`);
       }
       return pruned.length > 0;
     });
   } catch (e) {
-    console.warn('[install-plugin] 自动清理幽灵 bundle 失败:', e.message);
+    console.warn('[install-plugin] Ошибка автоочистки ghost-bundle:', e.message);
   }
 }
 
-// 7. 容器级配置预设写入 Home 级补丁层（官方 0.1.7 起设置权威在补丁层，旧 settings.yaml 仅导入一次）。
-//    - dsh-market.allowRestart:false —— 由容器 dsh-manager 统一守护，防止市场「一键重启」双重启端口冲突。
-//      注意：该字段是 entry 的 config（dshmarket 未导出可配置 Schema，无法经 settings.yaml 导入）。
-//    - ui-sidebar-browser disabled:false —— 0.1.7 起内置侧边栏浏览器在 Web 端默认关闭，这里重新开启以保持 0.1.6 的功能面。
-//    Home 级补丁 $DSH_HOME/cordis.patch.yml 优先级最高，且不会被 DSH 设置页或我方 profile 补丁清理逻辑改写。
+// 7. Контейнерные пресеты конфигурации пишутся в патч-слой уровня Home (официально с 0.1.7
+//    авторитет настроек — в патче, старый settings.yaml импортируется только один раз).
+//    - dsh-market.allowRestart:false —— контейнерный dsh-manager единый страж, запрещает
+//      «перезапуск в один клик» маркетплейса во избежание конфликта двух перезапусков по порту.
+//      Внимание: это поле — config записи (dshmarket не экспортирует настраиваемую Schema,
+//      через settings.yaml его не импортировать).
+//    - ui-sidebar-browser disabled:false —— со встроенной версии 0.1.7 браузер боковой панели
+//      в Web по умолчанию выключен, здесь включаем обратно, сохраняя функциональную поверхность 0.1.6.
+//    Патч уровня Home $DSH_HOME/cordis.patch.yml имеет наивысший приоритет и не перезаписывается
+//    ни страницей настроек DSH, ни нашей очисткой profile-патча.
 const homePatchPath = path.join(process.env.DSH_HOME || '/root', '.dsh', 'cordis.patch.yml');
 
 function ensureHomePatchEntries(entries) {
@@ -621,10 +656,10 @@ function ensureHomePatchEntries(entries) {
     }
     if (added.length > 0) {
       atomicWrite(homePatchPath, text);
-      console.log(`[install-plugin] Home 级补丁已更新 (${added.join(', ')}): ${homePatchPath}`);
+      console.log(`[install-plugin] Home-патч обновлён (${added.join(', ')}): ${homePatchPath}`);
     }
   } catch (e) {
-    console.warn('[install-plugin] 写入 Home 级补丁失败:', e.message);
+    console.warn('[install-plugin] Ошибка записи Home-патча:', e.message);
   }
 }
 
